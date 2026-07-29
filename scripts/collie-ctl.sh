@@ -8,6 +8,10 @@ PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT="collie"
 UNIT_FILE="${HOME}/.config/systemd/user/${UNIT}.service"
 PLUGIN_ID="herdr.collie"
+LAUNCHD_LABEL="herdr.collie"
+LAUNCHD_PLIST="${HOME}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+USER_UID="$(id -u)"
+CONFIG_ENV_NAMES=()
 
 # Resolve the plugin config dir (where .env lives) the SAME way no matter how we're launched.
 # Herdr injects HERDR_PLUGIN_CONFIG_DIR when it runs our actions, but a direct `collie-ctl.sh` call
@@ -33,18 +37,209 @@ if [ "$CONFIG_DIR" != "${HOME}/.config/collie" ] && [ -f "${HOME}/.config/collie
   echo "note: ignoring legacy ${HOME}/.config/collie/.env — config now lives in ${CONFIG_DIR}/.env (move it there)." >&2
 fi
 
-# Source the plugin .env so both this script and the systemd unit share one config source.
-if [ -f "${CONFIG_DIR}/.env" ]; then set -a; . "${CONFIG_DIR}/.env"; set +a; fi
+# Load only a constrained dotenv grammar; executing a config file as shell code turns write access
+# to a secrets file into code execution. Values are literal (optionally wrapped in matching quotes).
+# The launchd plist is generated from the parsed variables too, so macOS never needs a shell wrapper.
+fatal() { echo "error: $*" >&2; exit 1; }
+
+file_uid() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1"; }
+file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
+secure_config_dir() {
+  if [ -e "$CONFIG_DIR" ]; then
+    [ -d "$CONFIG_DIR" ] || fatal "${CONFIG_DIR} is not a directory"
+    [ ! -L "$CONFIG_DIR" ] || fatal "refusing symlinked config directory: ${CONFIG_DIR}"
+    [ "$(file_uid "$CONFIG_DIR")" = "$USER_UID" ] || fatal "${CONFIG_DIR} must be owned by uid ${USER_UID}"
+  else
+    mkdir -p -m 700 "$CONFIG_DIR"
+  fi
+  chmod 700 "$CONFIG_DIR" || fatal "could not restrict ${CONFIG_DIR} to owner-only access"
+}
+
+load_config_env() {
+  local env_file="${CONFIG_DIR}/.env" line name value owner mode
+  [ -e "$env_file" ] || return 0
+  [ -f "$env_file" ] || fatal "${env_file} is not a regular file"
+  [ ! -L "$env_file" ] || fatal "refusing symlinked config: ${env_file}"
+  owner="$(file_uid "$env_file")"
+  [ "$owner" = "$USER_UID" ] || fatal "${env_file} must be owned by uid ${USER_UID}"
+  mode="$(file_mode "$env_file")"
+  if [ "${mode#?}" != "00" ]; then
+    chmod 600 "$env_file" || fatal "could not restrict ${env_file} to owner-only access"
+  fi
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ""|\#*) continue ;; esac
+    [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || fatal "invalid .env entry (expected NAME=value)"
+    name="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    [[ "$name" =~ ^COLLIE_[A-Z0-9_]+$ || "$name" = "HERDR_SOCKET_PATH" || "$name" = "HERDR_PLUGIN_STATE_DIR" ]] ||
+      fatal "unsupported .env variable: ${name}"
+    if [[ "$value" == \"*\" ]]; then
+      [ "${#value}" -ge 2 ] && [ "${value:$((${#value} - 1)):1}" = "\"" ] ||
+        fatal "unterminated double-quoted value for ${name}"
+      value="${value:1:$((${#value} - 2))}"
+    elif [[ "$value" == \'*\' ]]; then
+      [ "${#value}" -ge 2 ] && [ "${value:$((${#value} - 1)):1}" = "'" ] ||
+        fatal "unterminated single-quoted value for ${name}"
+      value="${value:1:$((${#value} - 2))}"
+    elif [[ "$value" == *\"* || "$value" == *\'* ]]; then
+      fatal "quotes must wrap the complete value for ${name}"
+    fi
+    export "$name=$value"
+    case " ${CONFIG_ENV_NAMES[*]} " in *" ${name} "*) ;; *) CONFIG_ENV_NAMES+=("$name") ;; esac
+  done < "$env_file"
+}
+
+secure_config_dir
+load_config_env
 
 PORT="${COLLIE_PORT:-8787}"
 SOCKET="${HERDR_SOCKET_PATH:-${HOME}/.config/herdr/herdr.sock}"
 # How tailscale serve exposes the bridge: "https" (default, needs a cert from the control
 # server) or "http" (plain HTTP over the tailnet — use this on Headscale / .internal domains).
 SERVE_MODE="${COLLIE_SERVE_MODE:-https}"
+# Public HTTPS/HTTP listener and mount. Keep the bridge itself loopback-only; Tailscale Serve owns
+# the public edge and strips this mount before proxying to the bridge.
+BASE_PATH="${COLLIE_BASE_PATH:-/}"
+if [ "$BASE_PATH" != "/" ]; then
+  BASE_PATH="${BASE_PATH%/}"
+  [[ "$BASE_PATH" =~ ^/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+$ ]] ||
+    fatal "COLLIE_BASE_PATH must be / or slash-separated URL-safe path segments"
+fi
+case "$SERVE_MODE" in
+  http) SERVE_PORT="${COLLIE_SERVE_PORT:-$PORT}" ;;
+  https) SERVE_PORT="${COLLIE_SERVE_PORT:-443}" ;;
+  *) fatal "COLLIE_SERVE_MODE must be http or https" ;;
+esac
+if ! [[ "$SERVE_PORT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$SERVE_PORT" -gt 65535 ]; then
+  fatal "COLLIE_SERVE_PORT must be an integer from 1 through 65535"
+fi
+if [ -n "${COLLIE_UNIX_SOCKET:-}" ] && [ "${COLLIE_SKIP_SERVE:-}" != "1" ]; then
+  fatal "COLLIE_UNIX_SOCKET requires COLLIE_SKIP_SERVE=1; Tailscale Serve proxies loopback TCP only"
+fi
 BUN="$(command -v bun || true)"
 WEB_DIST="${PLUGIN_ROOT}/web/dist/index.html"
 
 have_systemd() { command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; }
+have_launchd() { [ "$(uname -s)" = "Darwin" ] && command -v launchctl >/dev/null; }
+
+SERVE_ROUTE_FILE="${CONFIG_DIR}/serve-route"
+
+disable_serve_route() {
+  local mode="$1" port="$2" path="$3"
+  local -a args=(tailscale serve)
+  if [ "$mode" = "http" ]; then args+=("--http=${port}"); else args+=("--https=${port}"); fi
+  [ "$path" = "/" ] || args+=("--set-path=${path}")
+  "${args[@]}" off >/dev/null 2>&1 || true
+}
+
+route_targets_bridge() {
+  local mode="$1" port="$2" path="$3"
+  [ -n "$BUN" ] || return 1
+  ROUTE_PORT="$port" ROUTE_PATH="$path" ROUTE_TARGET="http://127.0.0.1:${PORT}" "$BUN" -e '
+    let json = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { json += chunk; });
+    process.stdin.on("end", () => {
+      try {
+        const { Web = {} } = JSON.parse(json);
+        const port = process.env.ROUTE_PORT;
+        const path = process.env.ROUTE_PATH;
+        const target = process.env.ROUTE_TARGET;
+        const found = Object.entries(Web).some(([host, config]) =>
+          (host.endsWith(`:${port}`) || (port === "443" && !host.match(/:\d+$/))) &&
+          config.Handlers?.[path]?.Proxy === target,
+        );
+        process.exit(found ? 0 : 1);
+      } catch {
+        process.exit(1);
+      }
+    });
+  ' < <(tailscale serve status --json 2>/dev/null)
+}
+
+load_recorded_serve_route() {
+  local extra
+  RECORDED_SERVE_MODE=""
+  RECORDED_SERVE_PORT=""
+  RECORDED_BASE_PATH=""
+  [ -e "$SERVE_ROUTE_FILE" ] || return 1
+  [ -f "$SERVE_ROUTE_FILE" ] && [ ! -L "$SERVE_ROUTE_FILE" ] ||
+    fatal "refusing invalid Serve route record: ${SERVE_ROUTE_FILE}"
+  {
+    IFS= read -r RECORDED_SERVE_MODE
+    IFS= read -r RECORDED_SERVE_PORT
+    IFS= read -r RECORDED_BASE_PATH
+    IFS= read -r extra || true
+  } < "$SERVE_ROUTE_FILE"
+  [ -z "${extra:-}" ] &&
+    [[ "$RECORDED_SERVE_MODE" =~ ^(http|https)$ ]] &&
+    [[ "$RECORDED_SERVE_PORT" =~ ^[1-9][0-9]{0,4}$ ]] &&
+    [ "$RECORDED_SERVE_PORT" -le 65535 ] &&
+    { [ "$RECORDED_BASE_PATH" = "/" ] ||
+      [[ "$RECORDED_BASE_PATH" =~ ^/([A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+$ ]]; } ||
+    fatal "invalid Serve route record: ${SERVE_ROUTE_FILE}"
+}
+
+record_serve_route() {
+  local tmp
+  tmp="$(umask 077; mktemp "${CONFIG_DIR}/.serve-route.XXXXXX")"
+  printf '%s\n%s\n%s\n' "$SERVE_MODE" "$SERVE_PORT" "$BASE_PATH" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$SERVE_ROUTE_FILE"
+}
+
+remove_previous_serve_route() {
+  if load_recorded_serve_route; then
+    if [ "$RECORDED_SERVE_MODE" = "$SERVE_MODE" ] &&
+      [ "$RECORDED_SERVE_PORT" = "$SERVE_PORT" ] &&
+      [ "$RECORDED_BASE_PATH" = "$BASE_PATH" ]; then
+      return
+    fi
+    if [ "$RECORDED_BASE_PATH" != "/" ]; then
+      disable_serve_route "$RECORDED_SERVE_MODE" "$RECORDED_SERVE_PORT" "/sw.js"
+    fi
+    disable_serve_route "$RECORDED_SERVE_MODE" "$RECORDED_SERVE_PORT" "$RECORDED_BASE_PATH"
+    rm -f "$SERVE_ROUTE_FILE"
+  elif [ "$BASE_PATH" != "/" ]; then
+    # Before route records, Collie served `/`. Remove it only after status JSON proves its exact
+    # bridge target, including the historic default HTTPS :443 listener.
+    if route_targets_bridge "$SERVE_MODE" "$SERVE_PORT" "/"; then
+      disable_serve_route "$SERVE_MODE" "$SERVE_PORT" "/"
+    fi
+    if [ "$SERVE_MODE" != "https" ] || [ "$SERVE_PORT" != "443" ]; then
+      if route_targets_bridge "https" "443" "/"; then
+        disable_serve_route "https" "443" "/"
+      fi
+    fi
+  fi
+}
+
+# A pre-mount Collie PWA registered `/sw.js` at origin scope. That worker keeps controlling
+# `/collie` after the app moves under a mount, so it can serve an obsolete shell forever. Publish a
+# one-shot worker at that old URL: it unregisters itself and reloads only Collie tabs. This route has
+# no API or app content and remains tailnet-authenticated by Tailscale Serve.
+install_legacy_root_worker_cleanup() {
+  [ "$BASE_PATH" != "/" ] || return 0
+  local out="${CONFIG_DIR}/serve-legacy-sw.out"
+  local -a args=(tailscale serve --bg)
+  if [ "$SERVE_MODE" = "http" ]; then
+    args+=("--http=${SERVE_PORT}")
+  else
+    args+=("--https=${SERVE_PORT}")
+  fi
+  args+=("--set-path=/sw.js")
+  if "${args[@]}" "http://127.0.0.1:${PORT}/__collie_legacy_root_sw_cleanup.js" >"$out" 2>&1; then
+    echo "tailscale serve legacy worker cleanup → :${SERVE_PORT}/sw.js"
+  else
+    echo "warn: legacy service-worker cleanup route failed:" >&2
+    cat "$out" >&2
+    return 1
+  fi
+}
+
 
 # Build the Vite/React PWA into web/dist. The bridge serves that directory; without it the API
 # still runs but the UI 503s. Safe to call repeatedly (no-op if already built, unless forced).
@@ -80,10 +275,19 @@ cmd_build() {
   mv "$staging" "${PLUGIN_ROOT}/web/dist"
 }
 
+configured_build_base_path() {
+  if [ "$BASE_PATH" = "/" ]; then echo "/"; else echo "${BASE_PATH}/"; fi
+}
+
+built_base_path() {
+  sed -n 's/.*"basePath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "${PLUGIN_ROOT}/web/dist/build-info.json" | head -1
+}
+
 ensure_build() {
-  [ -f "$WEB_DIST" ] && return 0
+  if [ -f "$WEB_DIST" ] && [ "$(built_base_path)" = "$(configured_build_base_path)" ]; then return 0; fi
   [ -n "$BUN" ] || { echo "note: bun not found; cannot build web UI" >&2; return 1; }
-  echo "building web UI (first run)…"
+  echo "building web UI (first run or public mount changed)…"
   cmd_build || { echo "warn: web build failed; API will run but the UI will 503 until built" >&2; return 1; }
 }
 
@@ -93,9 +297,17 @@ self_dnsname() {
 }
 
 bridge_url() {
-  local name; name="$(self_dnsname)"
+  local name origin
+  name="$(self_dnsname)"
   if [ -z "$name" ]; then echo "http://127.0.0.1:${PORT} (Tailscale name unavailable)"; return; fi
-  if [ "$SERVE_MODE" = "http" ]; then echo "http://${name}:${PORT}"; else echo "https://${name}"; fi
+  if [ "$SERVE_MODE" = "http" ]; then
+    origin="http://${name}:${SERVE_PORT}"
+  elif [ "$SERVE_PORT" = "443" ]; then
+    origin="https://${name}"
+  else
+    origin="https://${name}:${SERVE_PORT}"
+  fi
+  echo "${origin}${BASE_PATH}"
 }
 
 # The version Collie is actually serving — read from the built bundle's stamp
@@ -135,8 +347,14 @@ print_status_banner() {
   local svc
   if have_systemd; then
     svc="systemd --user (${UNIT}) · $(systemctl --user is-active "$UNIT" 2>/dev/null || echo unknown)"
+  elif have_launchd; then
+    if launchctl print "gui/${USER_UID}/${LAUNCHD_LABEL}" >/dev/null 2>&1; then
+      svc="launchd (${LAUNCHD_LABEL}) · loaded"
+    else
+      svc="launchd (${LAUNCHD_LABEL}) · not loaded"
+    fi
   elif [ -f "${CONFIG_DIR}/collie.pid" ]; then
-    svc="pid $(cat "${CONFIG_DIR}/collie.pid" 2>/dev/null) (no systemd)"
+    svc="pid $(cat "${CONFIG_DIR}/collie.pid" 2>/dev/null) (no supervisor)"
   else
     svc="not supervised"
   fi
@@ -193,20 +411,92 @@ EOF
   systemctl --user daemon-reload
 }
 
+xml_escape() {
+  local value="$1"
+  value=${value//&/\&amp;}
+  value=${value//</\&lt;}
+  value=${value//>/\&gt;}
+  value=${value//\"/\&quot;}
+  value=${value//\'/\&apos;}
+  printf '%s' "$value"
+}
+
+write_launch_agent() {
+  local launch_dir tmp name
+  [ -n "$BUN" ] || fatal "bun not found on PATH"
+  [ ! -L "$CONFIG_DIR" ] || fatal "refusing symlinked config directory: ${CONFIG_DIR}"
+  mkdir -p "$CONFIG_DIR" "${HOME}/Library/LaunchAgents"
+  [ "$(file_uid "$CONFIG_DIR")" = "$USER_UID" ] || fatal "${CONFIG_DIR} must be owned by uid ${USER_UID}"
+  chmod 700 "$CONFIG_DIR" || fatal "could not restrict ${CONFIG_DIR} to owner-only access"
+  launch_dir="$(dirname "$LAUNCHD_PLIST")"
+  tmp="$(umask 077; mktemp "${launch_dir}/${LAUNCHD_LABEL}.plist.XXXXXX")"
+  {
+    cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(xml_escape "$LAUNCHD_LABEL")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$BUN")</string>
+    <string>run</string>
+    <string>$(xml_escape "${PLUGIN_ROOT}/bridge/index.ts")</string>
+  </array>
+  <key>WorkingDirectory</key><string>$(xml_escape "$PLUGIN_ROOT")</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+EOF
+    for name in "${CONFIG_ENV_NAMES[@]}"; do
+      case "$name" in HERDR_SOCKET_PATH|COLLIE_PORT) continue ;; esac
+      printf '    <key>%s</key><string>%s</string>\n' "$(xml_escape "$name")" "$(xml_escape "${!name}")"
+    done
+    cat <<EOF
+    <key>HERDR_SOCKET_PATH</key><string>$(xml_escape "$SOCKET")</string>
+    <key>COLLIE_PORT</key><string>$(xml_escape "$PORT")</string>
+    <key>HERDR_PLUGIN_CONFIG_DIR</key><string>$(xml_escape "$CONFIG_DIR")</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>$(xml_escape "${CONFIG_DIR}/collie.log")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "${CONFIG_DIR}/collie.log")</string>
+</dict>
+</plist>
+EOF
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$LAUNCHD_PLIST"
+}
+
+start_launch_agent() {
+  local target="gui/${USER_UID}/${LAUNCHD_LABEL}"
+  write_launch_agent
+  launchctl bootout "$target" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/${USER_UID}" "$LAUNCHD_PLIST"
+  launchctl kickstart -k "$target"
+}
+
 cmd_start() {
   ensure_build || true
   if have_systemd; then
     write_unit
     systemctl --user enable --now "$UNIT"
     echo "bridge started (systemd --user: ${UNIT})"
+  elif have_launchd; then
+    start_launch_agent
+    echo "bridge started (launchd: ${LAUNCHD_LABEL})"
   else
-    # Fallback: background process with a pidfile (e.g. macOS without lingering systemd).
+    # Last-resort fallback for platforms without a user-service manager. It is intentionally not
+    # advertised as durable: use a native supervisor when restart/login autoload matters.
     mkdir -p "$CONFIG_DIR"
     [ -n "$BUN" ] || { echo "error: bun not found" >&2; exit 1; }
     HERDR_SOCKET_PATH="$SOCKET" COLLIE_PORT="$PORT" HERDR_PLUGIN_CONFIG_DIR="$CONFIG_DIR" \
       nohup "$BUN" run "${PLUGIN_ROOT}/bridge/index.ts" >>"${CONFIG_DIR}/collie.log" 2>&1 &
     echo $! > "${CONFIG_DIR}/collie.pid"
-    echo "bridge started (pid $(cat "${CONFIG_DIR}/collie.pid"), no systemd)"
+    echo "bridge started (pid $(cat "${CONFIG_DIR}/collie.pid"), no supervisor)"
   fi
   cmd_serve
   print_status_banner
@@ -215,6 +505,9 @@ cmd_start() {
 cmd_stop() {
   if have_systemd; then
     systemctl --user disable --now "$UNIT" 2>/dev/null || true
+  elif have_launchd; then
+    launchctl bootout "gui/${USER_UID}/${LAUNCHD_LABEL}" 2>/dev/null || true
+    rm -f "$LAUNCHD_PLIST"
   elif [ -f "${CONFIG_DIR}/collie.pid" ]; then
     kill "$(cat "${CONFIG_DIR}/collie.pid")" 2>/dev/null || true
     rm -f "${CONFIG_DIR}/collie.pid"
@@ -236,6 +529,8 @@ cmd_uninstall() {
     rm -f "$UNIT_FILE"
     systemctl --user daemon-reload 2>/dev/null || true
     systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  elif have_launchd; then
+    rm -f "$LAUNCHD_PLIST"
   fi
   rm -f "${CONFIG_DIR}/collie.pid"
   echo "✓ uninstalled: service stopped & disabled, systemd unit removed, Collie's tailscale serve mapping removed"
@@ -283,39 +578,46 @@ cmd_serve() {
     return
   fi
   command -v tailscale >/dev/null || { echo "note: tailscale not found; bridge is on 127.0.0.1:${PORT} only"; return; }
+  remove_previous_serve_route
   local out="${CONFIG_DIR}/serve.out"
+  local -a args=(tailscale serve --bg)
   if [ "$SERVE_MODE" = "http" ]; then
-    if tailscale serve --bg --http="$PORT" "$PORT" >"$out" 2>&1; then
-      echo "tailscale serve (http) → tailnet :${PORT} -> 127.0.0.1:${PORT}"
-    else
-      echo "note: tailscale serve failed (try 'sudo tailscale set --operator=\$USER'):"; cat "$out"
-    fi
+    args+=("--http=${SERVE_PORT}")
   else
-    if tailscale serve --bg "$PORT" >"$out" 2>&1; then
-      echo "tailscale serve (https) → tailnet :443 -> 127.0.0.1:${PORT}"
-    else
-      echo "note: tailscale serve (https) failed — on Headscale/.internal domains use COLLIE_SERVE_MODE=http:"; cat "$out"
-    fi
+    args+=("--https=${SERVE_PORT}")
+  fi
+  [ "$BASE_PATH" = "/" ] || args+=("--set-path=${BASE_PATH}")
+  if "${args[@]}" "$PORT" >"$out" 2>&1; then
+    record_serve_route
+    install_legacy_root_worker_cleanup || true
+    echo "tailscale serve (${SERVE_MODE}) → tailnet :${SERVE_PORT}${BASE_PATH} -> 127.0.0.1:${PORT}"
+  else
+    echo "note: tailscale serve failed (try 'sudo tailscale set --operator=\$USER'):"; cat "$out"
   fi
 }
 
-# Remove ONLY Collie's tailscale serve mapping — the inverse of cmd_serve, NOT a blanket
-# `tailscale serve reset` (which would wipe every unrelated mapping on the host). We turn off
-# exactly the listener cmd_serve created, keyed off the same SERVE_MODE so the two stay symmetric:
-# https:443 by default, or http:$PORT in http mode. Best-effort (|| true) so teardown is idempotent
-# when the mapping is already gone.
+# Remove only routes Collie recorded (plus the current route) — never a listener-wide reset that
+# could remove another application. A changed mount is therefore a clean cutover, not an extra live URL.
 cmd_unserve() {
-  # Always attempt teardown, even under COLLIE_SKIP_SERVE=1: it's idempotent (|| true) and guarded by
-  # the `command -v tailscale` check, and skipping it would strand a stale serve mapping (from before
-  # the flag was flipped on) still publishing the app — a security hazard, not a convenience.
+  # Always attempt teardown, even under COLLIE_SKIP_SERVE=1: it is idempotent and skipping it could
+  # strand a stale Serve mapping still publishing the app — a security hazard, not a convenience.
   command -v tailscale >/dev/null || { echo "note: tailscale not found; no serve mapping to remove"; return; }
-  if [ "$SERVE_MODE" = "http" ]; then
-    tailscale serve --http="$PORT" off >/dev/null 2>&1 || true
-    echo "tailscale serve: removed Collie's http :${PORT} mapping"
-  else
-    tailscale serve --https=443 off >/dev/null 2>&1 || true
-    echo "tailscale serve: removed Collie's https :443 mapping"
+  disable_serve_route "$SERVE_MODE" "$SERVE_PORT" "$BASE_PATH"
+  if [ "$BASE_PATH" != "/" ]; then
+    disable_serve_route "$SERVE_MODE" "$SERVE_PORT" "/sw.js"
   fi
+  if load_recorded_serve_route; then
+    if [ "$RECORDED_SERVE_MODE" != "$SERVE_MODE" ] ||
+      [ "$RECORDED_SERVE_PORT" != "$SERVE_PORT" ] ||
+      [ "$RECORDED_BASE_PATH" != "$BASE_PATH" ]; then
+      if [ "$RECORDED_BASE_PATH" != "/" ]; then
+        disable_serve_route "$RECORDED_SERVE_MODE" "$RECORDED_SERVE_PORT" "/sw.js"
+      fi
+      disable_serve_route "$RECORDED_SERVE_MODE" "$RECORDED_SERVE_PORT" "$RECORDED_BASE_PATH"
+    fi
+    rm -f "$SERVE_ROUTE_FILE"
+  fi
+  echo "tailscale serve: removed Collie's ${SERVE_MODE} :${SERVE_PORT}${BASE_PATH} mapping"
 }
 
 cmd_status() {
@@ -335,8 +637,8 @@ cmd_logs() {
 cmd_version() { collie_version; }
 
 # Fire a one-off Web Push to every subscribed device — verify push end-to-end without waiting for an
-# agent to actually block. Delegates to scripts/push-test.ts, which reuses the bridge's Push class;
-# the plugin .env sourced at the top of this script gives it the VAPID keys. Args: [title] [body] [paneId].
+# agent to actually block. Delegates to scripts/push-test.ts; the constrained .env loader above
+# supplies its VAPID keys. Args: [title] [body] [paneId].
 cmd_push_test() {
   [ -n "$BUN" ] || { echo "error: bun not found on PATH" >&2; exit 1; }
   "$BUN" run "${PLUGIN_ROOT}/scripts/push-test.ts" "$@"

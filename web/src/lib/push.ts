@@ -1,5 +1,6 @@
 import { fetchConfig } from "@/lib/api";
 import type { BridgeConfig } from "@/lib/types";
+import { COLLIE_BASE_PATH, withBasePath } from "@/lib/base-path";
 
 // Client-side control of Web Push: the browser subscription plus a per-device preference. The bridge
 // just stores whatever subscriptions it's told about and prunes dead ones on its own — a browser
@@ -76,7 +77,7 @@ export async function enablePush(): Promise<EnableResult> {
   if (!pushSupported()) return { ok: false, reason: "unsupported" };
   if (!window.isSecureContext) return { ok: false, reason: "insecure" };
 
-  const reg = await navigator.serviceWorker.register("/sw.js");
+  const reg = await navigator.serviceWorker.register(withBasePath("/sw.js"), { scope: COLLIE_BASE_PATH });
   const cfg = await fetchConfig();
   if (!cfg.push || !cfg.vapidPublicKey) return { ok: false, reason: "server-off" };
   if (Notification.permission === "denied") return { ok: false, reason: "denied" };
@@ -99,7 +100,7 @@ export async function enablePush(): Promise<EnableResult> {
       applicationServerKey: serverKey,
     });
   }
-  await fetch("/api/subscribe", {
+  await fetch(withBasePath("/api/subscribe"), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(sub),

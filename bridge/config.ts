@@ -64,6 +64,11 @@ export interface Config {
    * check meaningless (see ARCHITECTURE.md §6). Override only if you know exactly why.
    */
   host: string;
+  /**
+   * Optional Unix-domain HTTP listener. When set, this replaces {@link host}/{@link port}; placing
+   * it in a 0700 directory prevents other local accounts from bypassing the Tailscale proxy.
+   */
+  unixSocket: string;
   /** Poll cadence for the state engine, ms. Also the fast fallback cadence when the event stream is down. */
   pollMs: number;
   /**
@@ -83,19 +88,17 @@ export interface Config {
   /** Key sequence sent to submit a reply after the text (agent-dependent; see HERDR_API.md). */
   submitKeys: string[];
   /**
-   * Tailscale identity gate. If set, any request carrying a `Tailscale-User-Login` header
-   * (injected by `tailscale serve`) must match this login — a mismatching tailnet user is
-   * rejected. A request with no such header still passes (direct-loopback callers don't get one),
-   * so this narrows *which* user is trusted rather than mandating the header. Empty = trust any
-   * loopback caller (fine when only tailscaled can reach the port).
+   * Tailscale identity gate. If set, every request must carry a matching
+   * `Tailscale-User-Login` header injected by `tailscale serve`; missing and mismatching
+   * identities are rejected. Empty disables this gate.
    */
   trustedUser: string;
   /**
    * Per-device authorisation. Name of a request header carrying an opaque device identifier,
    * injected by a trusted upstream reverse proxy. Empty = the feature is off (no behaviour change).
    * When set, devices whose header value isn't in {@link deviceAllowlist} are read-only. See
-   * `deviceAuth()` in server.ts for the full matrix. The header is trusted only because the bridge
-   * binds loopback behind the proxy — a direct client can't set it (same trust basis as trustedUser).
+   * `deviceAuth()` in server.ts for the full matrix. The header is trusted only when the reverse
+   * proxy is the listener's sole effective caller; a direct local client can forge it.
    */
   deviceHeader: string;
   /**
@@ -151,6 +154,7 @@ export function loadConfig(): Config {
     socketPath: process.env.HERDR_SOCKET_PATH ?? join(homedir(), ".config", "herdr", "herdr.sock"),
     port: envInt("COLLIE_PORT", 8787, { min: 1, max: 65535 }),
     host: process.env.COLLIE_HOST ?? "127.0.0.1",
+    unixSocket: (process.env.COLLIE_UNIX_SOCKET ?? "").trim(),
     pollMs: envInt("COLLIE_POLL_MS", 1500, { min: 250 }),
     pollIdleMs: envInt("COLLIE_POLL_IDLE_MS", 12_000, { min: 1000 }),
     notifyDelayMs: envInt("COLLIE_NOTIFY_DELAY_MS", 30_000, { min: 0 }),

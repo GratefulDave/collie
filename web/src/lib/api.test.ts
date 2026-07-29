@@ -178,6 +178,33 @@ describe("api client — session scoping", () => {
   });
 });
 
+describe("api client — build base path", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it("prefixes requests with the configured subpath", async () => {
+    vi.stubEnv("BASE_URL", "/collie/");
+    vi.resetModules();
+    // Reload after BASE_URL changes; static imports cannot observe a new build-time value.
+    const { fetchSnapshot: fetchFromSubpath, fetchPane: fetchPaneFromSubpath } = await import("./api");
+    const urls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify(fixtureSnapshot), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    await fetchFromSubpath();
+    await fetchPaneFromSubpath("w1:p1", 600);
+
+    expect(urls).toEqual(["/collie/api/snapshot", "/collie/api/pane/w1%3Ap1?lines=600"]);
+  });
+});
+
 // The fetch layer is where liveness is stamped onto the shared lib/connection-health anchor (the same
 // interception point that captures X-Collie-Build). A live snapshot/pane stamps; a 200 that reports
 // the herd link down must NOT — otherwise the "Herdr is down" escalation could never fire.

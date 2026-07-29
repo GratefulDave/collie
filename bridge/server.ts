@@ -72,8 +72,8 @@ const SECURITY_HEADERS: Record<string, string> = {
   "referrer-policy": "no-referrer",
 };
 
-// Loopback Host/Origin forms (with an optional port). Loopback is always trusted — only tailscaled
-// (or a co-located proxy) can reach the bridge's port, so a loopback caller is the on-host operator.
+// Loopback Host/Origin forms (with an optional port). These bypass only Host/Origin checks for
+// on-host operation; a configured trusted-user identity is still mandatory.
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
 const PANE_ROUTE = /^\/api\/pane\/([^/]+)(?:\/(reply|keys|upload|close|rename))?$/;
@@ -91,13 +91,15 @@ export function startServer(opts: {
   audit: AuditLog;
 }) {
   const { cfg, registry, push, snooze, notifyPrefs, updateMonitor, audit } = opts;
+  const listen = cfg.unixSocket
+    ? { unix: cfg.unixSocket }
+    : { hostname: cfg.host, port: cfg.port };
   // Per-session background notifications live in each session's runtime (built by the factory in
   // index.ts, wired to its StateEngine transitions). The routes here only fan preference changes and
   // snooze-clears across every live session's coordinator.
 
   const server = Bun.serve({
-    hostname: cfg.host,
-    port: cfg.port,
+    ...listen,
     // Runtime cap on any request body — a chunked/lying client is cut off here even if its
     // Content-Length is absent or false. The upload handler still does its own precise check.
     maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
@@ -276,13 +278,19 @@ export function startServer(opts: {
         await updateMonitor.checkRelease();
         return json(updateMonitor.status(), req.headers.get("accept-encoding"));
       }
+      if (pathname === "/__collie_legacy_root_sw_cleanup.js") {
+        return legacyRootWorkerCleanup(process.env.COLLIE_BASE_PATH ?? "/");
+      }
+
+
 
       // ── Static PWA (with SPA fallback) ───────────────────────────────────
       return serveStatic(pathname);
     },
   });
 
-  console.log(`[bridge] listening on http://${cfg.host}:${cfg.port}  (poll ${cfg.pollMs}ms)`);
+  const address = cfg.unixSocket ? `unix:${cfg.unixSocket}` : `http://${cfg.host}:${cfg.port}`;
+  console.log(`[bridge] listening on ${address}  (poll ${cfg.pollMs}ms)`);
   if (cfg.deviceHeader) {
     console.log(
       `[bridge] per-device auth ON: trusting '${cfg.deviceHeader}', ${cfg.deviceAllowlist.length} device(s) allowlisted`,
@@ -315,11 +323,11 @@ export function startupWarnings(cfg: Config): string[] {
     );
   }
   if (cfg.skipServe) {
-    // Reverse-proxy mode: no tailscale serve injects Tailscale-User-Login, so checkAccess never has
-    // an identity to enforce — trustedUser is dead config. Only nag when it's set (a likely mistake).
+    // Reverse-proxy mode: the proxy must inject a matching Tailscale-User-Login if trustedUser is
+    // configured; otherwise the mandatory identity gate denies every API request.
     if (cfg.trustedUser) {
       warnings.push(
-        `[bridge] WARNING: COLLIE_TRUSTED_USER has no effect under COLLIE_SKIP_SERVE=1 — without tailscale serve in front, the Tailscale-User-Login header is never injected. Use COLLIE_DEVICE_HEADER for per-device auth (see README → Variant C).`,
+        `[bridge] WARNING: COLLIE_TRUSTED_USER under COLLIE_SKIP_SERVE=1 requires the reverse proxy to inject a matching Tailscale-User-Login; otherwise every API request is denied. Usually leave it empty and use the proxy's access control plus COLLIE_DEVICE_HEADER (see README → Variant C).`,
       );
     }
   } else if (!cfg.trustedUser) {
@@ -786,8 +794,8 @@ async function uploadPane(
  *  - Origin required for writes: a state-changing (`level === "write"`) request with no Origin is
  *    trusted only from loopback (curl on the host). Browsers always send Origin on fetch/SW POSTs,
  *    so a missing Origin on a remote write is a non-browser or Origin-stripped request — reject it.
- *  - Optional Tailscale identity: if a trusted user is configured and `tailscale serve` injects a
- *    `Tailscale-User-Login`, it must match.
+ *  - Tailscale identity: when a trusted user is configured, every API request must carry the
+ *    matching `Tailscale-User-Login` injected by `tailscale serve`.
  */
 export function checkAccess(
   req: Request,
@@ -822,7 +830,8 @@ export function checkAccess(
 
   if (cfg.trustedUser) {
     const login = req.headers.get("tailscale-user-login");
-    if (login && login !== cfg.trustedUser) {
+    if (!login) return { ok: false, reason: "identity required" };
+    if (login !== cfg.trustedUser) {
       return { ok: false, reason: "identity not trusted" };
     }
   }
@@ -865,13 +874,13 @@ function guard(req: Request, cfg: Config, level: "read" | "write"): Response | n
 /**
  * Optional per-device authorisation, layered on top of {@link checkAccess}. Off by default; enabled
  * by setting COLLIE_DEVICE_HEADER to the header a trusted upstream proxy injects, carrying an opaque
- * device identifier. The header is trusted only because the bridge binds loopback behind the proxy,
- * so a direct client can't forge it (the same trust basis as the Tailscale identity header). Matrix:
+ * device identifier. The proxy must be the only caller able to reach the listener; otherwise a
+ * direct local client can forge this header. Matrix:
  *
  *   - feature off (no header configured) → not enforced, fully authorised (today's behaviour).
  *   - header absent                      → authorised, unchanged. The proxy injects the header for
- *                                          real device traffic; an absent header is the on-host
- *                                          loopback operator (same tolerance as a missing identity).
+ *                                          real device traffic; an absent header is treated as an
+ *                                          on-host loopback operator.
  *   - header present, value allowlisted  → authorised; the session is attributed to that device.
  *   - header present, value not listed   → read-only. The "unknown" sentinel is never authorised,
  *                                          and an empty allowlist makes every device read-only — a
@@ -1000,6 +1009,33 @@ export function resolveStaticPath(
   return { rel, full };
 }
 
+function legacyRootWorkerCleanup(basePath: string): Response {
+  const validBasePath =
+    basePath === "/" || /^\/[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/.test(basePath) ? basePath : "/";
+  const script = `const basePath=${JSON.stringify(validBasePath)};
+self.addEventListener("install", event => event.waitUntil(self.skipWaiting()));
+self.addEventListener("activate", event => event.waitUntil((async () => {
+  await self.clients.claim();
+  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  await self.registration.unregister();
+  await Promise.all(clients
+    .filter(client => {
+      const path = new URL(client.url).pathname;
+      return path === basePath || path.startsWith(basePath + "/");
+    })
+    .map(client => client.navigate(client.url)));
+})()));`;
+  return secure(
+    new Response(script, {
+      headers: {
+        "content-type": "text/javascript; charset=utf-8",
+        "cache-control": "no-cache",
+        "service-worker-allowed": "/",
+      },
+    }),
+  );
+}
+
 async function serveStatic(pathname: string): Promise<Response> {
   const resolved = resolveStaticPath(pathname);
   if (!resolved) return text("forbidden", 403);
@@ -1027,7 +1063,7 @@ async function serveStatic(pathname: string): Promise<Response> {
     "cache-control": cacheControlFor(rel),
   };
   if (ext === ".html") headers["content-security-policy"] = CSP;
-  if (rel === "sw.js") headers["service-worker-allowed"] = "/";
+  if (rel === "sw.js" || rel === "legacy-root-sw-cleanup.js") headers["service-worker-allowed"] = "/";
   return secure(new Response(file, { headers }));
 }
 

@@ -33,6 +33,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     socketPath: "/tmp/herdr.sock",
     port: 8787,
     host: "127.0.0.1",
+    unixSocket: "",
     pollMs: 1500,
     pollIdleMs: 12_000,
     notifyDelayMs: 30_000,
@@ -122,9 +123,12 @@ describe("checkAccess — Tailscale identity gate", () => {
     ).toEqual({ ok: false, reason: "identity not trusted" });
   });
 
-  test("with a trusted user set, a missing header still passes (documented loopback tolerance)", () => {
+  test("with a trusted user set, a missing header is rejected", () => {
     const c = cfg({ trustedUser: "me@example.com" });
-    expect(checkAccess(req({ host: "h" }), c)).toEqual({ ok: true });
+    expect(checkAccess(req({ host: "h" }), c)).toEqual({
+      ok: false,
+      reason: "identity required",
+    });
   });
 });
 
@@ -397,9 +401,9 @@ describe("deviceAuth — per-device authorisation", () => {
 describe("startupWarnings — security-posture nags", () => {
   const has = (ws: string[], needle: string) => ws.some((w) => w.includes(needle));
 
-  test("skipServe + trustedUser: warns the identity gate is inert and points at the device header", () => {
+  test("skipServe + trustedUser: warns the proxy must inject the mandatory identity", () => {
     const ws = startupWarnings(cfg({ skipServe: true, trustedUser: "me@example.com" }));
-    expect(has(ws, "COLLIE_TRUSTED_USER has no effect")).toBe(true);
+    expect(has(ws, "requires the reverse proxy to inject")).toBe(true);
     expect(has(ws, "COLLIE_DEVICE_HEADER")).toBe(true);
     expect(has(ws, "Variant C")).toBe(true);
     // The Variant-A empty-trustedUser nag must NOT also fire (it's meaningless behind a proxy).

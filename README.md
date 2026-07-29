@@ -10,8 +10,8 @@ so your phone's own voice dictation (Android & iOS) works in it for free — Col
 voice support of its own. Each agent gets a colored terminal mirror, a slash-command palette, and a
 special-keys pad.
 
-A Herdr plugin (thin launcher) plus a Bun/TypeScript bridge running as a `systemd --user` service,
-serving a Vite + React + shadcn PWA.
+A Herdr plugin (thin launcher) plus a Bun/TypeScript bridge supervised by `systemd --user` on Linux
+or a `launchd` agent on macOS, serving a Vite + React + shadcn PWA.
 
 ## Contents
 
@@ -96,7 +96,8 @@ It's built single-user and tailnet-only. The defenses:
   TLS, injects the identity header) or a conforming reverse proxy
   ([Variant C](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)). Never
   `tailscale funnel`, never a bare port.
-- **Optional identity gate** — set `COLLIE_TRUSTED_USER` to reject anyone but you.
+- **Optional identity gate** — set `COLLIE_TRUSTED_USER` to require the matching
+  `Tailscale-User-Login`; missing or different identities are rejected.
 - **Optional per-device gate** — behind a proxy that injects a device-identity header, set
   `COLLIE_DEVICE_HEADER` + `COLLIE_DEVICE_ALLOWLIST` so only allowlisted devices can drive agents;
   any other device is read-only. Off by default; revoke a device by dropping it from the list.
@@ -125,9 +126,9 @@ On the **host** (the tailnet node your agents run on):
 | **git** | Clone, and the `update` command. |
 
 Soft dependencies: **Node.js** (the control script uses it to extract your MagicDNS name from
-`tailscale status --json`; without it the banner falls back to the loopback URL) and **`systemd
---user`** (supervises the service; falls back to a `nohup` process without it). You never install JS
-deps by hand — the build runs `bun install` for you; the backend imports only Bun + `node:*`.
+`tailscale status --json`; without it the banner falls back to the loopback URL) and the native user
+supervisor (**`systemd --user`** on Linux; **`launchd`** on macOS). You never install JS deps by hand
+— the build runs `bun install` for you; the backend imports only Bun + `node:*`.
 [`web-push`](https://www.npmjs.com/package/web-push) is optional and lazy (see [Web
 Push](#web-push-optional)).
 
@@ -153,8 +154,10 @@ herdr plugin action invoke start --plugin herdr.collie
 They differ only in *when* the UI builds: a GitHub install builds at install time (the manifest's
 `[[build]]` step); a linked clone builds on first `start`. Either way, `start` does four things:
 
-1. **builds** `web/dist` if it's missing (typechecked, staged, swapped in atomically),
-2. **starts the bridge** as the `systemd --user` service `collie` (`nohup` fallback without systemd),
+1. **builds** `web/dist` if it's missing or its public mount changed (typechecked, staged, swapped
+   in atomically),
+2. **starts the bridge** through the native user supervisor: `systemd --user` service `collie` on
+   Linux or `launchd` agent `herdr.collie` on macOS,
 3. **publishes it on the tailnet** — literally `tailscale serve --bg 8787`: HTTPS on the host's
    MagicDNS name, `:443 → 127.0.0.1:8787`, tailnet-only,
 4. **prints the banner** with the URL to open — walked through line by line in
@@ -192,10 +195,11 @@ The `✓` is a real probe — the script connected to the bridge's port and got 
 
 1. **`web/dist`** — the built UI. The bridge serves it from disk at request time, so later UI
    rebuilds go live without a restart.
-2. **A `systemd --user` service named `collie`** — unit file written to
-   `~/.config/systemd/user/collie.service`, enabled and started, auto-restarting on failure.
-   Inspect it with `systemctl --user status collie`. (No usable systemd? A `nohup` process with a
-   pidfile in the config dir instead.)
+2. **A native user service** — Linux writes and enables
+   `~/.config/systemd/user/collie.service`; macOS writes and bootstraps
+   `~/Library/LaunchAgents/herdr.collie.plist`. Both start the bridge now and restart it after a
+   failure. Inspect Linux with `systemctl --user status collie`, macOS with
+   `launchctl print gui/$(id -u)/herdr.collie`.
 3. **A tailnet-only `tailscale serve` mapping** — the script ran `tailscale serve --bg 8787`:
    HTTPS on the host's MagicDNS name, `:443 → 127.0.0.1:8787`. Tailscale terminates TLS (managed
    cert, nothing to obtain or renew) and injects the identity header the bridge checks. Inspect
@@ -250,15 +254,17 @@ see [Troubleshooting](#troubleshooting).
 
 ### Surviving reboots
 
-A `systemd --user` service only runs while you have a login session. On a host that should serve
-Collie unattended, enable lingering once:
+On Linux, a `systemd --user` service only runs while you have a login session. On a host that should
+serve Collie unattended, enable lingering once:
 
 ```bash
 loginctl enable-linger $USER
 ```
 
-The unit is `enable`d, so with lingering it starts at boot with your user manager; the
-`tailscale serve` mapping is persistent (`--bg`) and comes back on its own.
+The Linux unit is `enable`d, so lingering starts it at boot with your user manager. On macOS,
+Collie uses a per-user `LaunchAgent`: it starts automatically when that user logs in and restarts
+after failure. It deliberately does not use a root `LaunchDaemon`; remote terminal control must not
+run with elevated privileges. The `tailscale serve` mapping is persistent (`--bg`) on both platforms.
 
 ## Configure
 
@@ -284,6 +290,23 @@ The bridge reads `.env` only at startup — after any edit, `scripts/collie-ctl.
 [`.env.example`](./.env.example) for the full option list — commonly `COLLIE_PORT`, or
 `COLLIE_SERVE_MODE=http` (Headscale / `.internal` domains; read by the control script when it runs
 `tailscale serve`).
+
+The control script treats `.env` as data, never shell code: use literal `NAME=value` lines (matching
+single or double quotes are allowed; interpolation is not). For secret safety it refuses symlinks or
+files owned by another user and restricts the file to `0600` before starting Collie.
+
+To publish on a non-default HTTPS endpoint or below a path, set both the public listener and the
+mount. The host/origin entries must exactly match the browser URL:
+
+```bash
+COLLIE_SERVE_PORT=8443
+COLLIE_BASE_PATH=/collie
+COLLIE_PUBLIC_HOSTS=macbook-pro-2.taild4c414.ts.net:8443
+COLLIE_ALLOWED_ORIGINS=https://macbook-pro-2.taild4c414.ts.net:8443
+```
+
+`start` rebuilds the PWA with that base and installs a tailnet-only Tailscale Serve route at
+`https://macbook-pro-2.taild4c414.ts.net:8443/collie`; the bridge remains bound to loopback.
 
 **Custom domain or reverse proxy?** See
 [Variant C](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale) for the full reverse-proxy
@@ -349,9 +372,9 @@ Pause the bridge without removing anything (a later `start` brings it right back
 scripts/collie-ctl.sh stop      # or: herdr plugin action invoke stop --plugin herdr.collie
 ```
 
-To tear the service down completely — stop + disable it, remove the `systemd --user` unit, and remove
-Collie's own `tailscale serve` mapping (port-scoped, so other tailnet mappings on the host survive) —
-use `uninstall`. It leaves your `.env` and the checkout untouched:
+To tear the service down completely — stop + disable the Linux unit or remove the macOS LaunchAgent,
+then remove Collie's own `tailscale serve` mapping (port-scoped, so other tailnet mappings on the host
+survive) — use `uninstall`. It leaves your `.env` and the checkout untouched:
 
 ```bash
 scripts/collie-ctl.sh uninstall # or: herdr plugin action invoke uninstall --plugin herdr.collie
@@ -388,7 +411,7 @@ Tailscale/proxy by **device** (B), or a reverse proxy as the sole front door (C)
 
 The happy path from [Install](#install). `tailscale serve` terminates TLS on your MagicDNS name and
 injects `Tailscale-User-Login`; set `COLLIE_TRUSTED_USER` to your tailnet login and the bridge
-rejects anyone else.
+requires that exact identity on every API request.
 
 ```bash
 # in your .env
@@ -496,11 +519,11 @@ COLLIE_DEVICE_ALLOWLIST=my-phone,my-laptop          # …and the ids allowed to 
 # COLLIE_PUBLIC_URL=https://collie.example.com      # optional — shown in the collie-ctl.sh status banner
 ```
 
-> ⚠️ **`COLLIE_TRUSTED_USER` does nothing here.** It gates on `Tailscale-User-Login`, which only
-> `tailscale serve` injects — with no Tailscale in the path there is no injector, and the bridge
-> logs a startup warning saying so. **Per-device auth (`COLLIE_DEVICE_HEADER`) is the write gate**,
-> and the **proxy must provide TLS and its own access control** — anyone who reaches the proxy gets
-> read access to every pane. Give the proxy the same respect you'd give the tailnet.
+> ⚠️ Leave `COLLIE_TRUSTED_USER` unset here unless the proxy intentionally injects a matching
+> `Tailscale-User-Login`; once configured, that header is mandatory and missing identities are
+> rejected. **Per-device auth (`COLLIE_DEVICE_HEADER`) is the write gate**, while the **proxy must
+> provide TLS and its own access control** — anyone who passes the proxy gets read access to every
+> pane. Give the proxy the same respect you'd give the tailnet.
 
 **Caching: respect the origin's `Cache-Control` — never blanket-cache.** The bridge marks hashed
 assets (`/assets/*`) immutable and everything else (notably `/sw.js` and `index.html`) `no-cache`.
@@ -555,10 +578,10 @@ Headscale / `.internal` tailnet domains — HTTPS certs aren't available, which 
 
 **Banner shows `⚠ Collie isn't answering on :8787 yet`.** The service was started but the HTTP
 server isn't answering the probe. `scripts/collie-ctl.sh logs` (or `journalctl --user -u collie -f`
-to watch live) says why — most commonly the port is already taken (set `COLLIE_PORT` in `.env`, then
+on Linux) says why — most commonly the port is already taken (set `COLLIE_PORT` in `.env`, then
 `scripts/collie-ctl.sh restart`, which also re-runs `tailscale serve` against the new port) or the
-first build failed (the log says so; fix and run `scripts/collie-ctl.sh build`). The unit
-auto-restarts every 5 s, so once the cause is fixed it usually comes back on its own.
+first build failed (the log says so; fix and run `scripts/collie-ctl.sh build`). The native supervisor
+restarts failures after 5 s, so once the cause is fixed it usually comes back on its own.
 
 **Phone can't open the tailnet URL.** Work down the list: (1) the phone runs the Tailscale app and
 is *connected* to the same tailnet as the host; (2) you're opening the banner's `tailnet` URL
@@ -572,10 +595,11 @@ through an origin the bridge doesn't expect — a custom domain, or a proxy that
 Allow the exact public origin with `COLLIE_ALLOWED_ORIGINS` (see [Configure](#configure)), or make
 the proxy forward `Host` unchanged (Variant B, rule 4).
 
-**Collie is gone after a reboot.** A `systemd --user` unit only runs while you have a session — on a
-headless host enable lingering once (`loginctl enable-linger $USER`) and the `collie` unit (already
-`enable`d) starts at boot with your user manager. The `tailscale serve` mapping persists on its own
-(`--bg`), so lingering is usually the whole fix.
+**Collie is gone after a reboot.** On Linux, enable lingering once
+(`loginctl enable-linger $USER`); the already-enabled `collie` unit then starts with the user manager.
+On macOS, `start` installs `~/Library/LaunchAgents/herdr.collie.plist`, which loads when you log in.
+Collie intentionally does not run before login as root. The `tailscale serve` mapping persists on its
+own (`--bg`).
 
 **Phone shows a stale UI after a rebuild.** A PWA's service-worker cache is per-origin, so reaching
 Collie at two origins (a custom domain *and* the raw `host:8787`) gives you two installs, each

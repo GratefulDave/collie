@@ -4,6 +4,7 @@
 import { trackBusy } from "./busy";
 import { markLive } from "./connection-health";
 import { observeServerBuild, SERVER_BUILD_HEADER } from "./server-build";
+import { withBasePath } from "./base-path";
 import type {
   ActionResponse,
   BridgeConfig,
@@ -91,14 +92,15 @@ async function doReq<T>(path: string, init?: RequestInit): Promise<T> {
   // GET reads get the short leash; anything mutating gets the longer mutation budget.
   const method = init?.method?.toUpperCase() ?? "GET";
   const timeoutMs = method === "GET" ? GET_TIMEOUT_MS : MUTATION_TIMEOUT_MS;
-  const res = await fetch(path, {
+  const url = withBasePath(path);
+  const res = await fetch(url, {
     ...init,
     signal: withTimeout(init?.signal, timeoutMs),
     headers: { "content-type": "application/json", ...init?.headers },
   });
   captureBuild(res);
   if (!res.ok) {
-    throw new ApiError(`${path} → ${res.status} ${await errorDetail(res)}`, res.status);
+    throw new ApiError(`${url} → ${res.status} ${await errorDetail(res)}`, res.status);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -161,7 +163,7 @@ export async function fetchPane(
   const headers: Record<string, string> = {};
   if (cached) headers["if-none-match"] = cached.etag;
 
-  const res = await fetch(url, { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
+  const res = await fetch(withBasePath(url), { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
   captureBuild(res); // pane polls carry the build header too (incl. 304s) — keep the store fresh
 
   if (res.status === 304 && cached) {
@@ -322,7 +324,7 @@ export function uploadImage(paneId: string, file: File, session?: string): Promi
     (async () => {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await fetch(withSession(`/api/pane/${encodeURIComponent(paneId)}/upload`, session), {
+      const res = await fetch(withBasePath(withSession(`/api/pane/${encodeURIComponent(paneId)}/upload`, session)), {
         method: "POST",
         body: fd,
         signal: withTimeout(undefined, UPLOAD_TIMEOUT_MS),

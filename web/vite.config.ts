@@ -5,11 +5,14 @@ import { VitePWA } from "vite-plugin-pwa";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { normalizeBasePath } from "./base-path";
 
 // The bridge (Bun server) serves the built app from `web/dist` and proxies nothing — the
 // browser talks to the same origin for both static files and /api. In `vite dev`, proxy the
 // bridge so the SPA can hit the real socket-backed API while you iterate on the UI.
 const BRIDGE = process.env.COLLIE_DEV_TARGET ?? "http://127.0.0.1:8787";
+const COLLIE_BASE_PATH = normalizeBasePath(process.env.COLLIE_BASE_PATH);
+const apiProxyPath = `${COLLIE_BASE_PATH.slice(0, -1)}/api`;
 
 // Dev-only: extra Host headers to accept besides localhost. Set COLLIE_DEV_HOSTS to a comma-separated
 // list (or "*" for any) when viewing the dev server from another device — e.g. a tailnet MagicDNS
@@ -93,6 +96,7 @@ const BUILD_INFO = {
   sha: buildSha,
   time: buildTime,
   id: `${stampedVersion}+${buildSha}.${Math.floor(Date.parse(buildTime) / 1000)}`,
+  basePath: COLLIE_BASE_PATH,
 };
 
 // Emit dist/build-info.json so the bridge can read the current build id. Kept out of the SW precache
@@ -109,6 +113,7 @@ const buildInfoPlugin: Plugin = {
 };
 
 export default defineConfig({
+  base: COLLIE_BASE_PATH,
   define: { __BUILD_INFO__: JSON.stringify(BUILD_INFO) },
   plugins: [
     react(),
@@ -125,6 +130,7 @@ export default defineConfig({
       injectRegister: false,
       registerType: "autoUpdate",
       strategies: "injectManifest",
+      scope: COLLIE_BASE_PATH,
       srcDir: "src",
       filename: "sw.ts", // source; compiled to dist/sw.js (the bridge sets Service-Worker-Allowed: /)
       includeAssets: ["favicon.svg", "favicon.ico", "favicon-96x96.png", "apple-touch-icon.png"],
@@ -132,9 +138,9 @@ export default defineConfig({
         name: "Collie",
         short_name: "Collie",
         description: "Monitor and reply to your Herdr agent herd from your phone",
-        id: "/",
-        start_url: "/",
-        scope: "/",
+        id: COLLIE_BASE_PATH,
+        start_url: COLLIE_BASE_PATH,
+        scope: COLLIE_BASE_PATH,
         display: "standalone",
         orientation: "portrait",
         background_color: "#0a0a0a",
@@ -144,8 +150,18 @@ export default defineConfig({
           // icon and the Android adaptive ("maskable") icon. (favicon.svg is intentionally NOT a
           // manifest icon: it's a low-res raster-in-svg for the browser tab only — declaring it
           // sizes:"any" would let an installer pick it and render the install icon blurry.)
-          { src: "/web-app-manifest-192x192.png", sizes: "192x192", type: "image/png", purpose: "any maskable" },
-          { src: "/web-app-manifest-512x512.png", sizes: "512x512", type: "image/png", purpose: "any maskable" },
+          {
+            src: `${COLLIE_BASE_PATH}web-app-manifest-192x192.png`,
+            sizes: "192x192",
+            type: "image/png",
+            purpose: "any maskable",
+          },
+          {
+            src: `${COLLIE_BASE_PATH}web-app-manifest-512x512.png`,
+            sizes: "512x512",
+            type: "image/png",
+            purpose: "any maskable",
+          },
         ],
       },
       injectManifest: {
@@ -171,7 +187,12 @@ export default defineConfig({
     port: 5173,
     allowedHosts,
     proxy: {
-      "/api": { target: BRIDGE, changeOrigin: true },
+      [apiProxyPath]: {
+        target: BRIDGE,
+        changeOrigin: true,
+        // Mirror Tailscale Serve's --set-path mount: the bridge always receives /api/....
+        rewrite: (path) => path.slice(COLLIE_BASE_PATH.length - 1),
+      },
     },
   },
 });

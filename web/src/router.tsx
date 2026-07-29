@@ -1,4 +1,5 @@
 import { createBrowserRouter } from "react-router";
+import { COLLIE_BASE_PATH } from "@/lib/base-path";
 
 import { BootSplash, RootError, RootLayout } from "@/routes/root";
 import { HomeRoute } from "@/routes/home";
@@ -39,4 +40,4 @@ export const router = createBrowserRouter([
       { path: "pane/:paneId", loader: paneLoader, element: <DetailRoute /> },
     ],
   },
-]);
+], { basename: COLLIE_BASE_PATH === "/" ? "/" : COLLIE_BASE_PATH.slice(0, -1) });

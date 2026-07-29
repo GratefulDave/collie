@@ -3,6 +3,7 @@ import { precacheAndRoute, createHandlerBoundToURL } from "workbox-precaching";
 import { NavigationRoute, registerRoute } from "workbox-routing";
 import { clientsClaim } from "workbox-core";
 
+import { withBasePath } from "./lib/base-path";
 import { decidePush, type PushPayload } from "./lib/push-decision";
 
 // Custom service worker (vite-plugin-pwa `injectManifest`). It does everything the old generated
@@ -22,7 +23,12 @@ declare const self: ServiceWorkerGlobalScope & {
 // ── App-shell caching (parity with the previous generateSW config) ──────────────────────────────
 precacheAndRoute(self.__WB_MANIFEST);
 // SPA fallback so deep links (/pane/:id) resolve offline too; never intercept the API.
-registerRoute(new NavigationRoute(createHandlerBoundToURL("/index.html"), { denylist: [/^\/api\//] }));
+const API_PATH = withBasePath("/api/");
+registerRoute(
+  new NavigationRoute(createHandlerBoundToURL(withBasePath("/index.html")), {
+    denylist: [new RegExp(`^${API_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)],
+  }),
+);
 
 // `registerType: "autoUpdate"` means a fresh build should take over without a user gesture. With
 // injectManifest we own that lifecycle: skip the waiting phase on install, claim open clients on
@@ -36,7 +42,7 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
 // ── Web Push ────────────────────────────────────────────────────────────────────────────────────
 // The branching (suppress vs show vs clear, tag/title/renotify) lives in lib/push-decision so it's
 // unit-tested; here we only parse the event, read client visibility, and run the side effect.
-const ICON = "/web-app-manifest-192x192.png";
+const ICON = withBasePath("/web-app-manifest-192x192.png");
 
 self.addEventListener("push", (event: PushEvent) => {
   event.waitUntil(handlePush(event));
@@ -98,7 +104,7 @@ self.addEventListener("notificationclick", (event: NotificationEvent) => {
   event.notification.close();
   const data = (event.notification.data as NotifData | null) ?? {};
   if (data.target === "settings") {
-    event.waitUntil(openPath("/settings"));
+    event.waitUntil(openPath(withBasePath("/settings")));
     return;
   }
   event.waitUntil(openPane(data.paneId, data.session));
@@ -107,8 +113,8 @@ self.addEventListener("notificationclick", (event: NotificationEvent) => {
 // Deep-link to the agent's pane — the body-tap path. The session rides along as `?s=` so it lands in
 // the right herd (omitted for primary). Delegates the focus/navigate/open to openPath.
 async function openPane(paneId: string | undefined, session?: string): Promise<void> {
-  const base = paneId && paneId !== "test" ? `/pane/${encodeURIComponent(paneId)}` : "/";
-  await openPath(`${base}${sessionSearchParam(session)}`);
+  const path = paneId && paneId !== "test" ? `/pane/${encodeURIComponent(paneId)}` : "/";
+  await openPath(`${withBasePath(path)}${sessionSearchParam(session)}`);
 }
 
 // Focus an existing Collie tab (navigating it to `path`) or open a new one. `path` is origin-relative.
