@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { join } from "node:path";
 
-import { loadConfig } from "./config.ts";
+import { defaultSocketPath, loadConfig } from "./config.ts";
 
 // loadConfig is the deployment contract — env vars in, a resolved Config out. Pure (just reads
 // process.env + homedir), so we drive it by mutating the environment and restoring it after.
@@ -13,6 +14,8 @@ const KEYS = [
   "COLLIE_POLL_IDLE_MS",
   "COLLIE_NOTIFY_DELAY_MS",
   "COLLIE_READ_LINES",
+  "COLLIE_TRANSCRIPT",
+  "COLLIE_TRANSCRIPT_ROOT",
   "COLLIE_SUBMIT_KEYS",
   "COLLIE_TRUSTED_USER",
   "COLLIE_DEVICE_HEADER",
@@ -27,6 +30,7 @@ const KEYS = [
   "COLLIE_SKIP_SERVE",
   "HERDR_SOCKET_PATH",
   "HERDR_PLUGIN_STATE_DIR",
+  "COLLIE_HERDR_DIAL",
 ];
 
 let saved: Record<string, string | undefined>;
@@ -56,6 +60,9 @@ describe("loadConfig", () => {
     expect(cfg.pollMs).toBe(1500);
     expect(cfg.pollIdleMs).toBe(12_000);
     expect(cfg.readLines).toBe(200);
+    // Transcript history defaults ON — it's the only scrollback a Claude pane can ever have.
+    expect(cfg.transcript).toBe(true);
+    expect(cfg.transcriptRoot).toEndWith("/.claude/projects");
     expect(cfg.submitKeys).toEqual(["Enter"]);
     expect(cfg.trustedUser).toBe("");
     expect(cfg.allowedOrigins).toEqual([]);
@@ -105,6 +112,26 @@ describe("loadConfig", () => {
     expect(loadConfig().skipServe).toBe(false);
     process.env.COLLIE_SKIP_SERVE = "";
     expect(loadConfig().skipServe).toBe(false);
+  });
+
+  test("parses COLLIE_TRANSCRIPT as a boolean toggle (default ON)", () => {
+    for (const off of ["off", "0", "false", "no", "OFF"]) {
+      process.env.COLLIE_TRANSCRIPT = off;
+      expect(loadConfig().transcript).toBe(false);
+    }
+    for (const on of ["on", "1", "true", "yes"]) {
+      process.env.COLLIE_TRANSCRIPT = on;
+      expect(loadConfig().transcript).toBe(true);
+    }
+    // Garbage falls back to the default — a typo must not silently remove the only scrollback a
+    // Claude pane has.
+    process.env.COLLIE_TRANSCRIPT = "banana";
+    expect(loadConfig().transcript).toBe(true);
+  });
+
+  test("COLLIE_TRANSCRIPT_ROOT relocates the transcript root", () => {
+    process.env.COLLIE_TRANSCRIPT_ROOT = "/srv/claude/projects";
+    expect(loadConfig().transcriptRoot).toBe("/srv/claude/projects");
   });
 
   test("reads the per-device auth header and allowlist", () => {
@@ -183,5 +210,39 @@ describe("loadConfig", () => {
     const cfg = loadConfig();
     expect(cfg.trustedUser).toBe("me@example.com");
     expect(cfg.host).toBe("0.0.0.0");
+  });
+
+  test("dial mode defaults to auto and accepts a forced dialer", () => {
+    expect(loadConfig().dialMode).toBe("auto");
+    process.env.COLLIE_HERDR_DIAL = "net";
+    expect(loadConfig().dialMode).toBe("net");
+    process.env.COLLIE_HERDR_DIAL = "BUN"; // case-insensitive
+    expect(loadConfig().dialMode).toBe("bun");
+  });
+
+  test("an unrecognised dial mode falls back to auto rather than dialling nothing", () => {
+    process.env.COLLIE_HERDR_DIAL = "carrier-pigeon";
+    expect(loadConfig().dialMode).toBe("auto");
+  });
+});
+
+// Pure — both platform branches are testable from any host (expectations use join() so the
+// host's separator never leaks into the assertion).
+describe("defaultSocketPath", () => {
+  test("unix default lives under ~/.config/herdr", () => {
+    expect(defaultSocketPath("linux", {}, "/home/u")).toBe(join("/home/u", ".config", "herdr", "herdr.sock"));
+    expect(defaultSocketPath("darwin", {}, "/Users/u")).toBe(join("/Users/u", ".config", "herdr", "herdr.sock"));
+  });
+
+  test("win32 default honours APPDATA", () => {
+    expect(defaultSocketPath("win32", { APPDATA: "C:\\Users\\u\\AppData\\Roaming" }, "C:\\Users\\u")).toBe(
+      join("C:\\Users\\u\\AppData\\Roaming", "herdr", "herdr.sock"),
+    );
+  });
+
+  test("win32 falls back to <home>/AppData/Roaming when APPDATA is unset", () => {
+    expect(defaultSocketPath("win32", {}, "C:\\Users\\u")).toBe(
+      join("C:\\Users\\u", "AppData", "Roaming", "herdr", "herdr.sock"),
+    );
   });
 });

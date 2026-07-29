@@ -1,9 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRevalidator } from "react-router";
-import { CheckCircle2, Loader2, Plug, RefreshCw, RotateCw, TriangleAlert, WifiOff } from "lucide-react";
+import {
+  CheckCircle2,
+  Loader2,
+  LogIn,
+  Plug,
+  RefreshCw,
+  RotateCw,
+  TriangleAlert,
+  WifiOff,
+} from "lucide-react";
 
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { PROXY_AUTH_PATH } from "@/lib/sw-routes";
 import { useConnectionLost, useConnectionTrouble } from "@/hooks/use-connection-lost";
 import { useLoadingStalled } from "@/hooks/use-loading-stalled";
 import { useOnline } from "@/hooks/use-online";
@@ -16,6 +26,8 @@ interface ConnectionBannerProps {
   bridge: BridgeStatus | undefined;
   /** The last snapshot fetch failed (stale data on screen). */
   error: boolean;
+  /** The failed snapshot request was rejected with HTTP 401 or 403. */
+  authError: boolean;
 }
 
 // The result of the /api/config probe (which never touches Herdr): "unknown" until it resolves,
@@ -40,7 +52,67 @@ export const EXIT_MS = 200;
 // disagree; `connecting` is poll-truth (isConnecting) — navigator.onLine is COPY-only (it picks the
 // red cause), never a gate. Threshold lockstep with the shared clock is proven in use-connection-lost;
 // here we own the amber→red→green state machine and the smooth mount/unmount.
-export function ConnectionBanner({ bridge, error }: ConnectionBannerProps) {
+export function ConnectionBanner({ bridge, error, authError }: ConnectionBannerProps) {
+  if (authError) return <AuthErrorBanner />;
+  return <ConnectionStateBanner bridge={bridge} error={error} />;
+}
+
+// A refusal is not an outage, so it gets its own surface ahead of the connection state machine: no
+// probe, no reconnect spinner, no escalation clock. The copy stays deliberately non-specific about
+// the cause. The flag covers 401 and 403 alike, and a 403 can equally mean "this device is not
+// allowlisted", "host not allowed" or "cross-origin rejected", so naming any one of them would be
+// wrong more often than right. What the operator needs here is the one fact the old behaviour hid:
+// this is not the network.
+//
+// Reload alone is NOT enough to reach a fronting proxy, which is what this banner used to claim. In
+// an installed PWA the service worker answers every navigation it owns — a reload included — from
+// the precached app shell, so a reload re-renders the same refused UI and never touches the proxy.
+// "Sign in" is the escape: a real navigation to the one path the SW always passes to the network
+// (lib/sw-routes). An <a>, not a button, so it is an ordinary navigation the SW sees as such — and
+// so it still works if React is wedged. Reload stays alongside it, since a merely stale session on
+// an already-signed-in device recovers without leaving the app.
+function AuthErrorBanner() {
+  return (
+    <div className="grid shrink-0 grid-rows-[1fr] overflow-hidden opacity-100">
+      <div className="min-h-0 overflow-hidden">
+        <div
+          role="alert"
+          aria-live="polite"
+          className={cn(
+            "flex items-center gap-2 border-b px-4 py-1 text-xs [padding-top:calc(env(safe-area-inset-top)_+_0.25rem)]",
+            TINT.blocked.row,
+          )}
+        >
+          <TriangleAlert className={cn("size-3.5 shrink-0", TINT.blocked.icon)} />
+          <span className="min-w-0 flex-1 truncate font-medium text-foreground">
+            Access refused. This is not a connection problem.
+          </span>
+          <a
+            href={PROXY_AUTH_PATH}
+            className={cn(
+              buttonVariants({ size: "sm" }),
+              "h-6 gap-1 px-2 text-xs no-underline",
+            )}
+          >
+            <LogIn className="size-3.5" />
+            Sign in
+          </a>
+          <Button
+            size="icon"
+            variant="ghost"
+            aria-label="Reload"
+            className="size-6 text-muted-foreground"
+            onClick={() => window.location.reload()}
+          >
+            <RefreshCw className="size-3.5" />
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConnectionStateBanner({ bridge, error }: Omit<ConnectionBannerProps, "authError">) {
   const stalled = useLoadingStalled();
   const connecting = isConnecting({ bridge, error, stalled });
   const trouble = useConnectionTrouble(connecting);

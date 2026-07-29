@@ -5,17 +5,23 @@ import {
   cacheControlFor,
   checkAccess,
   deviceAuth,
+  guard,
+  historyParams,
   isHostAllowed,
+  isReservedAuthPath,
+  keysPane,
   normalizeTabLabel,
   paneReadResponse,
+  replyPane,
   resolveStaticPath,
   sendReplySteps,
   startupWarnings,
   withBuildHeader,
   type ReplySender,
 } from "./server.ts";
+import { AuditLog } from "./audit.ts";
 import type { Config } from "./config.ts";
-import type { PaneRead } from "./herdr-client.ts";
+import type { HerdrClient, PaneRead } from "./herdr-client.ts";
 
 // checkAccess is the API security gate (same-origin/CSRF + optional Tailscale identity). A
 // regression here silently opens remote shell access, so it gets the most direct coverage.
@@ -38,6 +44,8 @@ function cfg(overrides: Partial<Config> = {}): Config {
     pollIdleMs: 12_000,
     notifyDelayMs: 30_000,
     readLines: 200,
+    transcript: true,
+    transcriptRoot: "/tmp/claude-projects",
     submitKeys: ["Enter"],
     trustedUser: "",
     deviceHeader: "",
@@ -307,6 +315,249 @@ describe("sendReplySteps — two-step send & partial-failure clarity", () => {
   });
 });
 
+describe("pane write prompt binding", () => {
+  type ReadArgs = Parameters<HerdrClient["readPane"]>;
+
+  class FakePaneClient {
+    text = "Approve this command?\n1. Yes\n2. No";
+    readonly reads: ReadArgs[] = [];
+    readonly texts: Array<[string, string]> = [];
+    readonly keys: Array<[string, string[]]> = [];
+
+    readPane(
+      paneId: string,
+      source: ReadArgs[1],
+      lines: number,
+      format: ReadArgs[3],
+    ): Promise<PaneRead> {
+      this.reads.push([paneId, source, lines, format]);
+      return Promise.resolve({
+        pane_id: paneId,
+        text: this.text,
+        truncated: false,
+        revision: 1,
+      });
+    }
+
+    sendPaneText(paneId: string, text: string): Promise<void> {
+      this.texts.push([paneId, text]);
+      return Promise.resolve();
+    }
+
+    sendPaneKeys(paneId: string, keys: string[]): Promise<void> {
+      this.keys.push([paneId, keys]);
+      return Promise.resolve();
+    }
+  }
+
+  function request(body: unknown): Request {
+    return new Request("http://localhost/api/pane/w1%3Ap1/action", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  function auditEntries(): { audit: AuditLog; entries: Array<Record<string, unknown>> } {
+    const entries: Array<Record<string, unknown>> = [];
+    return {
+      audit: new AuditLog((line) => {
+        entries.push(JSON.parse(line));
+      }),
+      entries,
+    };
+  }
+
+  test("keys without expected_prompt writes without an extra pane read", async () => {
+    const client = new FakePaneClient();
+    const { audit } = auditEntries();
+    const res = await keysPane(
+      client as unknown as HerdrClient,
+      cfg(),
+      "w1:p1",
+      request({ keys: ["1"] }),
+      audit,
+      null,
+      "default",
+    );
+    expect(res.status).toBe(200);
+    expect(client.reads).toEqual([]);
+    expect(client.keys).toEqual([["w1:p1", ["1"]]]);
+  });
+
+  test("reply without expected_prompt writes without an extra pane read", async () => {
+    const client = new FakePaneClient();
+    const { audit } = auditEntries();
+    const res = await replyPane(
+      client as unknown as HerdrClient,
+      cfg(),
+      "w1:p1",
+      request({ text: "hello", submit: false }),
+      audit,
+      null,
+      "default",
+    );
+    expect(res.status).toBe(200);
+    expect(client.reads).toEqual([]);
+    expect(client.texts).toEqual([["w1:p1", "hello"]]);
+  });
+
+  test("matching expected_prompt reads the GET window then sends keys", async () => {
+    const client = new FakePaneClient();
+    const { audit, entries } = auditEntries();
+    const res = await keysPane(
+      client as unknown as HerdrClient,
+      cfg({ readLines: 321 }),
+      "w1:p1",
+      request({ keys: ["1"], expected_prompt: "Approve this command?\n1. Yes\n2. No" }),
+      audit,
+      "phone",
+      "default",
+    );
+    expect(res.status).toBe(200);
+    expect(client.reads).toEqual([["w1:p1", "recent", 321, "ansi"]]);
+    expect(client.keys).toEqual([["w1:p1", ["1"]]]);
+    expect(entries[0]?.detail).toMatchObject({
+      promptBinding: { checked: true, passed: true },
+    });
+  });
+
+  test("binding read depth grows beyond a small configured window to contain the expectation", async () => {
+    const client = new FakePaneClient();
+    const expected = Array.from({ length: 32 }, (_, index) => `prompt line ${index + 1}`).join("\n");
+    client.text = expected;
+    const { audit } = auditEntries();
+    const res = await keysPane(
+      client as unknown as HerdrClient,
+      cfg({ readLines: 20 }),
+      "w1:p1",
+      request({ keys: ["1"], expected_prompt: expected }),
+      audit,
+      null,
+      "default",
+    );
+
+    expect(res.status).toBe(200);
+    expect(client.reads).toHaveLength(1);
+    expect(client.reads[0]?.[0]).toBe("w1:p1");
+    expect(client.reads[0]?.[1]).toBe("recent");
+    expect(client.reads[0]?.[2]).toBeGreaterThan(32);
+    expect(client.reads[0]?.[3]).toBe("ansi");
+    expect(client.keys).toEqual([["w1:p1", ["1"]]]);
+  });
+
+  test("matching expected_prompt reads the GET window then sends reply text", async () => {
+    const client = new FakePaneClient();
+    const { audit } = auditEntries();
+    const res = await replyPane(
+      client as unknown as HerdrClient,
+      cfg({ readLines: 321 }),
+      "w1:p1",
+      request({
+        text: "hello",
+        submit: false,
+        expected_prompt: "Approve this command?\n1. Yes\n2. No",
+      }),
+      audit,
+      null,
+      "default",
+    );
+    expect(res.status).toBe(200);
+    expect(client.reads).toEqual([["w1:p1", "recent", 321, "ansi"]]);
+    expect(client.texts).toEqual([["w1:p1", "hello"]]);
+  });
+
+  test("stale expected_prompt returns prompt_changed and sends no keys", async () => {
+    const client = new FakePaneClient();
+    client.text = "Command finished";
+    const { audit, entries } = auditEntries();
+    const res = await keysPane(
+      client as unknown as HerdrClient,
+      cfg(),
+      "w1:p1",
+      request({ keys: ["1"], expected_prompt: "Approve this command?\n1. Yes\n2. No" }),
+      audit,
+      null,
+      "default",
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      ok: false,
+      error: "prompt changed",
+      code: "prompt_changed",
+    });
+    expect(client.keys).toEqual([]);
+    expect(client.texts).toEqual([]);
+    expect(entries[0]?.detail).toMatchObject({
+      promptBinding: { checked: true, passed: false, reason: "not_found" },
+    });
+  });
+
+  test("stale expected_prompt returns prompt_changed and sends no reply text or keys", async () => {
+    const client = new FakePaneClient();
+    client.text = "Command finished";
+    const { audit } = auditEntries();
+    const res = await replyPane(
+      client as unknown as HerdrClient,
+      cfg(),
+      "w1:p1",
+      request({
+        text: "hello",
+        submit: true,
+        expected_prompt: "Approve this command?\n1. Yes\n2. No",
+      }),
+      audit,
+      null,
+      "default",
+    );
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ ok: false, code: "prompt_changed" });
+    expect(client.keys).toEqual([]);
+    expect(client.texts).toEqual([]);
+  });
+
+  test("rejects oversized and non-string expected_prompt before a keys write", async () => {
+    for (const expected_prompt of ["x".repeat(8193), 42]) {
+      const client = new FakePaneClient();
+      const { audit } = auditEntries();
+      const res = await keysPane(
+        client as unknown as HerdrClient,
+        cfg(),
+        "w1:p1",
+        request({ keys: ["1"], expected_prompt }),
+        audit,
+        null,
+        "default",
+      );
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe("bad expected_prompt");
+      expect(client.reads).toEqual([]);
+      expect(client.keys).toEqual([]);
+    }
+  });
+
+  test("rejects oversized and non-string expected_prompt before a reply write", async () => {
+    for (const expected_prompt of ["x".repeat(8193), null]) {
+      const client = new FakePaneClient();
+      const { audit } = auditEntries();
+      const res = await replyPane(
+        client as unknown as HerdrClient,
+        cfg(),
+        "w1:p1",
+        request({ text: "hello", expected_prompt }),
+        audit,
+        null,
+        "default",
+      );
+      expect(res.status).toBe(400);
+      expect(await res.text()).toBe("bad expected_prompt");
+      expect(client.reads).toEqual([]);
+      expect(client.texts).toEqual([]);
+      expect(client.keys).toEqual([]);
+    }
+  });
+});
+
 describe("paneReadResponse — pane read → REST body", () => {
   test("passes text, truncated, and the monotonic revision through", () => {
     const read: PaneRead = { pane_id: "w1:p1", text: "hello", truncated: true, revision: 42 };
@@ -329,6 +580,43 @@ describe("paneReadResponse — pane read → REST body", () => {
   });
 });
 
+describe("historyParams — transcript paging params", () => {
+  const params = (qs: string) => historyParams(new URL(`http://x/api/pane/w1:p1/history${qs}`));
+
+  test("no params means the newest page at the default size", () => {
+    expect(params("")).toEqual({ limit: 200 });
+  });
+
+  test("an explicit limit is honoured", () => {
+    expect(params("?limit=10")).toEqual({ limit: 10 });
+  });
+
+  // "Show entire history" asks for the whole conversation, so the ceiling is a safety net against a
+  // pathological log rather than a paging window.
+  test("an absurd limit is clamped to the safety ceiling", () => {
+    expect(params("?limit=99999")).toEqual({ limit: 5000 });
+  });
+
+  test.each([["zero", "?limit=0"], ["negative", "?limit=-5"], ["garbage", "?limit=abc"]])(
+    "a %s limit falls back to the default",
+    (_label, qs) => {
+      expect(params(qs).limit).toBe(200);
+    },
+  );
+
+  test("a cursor is carried through as an opaque string", () => {
+    expect(params("?before=abc-123")).toEqual({ limit: 200, before: "abc-123" });
+  });
+
+  test("an absurdly long cursor is dropped rather than carried", () => {
+    expect(params(`?before=${"x".repeat(500)}`)).toEqual({ limit: 200 });
+  });
+
+  test("an empty cursor is omitted, not passed as an empty match", () => {
+    expect(params("?before=")).toEqual({ limit: 200 });
+  });
+});
+
 describe("deviceAuth — per-device authorisation", () => {
   const HDR = "x-device-id";
 
@@ -346,19 +634,71 @@ describe("deviceAuth — per-device authorisation", () => {
     });
   });
 
-  test("feature on, header absent: authorised and unchanged (on-host loopback operator)", () => {
+  test("feature on, header absent: refused", () => {
     const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
     expect(deviceAuth(req({ host: "h" }), c)).toEqual({
       enforced: true,
       device: null,
-      authorized: true,
+      authorized: false,
     });
     // A blank/whitespace header value is treated as absent, not as a device named "".
     expect(deviceAuth(req({ host: "h", "x-device-id": "  " }), c)).toEqual({
       enforced: true,
       device: null,
-      authorized: true,
+      authorized: false,
     });
+  });
+
+  // The absent-header case has no loopback exemption, and a loopback-looking Host must not create
+  // one by the back door: Host is set by the caller and rewritten by the proxy, so it attests
+  // nothing. This pins that no future "but it came from localhost" shortcut sneaks in here.
+  test("feature on, header absent: a loopback Host does not buy an exemption", () => {
+    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
+    for (const host of ["127.0.0.1", "127.0.0.1:8787", "localhost", "[::1]:8787"]) {
+      expect(deviceAuth(req({ host }), c).authorized).toBe(false);
+    }
+  });
+});
+
+// deviceAuth being right in isolation proves nothing if the wiring in guard() regresses, and that
+// wiring is where the whole gate lives: it consults deviceAuth for "write" and deliberately not for
+// "read". Both halves are asserted here, so neither the gate nor the read-only scope can drift
+// silently. The write cases carry a matching Origin so checkAccess passes and the device decision is
+// the only thing under test.
+describe("guard applies the device gate to writes only", () => {
+  const HDR = "x-device-id";
+  const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
+  const write = (headers: Record<string, string>) =>
+    guard(req({ host: "collie.ts.net", origin: "https://collie.ts.net", ...headers }), c, "write");
+  const read = (headers: Record<string, string>) =>
+    guard(req({ host: "collie.ts.net", ...headers }), c, "read");
+
+  test("write with no device header is refused with 403", () => {
+    const denied = write({});
+    expect(denied).not.toBeNull();
+    expect(denied!.status).toBe(403);
+  });
+
+  test("write with a non-allowlisted device is refused with 403", () => {
+    const denied = write({ "x-device-id": "intruder" });
+    expect(denied).not.toBeNull();
+    expect(denied!.status).toBe(403);
+  });
+
+  test("write with an allowlisted device proceeds", () => {
+    expect(write({ "x-device-id": "phone" })).toBeNull();
+  });
+
+  // The scope of the gate, stated as a test rather than only in prose: a header-less caller keeps
+  // READ access (it is read-only, not rejected outright). If someone later tightens this, it should
+  // be a deliberate change with this test updated, not an accident.
+  test("read with no device header still proceeds (read-only, not rejected)", () => {
+    expect(read({})).toBeNull();
+    expect(read({ "x-device-id": "intruder" })).toBeNull();
+  });
+
+  test("with the feature off, a write with no device header proceeds", () => {
+    expect(guard(req({ host: "127.0.0.1:8787" }), cfg(), "write")).toBeNull();
   });
 
   test("feature on, allowlisted device: authorised and attributed (header is trimmed)", () => {
@@ -507,6 +847,24 @@ describe("cacheControlFor", () => {
       "apple-touch-icon.png",
     ]) {
       expect(cacheControlFor(rel)).toBe("no-cache");
+    }
+  });
+});
+
+// The other end of web/src/lib/sw-routes.ts. The service worker hands `/auth/` to the network; if
+// the bridge doesn't recognise the same set, the SPA fallback answers with the app shell and the
+// operator gets the very UI they were trying to escape. These two must agree exactly.
+describe("isReservedAuthPath — the namespace a fronting proxy owns", () => {
+  test("claims /auth with or without a trailing slash, and everything beneath it", () => {
+    expect(isReservedAuthPath("/auth")).toBe(true);
+    expect(isReservedAuthPath("/auth/")).toBe(true);
+    expect(isReservedAuthPath("/auth/sign-in")).toBe(true);
+    expect(isReservedAuthPath("/auth/oidc/callback")).toBe(true);
+  });
+
+  test("leaves Collie's own routes alone, including a mere prefix match", () => {
+    for (const path of ["/", "/settings", "/pane/w1:p1", "/authors", "/api/snapshot"]) {
+      expect(isReservedAuthPath(path)).toBe(false);
     }
   });
 });

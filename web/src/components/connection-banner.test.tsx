@@ -33,12 +33,18 @@ function setOnline(value: boolean) {
 // hooks are re-read) — RouterProvider re-rendered with the same static route element would bail out.
 let rerenderBanner: () => void = () => {};
 
-function renderBanner(props: { bridge?: "connected" | "disconnected"; error?: boolean } = {}) {
+function renderBanner(
+  props: { bridge?: "connected" | "disconnected"; error?: boolean; authError?: boolean } = {},
+) {
   function Harness() {
     const [, setN] = useState(0);
     rerenderBanner = () => setN((n) => n + 1);
     return (
-      <ConnectionBanner bridge={props.bridge ?? "disconnected"} error={props.error ?? false} />
+      <ConnectionBanner
+        bridge={props.bridge ?? "disconnected"}
+        error={props.error ?? false}
+        authError={props.authError ?? false}
+      />
     );
   }
   const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
@@ -59,6 +65,33 @@ afterEach(() => {
 });
 
 describe("ConnectionBanner — the single connection surface", () => {
+  it("shows the auth refusal with Reload and no connection treatment", () => {
+    h.trouble = true;
+    h.lost = true;
+    renderBanner({ authError: true });
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Access refused. This is not a connection problem.",
+    );
+    expect(screen.getByRole("button", { name: "Reload" })).toBeInTheDocument();
+    expect(screen.queryByText("Reconnecting…")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(document.querySelector(".animate-spin")).toBeNull();
+    expect(cfg.calls).toBe(0);
+  });
+
+  // The escape hatch for an installed PWA, which has no address bar: a real link to the one path the
+  // service worker always passes to the network. It must stay an <a> with a real href — a button
+  // with an onClick would be a same-document action the SW never sees as a navigation, which is the
+  // whole bug (#31). If this assertion is ever "fixed" by swapping in a Button, the PWA is bricked
+  // again behind a refused session and nothing else will fail.
+  it("offers a real link to the reserved proxy path, not a click handler", () => {
+    renderBanner({ authError: true });
+
+    const signIn = screen.getByRole("link", { name: "Sign in" });
+    expect(signIn).toHaveAttribute("href", "/auth/");
+  });
+
   it("renders nothing while healthy — no bar at all", () => {
     renderBanner({ bridge: "connected" });
     expect(screen.queryByRole("status")).toBeNull();

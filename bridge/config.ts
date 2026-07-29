@@ -1,6 +1,8 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { DialMode } from "./dial.ts";
+
 // All bridge configuration, resolved once at startup. Env-driven so the systemd unit and the
 // plugin launcher can configure it without code changes. Defaults are safe for a single-user,
 // tailnet-only deployment.
@@ -44,6 +46,20 @@ function envList(name: string): string[] {
  * `yes` → true (case-insensitive); anything else falls back with a warning. Used for feature toggles
  * that default on, where a typo silently flipping the feature would be surprising.
  */
+/**
+ * Read an env var constrained to a fixed set of string values, falling back (with a warning) on
+ * anything not in `allowed`. Empty/unset → `fallback`. Case-insensitive.
+ */
+function envEnum<T extends string>(name: string, allowed: readonly T[], fallback: T): T {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const v = raw.trim().toLowerCase();
+  const match = allowed.find((a) => a.toLowerCase() === v);
+  if (match !== undefined) return match;
+  console.warn(`[config] ${name}="${raw}" is not one of ${allowed.join("|")} — using default ${fallback}`);
+  return fallback;
+}
+
 function envBool(name: string, fallback: boolean): boolean {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -57,6 +73,16 @@ function envBool(name: string, fallback: boolean): boolean {
 export interface Config {
   /** Path to Herdr's control socket. A non-Herdr-launched daemon must discover this itself. */
   socketPath: string;
+  /**
+   * Which dialer opens that socket. `auto` (the default) is correct everywhere: `node:net` on
+   * Windows, where herdr's socket is a named pipe, and Bun's native transport elsewhere. Forcing
+   * `net` on Linux/macOS exercises the Windows dial path against the real socket — the only way to
+   * run that code without a Windows box. Set via `COLLIE_HERDR_DIAL`.
+   *
+   * Optional so it stays out of unrelated test fixtures: `loadConfig` always resolves it, and an
+   * absent value means the same thing as `auto` at the one place it's consumed.
+   */
+  dialMode?: DialMode;
   /** TCP port the bridge listens on (loopback only). `tailscale serve` proxies to it. */
   port: number;
   /**
@@ -85,6 +111,19 @@ export interface Config {
   notifyDelayMs: number;
   /** How many lines of scrollback to pull for the agent detail view. */
   readLines: number;
+  /**
+   * Serve agent conversation history from the agent's own on-disk session log. This is the only
+   * way to get scrollback for a Claude pane at all — Claude runs on the terminal's alternate
+   * screen, which has no scrollback ring, so Herdr retains nothing behind the viewport (see
+   * transcript.ts). Off disables the feature and its route wholesale.
+   */
+  transcript: boolean;
+  /**
+   * Root of the agent's session logs — Claude Code's `~/.claude/projects`. Every transcript read is
+   * confined to this directory (after symlink resolution). Override only to relocate a non-default
+   * Claude home; it is never derived from a request.
+   */
+  transcriptRoot: string;
   /** Key sequence sent to submit a reply after the text (agent-dependent; see HERDR_API.md). */
   submitKeys: string[];
   /**
@@ -142,6 +181,23 @@ export interface Config {
   skipServe: boolean;
 }
 
+/**
+ * herdr's default socket location: `~/.config/herdr/herdr.sock` on Unix, `%APPDATA%\herdr\herdr.sock`
+ * on Windows (the Windows beta keeps its config root under AppData\Roaming). Pure so both branches
+ * are unit-testable on any platform.
+ */
+export function defaultSocketPath(
+  platform: NodeJS.Platform = process.platform,
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  if (platform === "win32") {
+    const appData = env.APPDATA ?? join(home, "AppData", "Roaming");
+    return join(appData, "herdr", "herdr.sock");
+  }
+  return join(home, ".config", "herdr", "herdr.sock");
+}
+
 export function loadConfig(): Config {
   const stateDir =
     process.env.HERDR_PLUGIN_STATE_DIR ??
@@ -151,7 +207,8 @@ export function loadConfig(): Config {
   const submitKeys = envList("COLLIE_SUBMIT_KEYS");
 
   return {
-    socketPath: process.env.HERDR_SOCKET_PATH ?? join(homedir(), ".config", "herdr", "herdr.sock"),
+    socketPath: process.env.HERDR_SOCKET_PATH ?? defaultSocketPath(),
+    dialMode: envEnum("COLLIE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto"),
     port: envInt("COLLIE_PORT", 8787, { min: 1, max: 65535 }),
     host: process.env.COLLIE_HOST ?? "127.0.0.1",
     unixSocket: (process.env.COLLIE_UNIX_SOCKET ?? "").trim(),
@@ -159,6 +216,9 @@ export function loadConfig(): Config {
     pollIdleMs: envInt("COLLIE_POLL_IDLE_MS", 12_000, { min: 1000 }),
     notifyDelayMs: envInt("COLLIE_NOTIFY_DELAY_MS", 30_000, { min: 0 }),
     readLines: envInt("COLLIE_READ_LINES", 200, { min: 1 }),
+    transcript: envBool("COLLIE_TRANSCRIPT", true),
+    transcriptRoot:
+      process.env.COLLIE_TRANSCRIPT_ROOT ?? join(homedir(), ".claude", "projects"),
     submitKeys: submitKeys.length ? submitKeys : ["Enter"],
     trustedUser: process.env.COLLIE_TRUSTED_USER ?? "",
     deviceHeader: (process.env.COLLIE_DEVICE_HEADER ?? "").trim(),

@@ -13,17 +13,19 @@
 // no flag, no race — and because a navigation aborts any in-flight revalidation, the nav is instant
 // even while a poll's doomed fetch is still hanging.
 
-import { fetchPane, fetchSnapshot } from "@/lib/api";
+import { fetchHistory, fetchPane, fetchSnapshot, isApiErrorStatus } from "@/lib/api";
 import { isLostLatched } from "@/lib/connection-health";
 import { SESSION_PARAM, normalizeSession } from "@/lib/session";
 import type {
   AgentView,
   BridgeStatus,
   DeviceAuth,
+  PaneHistoryResponse,
   PaneReadResponse,
   SessionSummary,
   SnapshotResponse,
   TabView,
+  TranscriptEntry,
   UpdateInfo,
   WorkspaceView,
 } from "@/lib/types";
@@ -75,6 +77,8 @@ export interface HomeData {
   update: UpdateInfo | undefined;
   /** True when this render is the last-good snapshot after a failed refresh. */
   error: boolean;
+  /** True when the failed refresh was rejected with HTTP 401 or 403. */
+  authError: boolean;
 }
 
 export interface PaneData {
@@ -91,11 +95,31 @@ export interface PaneData {
    * the degraded (stale-text) path, where the guard's fresh fetch will reject a mismatch anyway. */
   revision: number;
   error: boolean;
+  /** True when the failed refresh was rejected with HTTP 401 or 403. */
+  authError: boolean;
 }
 
 // Keep-previous-data cache is now PER-SESSION: switching sessions must not show the other session's
 // herd flagged as stale. Keyed by session name ("" = primary).
 const lastSnapshot = new Map<string, SnapshotResponse>();
+
+// A latched navigation skips the network, so retain whether the last real outcome for each session
+// was an auth rejection. Store only rejected sessions; every other real outcome removes the marker.
+const authErrorSessions = new Set<string>();
+
+function rememberAuthError(session: string | undefined, authError: boolean): void {
+  const key = session ?? "";
+  if (authError) authErrorSessions.add(key);
+  else authErrorSessions.delete(key);
+}
+
+function hasAuthError(session: string | undefined): boolean {
+  return authErrorSessions.has(session ?? "");
+}
+
+function isAuthError(error: unknown): boolean {
+  return isApiErrorStatus(error, 401) || isApiErrorStatus(error, 403);
+}
 
 // The URL each loader last RAN for — the nav-vs-revalidate discriminator for the offline fast path (see
 // the header comment). Module-scoped so it survives revalidations (the loader re-runs every poll) and
@@ -128,6 +152,7 @@ function toHomeData(snap: SnapshotResponse, session: string | undefined, error: 
     snoozedUntil: snap.notifications?.snoozedUntil ?? null,
     update: snap.update,
     error,
+    authError: error && hasAuthError(session),
   };
 }
 
@@ -151,6 +176,7 @@ function staleHome(session: string | undefined): HomeData {
         snoozedUntil: null,
         update: undefined,
         error: true,
+        authError: hasAuthError(session),
       };
 }
 
@@ -173,9 +199,11 @@ export async function rootLoader({ request }: { request?: Request } = {}): Promi
   try {
     const snap = await fetchSnapshot(session, request?.signal);
     lastSnapshot.set(session ?? "", snap);
+    rememberAuthError(session, false);
     return toHomeData(snap, session, false);
   } catch (e) {
     if (isAbortError(e)) throw e; // superseded revalidation — let React Router drop it
+    rememberAuthError(session, isAuthError(e));
     // Keep the last good herd on screen, flagged so the ConnectionBanner can say "reconnecting…".
     return staleHome(session);
   }
@@ -205,10 +233,15 @@ function rememberPaneText(key: string, text: string): void {
 // back through a long exchange. The live tail still follows; scrolling up freezes it (see
 // AgentChat). Larger = more scrollback but more bytes per poll — 600 holds several exchanges.
 const DETAIL_HISTORY_LINES = 600;
-// "Load older" raises the requested window by a step per tap, up to a cap. The bridge itself clamps
-// at 10000, so we stop well below that — 5000 lines is plenty of phone scrollback per poll.
+// "Load older" raises the requested window by a step per tap, up to a cap.
+//
+// The cap is 1000 because HERDR clamps `pane.read` there — silently, and without setting `truncated`.
+// Live-probed against a pane holding 6895 lines of scrollback: 999→1000, 1000→1001, 2000→1001,
+// 6000→1001. Asking for more than 1000 returns the same 1000 lines, so a higher cap only bought taps
+// that fetched nothing new. (The bridge's own MAX_READ_LINES=10000 is the outer guard; this is the
+// real ceiling.) If Herdr ever lifts its clamp, raise this to match.
 const DETAIL_HISTORY_STEP = 600;
-export const DETAIL_HISTORY_MAX = 5000;
+export const DETAIL_HISTORY_MAX = 1000;
 
 // Per-pane requested scrollback, raised by "Load older". Module-scoped so it survives revalidations
 // (the loader re-runs on every poll) but resets on a full app reload — mirrors lastPaneText. Bounded
@@ -254,6 +287,7 @@ function stalePane(paneId: string, session: string | undefined, lines: number): 
     requestedLines: lines,
     revision: 0,
     error: true,
+    authError: hasAuthError(session),
   };
 }
 
@@ -289,10 +323,89 @@ export async function paneLoader({
     const read: PaneReadResponse = await fetchPane(paneId, lines, session, request?.signal);
     const text = read.text || lastPaneText.get(key) || "";
     rememberPaneText(key, text);
-    return { paneId, session, text, truncated: read.truncated, requestedLines: lines, revision: read.revision, error: false };
+    rememberAuthError(session, false);
+    return {
+      paneId,
+      session,
+      text,
+      truncated: read.truncated,
+      requestedLines: lines,
+      revision: read.revision,
+      error: false,
+      authError: false,
+    };
   } catch (e) {
     if (isAbortError(e)) throw e; // superseded revalidation — let React Router drop it
+    rememberAuthError(session, isAuthError(e));
     // Genuine network / server failure: show stale text flagged as degraded.
     return stalePane(paneId, session, lines);
+  }
+}
+
+// ── Pane history (the agent's own transcript) ─────────────────────────────────
+//
+// A Claude pane runs on the terminal's ALTERNATE SCREEN, which keeps no scrollback ring — Herdr can
+// only ever hand us the visible viewport, so "load older" against the mirror is physically
+// impossible. The real history lives in the agent's own session log, and this loader fetches its
+// newest page. Unlike the pane loader this one is NOT on the poll loop: the history route sets
+// `shouldRevalidate: () => false` (see router.tsx), because re-pulling a 900-turn transcript every
+// 1.5s would be pure waste and would fight the component's own "load older" paging.
+
+/**
+ * Turns requested when the history view opens.
+ *
+ * "Show entire history" is taken literally: the point of this view is that the terminal mirror
+ * CAN'T show you the past, so opening it and still being 40 turns from the start would miss the
+ * point. This is high enough to swallow whole conversations (the longest measured live: 1415 turns);
+ * `hasMore` + "Load older" remain for anything beyond it, so a pathological log still degrades to
+ * paging rather than a stall.
+ */
+export const HISTORY_PAGE_SIZE = 5000;
+
+export interface HistoryData {
+  paneId: string;
+  session: string | undefined;
+  /** Oldest-first. Empty when unavailable or on a failed fetch. */
+  entries: TranscriptEntry[];
+  /** Older turns exist before `entries[0]` — the view pages back with `before`. */
+  hasMore: boolean;
+  total: number;
+  /** The log was byte-capped, so even the oldest page isn't the true start. */
+  fileTruncated: boolean;
+  /** Why there's nothing to show; undefined when history IS available. */
+  unavailable?: "disabled" | "no-session" | "no-log" | "error";
+}
+
+export async function historyLoader({
+  params,
+  request,
+}: {
+  params: { paneId?: string };
+  request?: Request;
+}): Promise<HistoryData> {
+  const { paneId } = params;
+  if (!paneId) throw new Error("historyLoader: missing :paneId route param");
+  const session = sessionFromRequest(request);
+  const base = { paneId, session, entries: [], hasMore: false, total: 0, fileTruncated: false };
+
+  try {
+    const res: PaneHistoryResponse = await fetchHistory(
+      paneId,
+      { limit: HISTORY_PAGE_SIZE },
+      session,
+      request?.signal,
+    );
+    if (!res.available) return { ...base, unavailable: res.reason };
+    return {
+      paneId,
+      session,
+      entries: res.entries,
+      hasMore: res.hasMore,
+      total: res.total,
+      fileTruncated: res.fileTruncated,
+    };
+  } catch (e) {
+    if (isAbortError(e)) throw e; // superseded — let React Router drop it
+    return { ...base, unavailable: "error" };
   }
 }

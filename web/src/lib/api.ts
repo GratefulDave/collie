@@ -10,6 +10,7 @@ import type {
   BridgeConfig,
   CreateResponse,
   NotifyPrefs,
+  PaneHistoryResponse,
   PaneReadResponse,
   SnapshotResponse,
   UpdateInfo,
@@ -25,6 +26,11 @@ class ApiError extends Error {
     this.name = "ApiError";
     this.status = status;
   }
+}
+
+/** True when an API request failed with the given HTTP status. */
+export function isApiErrorStatus(error: unknown, status: number): boolean {
+  return error instanceof ApiError && error.status === status;
 }
 
 // Every request gets a deadline so a black-holed connection (phone sleep/wake, a Tailscale route
@@ -80,6 +86,35 @@ async function errorDetail(res: Response): Promise<string> {
   }
 }
 
+/**
+ * The recover handler for the two endpoints that accept `expected_prompt`: reply and keys. A
+ * rejected binding is their normal answer, not a transport failure. The bridge refuses the write
+ * because the prompt moved, and the caller renders "the dialog changed". Both must share it, or one
+ * of them starts throwing where the other returns a value.
+ */
+const recoverPromptChanged = (status: number, detail: string): ActionResponse | null =>
+  status === 409 ? promptChangedResponse(detail) : null;
+
+function promptChangedResponse(detail: string): ActionResponse | null {
+  try {
+    const body = JSON.parse(detail) as {
+      ok?: unknown;
+      code?: unknown;
+      error?: unknown;
+    };
+    if (
+      body.ok === false &&
+      body.code === "prompt_changed" &&
+      typeof body.error === "string"
+    ) {
+      return { ok: false, error: body.error, code: "prompt_changed" };
+    }
+  } catch {
+    // A non-JSON error body follows the existing ApiError path below.
+  }
+  return null;
+}
+
 // Capture the bridge's build id off any response that carries it. Every poll (snapshot/pane) — and
 // config + mutations — funnels through the two fetch sites below, so the store stays current for
 // free, powering the no-service-worker self-updater (lib/self-update.ts). Absent header (older
@@ -88,7 +123,14 @@ function captureBuild(res: Response): void {
   observeServerBuild(res.headers.get(SERVER_BUILD_HEADER));
 }
 
-async function doReq<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * Lets ONE caller claim a non-ok response instead of having it thrown. The transport stays generic:
+ * it knows a caller may recognise a refusal and turn it into a normal value, but nothing about which
+ * status or which body shape. Return null to fall through to the usual {@link ApiError}.
+ */
+type Recover<T> = (status: number, detail: string) => T | null;
+
+async function doReq<T>(path: string, init?: RequestInit, recover?: Recover<T>): Promise<T> {
   // GET reads get the short leash; anything mutating gets the longer mutation budget.
   const method = init?.method?.toUpperCase() ?? "GET";
   const timeoutMs = method === "GET" ? GET_TIMEOUT_MS : MUTATION_TIMEOUT_MS;
@@ -100,7 +142,10 @@ async function doReq<T>(path: string, init?: RequestInit): Promise<T> {
   });
   captureBuild(res);
   if (!res.ok) {
-    throw new ApiError(`${url} → ${res.status} ${await errorDetail(res)}`, res.status);
+    const detail = await errorDetail(res);
+    const recovered = recover?.(res.status, detail);
+    if (recovered !== null && recovered !== undefined) return recovered;
+    throw new ApiError(`${url} → ${res.status} ${detail}`, res.status);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -109,8 +154,8 @@ async function doReq<T>(path: string, init?: RequestInit): Promise<T> {
 // Every mutating request (non-GET) feeds the app-wide busy signal so the top progress bar shows
 // while it's in flight; GET reads (snapshot/config polling) don't, or the bar would never rest.
 // trackBusy increments synchronously, so a caller sees `isBusy()` true the instant it fires.
-function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const op = doReq<T>(path, init);
+function req<T>(path: string, init?: RequestInit, recover?: Recover<T>): Promise<T> {
+  const op = doReq<T>(path, init, recover);
   const method = init?.method?.toUpperCase() ?? "GET";
   return method === "GET" ? op : trackBusy(op);
 }
@@ -194,23 +239,66 @@ export async function fetchPane(
   return data;
 }
 
+/**
+ * Fetch a page of the pane's conversation history — the scrollback its terminal can't hold (a Claude
+ * pane runs on the alternate screen, which has no scrollback ring). Newest-anchored: no cursor gives
+ * the most recent turns; `before` walks backwards from a turn already on screen.
+ *
+ * Deliberately NOT ETag-cached like fetchPane: history is fetched on navigation and on an explicit
+ * "load older" tap, never on the poll loop, so there's no repeat-fetch to save.
+ */
+export function fetchHistory(
+  paneId: string,
+  opts: { limit?: number; before?: string } = {},
+  session?: string,
+  signal?: AbortSignal,
+): Promise<PaneHistoryResponse> {
+  const q = new URLSearchParams();
+  if (opts.limit) q.set("limit", String(opts.limit));
+  if (opts.before) q.set("before", opts.before);
+  const qs = q.toString();
+  const path = `/api/pane/${encodeURIComponent(paneId)}/history${qs ? `?${qs}` : ""}`;
+  return req<PaneHistoryResponse>(withSession(path, session), { signal });
+}
+
 export function sendReply(
   paneId: string,
   text: string,
   submit = true,
   session?: string,
+  expectedPrompt?: string,
 ): Promise<ActionResponse> {
-  return req<ActionResponse>(withSession(`/api/pane/${encodeURIComponent(paneId)}/reply`, session), {
-    method: "POST",
-    body: JSON.stringify({ text, submit }),
-  });
+  return req<ActionResponse>(
+    withSession(`/api/pane/${encodeURIComponent(paneId)}/reply`, session),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        text,
+        submit,
+        ...(expectedPrompt !== undefined ? { expected_prompt: expectedPrompt } : {}),
+      }),
+    },
+    recoverPromptChanged,
+  );
 }
 
-export function sendKeys(paneId: string, keys: string[], session?: string): Promise<ActionResponse> {
-  return req<ActionResponse>(withSession(`/api/pane/${encodeURIComponent(paneId)}/keys`, session), {
-    method: "POST",
-    body: JSON.stringify({ keys }),
-  });
+export function sendKeys(
+  paneId: string,
+  keys: string[],
+  session?: string,
+  expectedPrompt?: string,
+): Promise<ActionResponse> {
+  return req<ActionResponse>(
+    withSession(`/api/pane/${encodeURIComponent(paneId)}/keys`, session),
+    {
+      method: "POST",
+      body: JSON.stringify({
+        keys,
+        ...(expectedPrompt !== undefined ? { expected_prompt: expectedPrompt } : {}),
+      }),
+    },
+    recoverPromptChanged,
+  );
 }
 
 /** Close a pane ("kill the agent"). */

@@ -5,6 +5,7 @@ import type {
   SessionSummary,
   SnapshotResponse,
   TabView,
+  TranscriptEntry,
   WorkspaceView,
 } from "@/lib/types";
 
@@ -94,13 +95,68 @@ export const fixtureSnapshot: SnapshotResponse = {
   ts: 0,
 };
 
+/** A minimal two-turn transcript: a human ask and the agent's tool-call-plus-answer reply. */
+export const fixtureTranscript: TranscriptEntry[] = [
+  {
+    uuid: "t1",
+    ts: "2026-07-25T06:22:21.253Z",
+    role: "user",
+    parts: [{ kind: "text", text: "what changed today?" }],
+  },
+  {
+    uuid: "t2",
+    ts: "2026-07-25T06:22:24.093Z",
+    role: "assistant",
+    parts: [
+      { kind: "tool", name: "Bash", summary: "git log --oneline", result: { text: "abc1234 fix" } },
+      { kind: "text", text: "One commit: abc1234." },
+    ],
+  },
+];
+
+// ── The fake pane's input box ────────────────────────────────────────────────────────────────────
+// A guarded reply (lib/reply-action.ts) types with submit:false and then polls pane reads until the
+// adapter can see that text on the "❯" line — only then does it send the submit key. So the fake
+// pane has to behave like a real TUI (text typed → it appears on the prompt line; submit → the line
+// clears) or no guarded send would ever verify and every send test would stall.
+let typedDraft = "";
+/** Reset between tests (setup.ts afterEach) so a draft can't leak into the next case. */
+export function resetTypedDraft(): void {
+  typedDraft = "";
+}
+/** Record what a reply POST did to the input line — exported so tests that override the reply
+ *  handler with their own can keep the fake pane honest. */
+export function recordReply(body: { text?: string; submit?: boolean }): void {
+  typedDraft = body.submit ? "" : body.text ?? "";
+}
+// 40 box glyphs clears the 20-glyph border threshold in isBoxBorder (harness/claude/markers.ts).
+const BOX_RULE = "─".repeat(40);
+/** `base` output with the current draft rendered inside a Claude-shaped input box below it. */
+export function paneTextWithDraft(base = "hello from the pane"): string {
+  return typedDraft ? `${base}\n${BOX_RULE}\n❯ ${typedDraft}\n${BOX_RULE}` : base;
+}
+
 // Default happy-path handlers; individual tests can override via server.use(...).
 export const handlers = [
   http.get("/api/snapshot", () => HttpResponse.json(fixtureSnapshot)),
   http.get(/\/api\/pane\/[^/]+$/, () =>
-    HttpResponse.json({ paneId: "w1:p1", text: "hello from the pane", truncated: false, revision: 1 }),
+    HttpResponse.json({ paneId: "w1:p1", text: paneTextWithDraft(), truncated: false, revision: 1 }),
   ),
-  http.post(/\/api\/pane\/[^/]+\/reply$/, () => HttpResponse.json({ ok: true })),
+  // Pane transcript history. Two turns, newest-anchored, with nothing older behind them.
+  http.get(/\/api\/pane\/[^/]+\/history/, () =>
+    HttpResponse.json({
+      paneId: "w1:p1",
+      available: true,
+      entries: fixtureTranscript,
+      hasMore: false,
+      total: fixtureTranscript.length,
+      fileTruncated: false,
+    }),
+  ),
+  http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+    recordReply((await request.json()) as { text?: string; submit?: boolean });
+    return HttpResponse.json({ ok: true });
+  }),
   http.post(/\/api\/pane\/[^/]+\/keys$/, () => HttpResponse.json({ ok: true })),
   http.post(/\/api\/pane\/[^/]+\/close$/, () => HttpResponse.json({ ok: true })),
   http.post(/\/api\/pane\/[^/]+\/rename$/, () => HttpResponse.json({ ok: true })),

@@ -5,6 +5,7 @@ import { clientsClaim } from "workbox-core";
 
 import { withBasePath } from "./lib/base-path";
 import { decidePush, type PushPayload } from "./lib/push-decision";
+import { NAVIGATION_NETWORK_ONLY } from "./lib/sw-routes";
 
 // Custom service worker (vite-plugin-pwa `injectManifest`). It does everything the old generated
 // Workbox SW did — precache the app shell + SPA-fallback navigations — PLUS the two handlers a
@@ -22,11 +23,17 @@ declare const self: ServiceWorkerGlobalScope & {
 
 // ── App-shell caching (parity with the previous generateSW config) ──────────────────────────────
 precacheAndRoute(self.__WB_MANIFEST);
-// SPA fallback so deep links (/pane/:id) resolve offline too; never intercept the API.
-const API_PATH = withBasePath("/api/");
+// SPA fallback so deep links (/pane/:id) resolve offline too. The denylist is the set of paths this
+// SW must never answer from the precache — the API, and the `/auth/` namespace reserved for a
+// fronting proxy's sign-in page. It must be mounted with the app: NavigationRoute matches origin
+// pathnames, while Vite scopes this worker to COLLIE_BASE_PATH. See lib/sw-routes for the contract.
+const BASE_PATH_PATTERN = withBasePath("/").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const NAVIGATION_DENYLIST = NAVIGATION_NETWORK_ONLY.map(
+  (rule) => new RegExp(rule.source.replace("^\\/", `^${BASE_PATH_PATTERN}`), rule.flags),
+);
 registerRoute(
   new NavigationRoute(createHandlerBoundToURL(withBasePath("/index.html")), {
-    denylist: [new RegExp(`^${API_PATH.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)],
+    denylist: NAVIGATION_DENYLIST,
   }),
 );
 

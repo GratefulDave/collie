@@ -124,6 +124,12 @@ app. Closing this needs the server-side blocking-message capture described above
   `agent.send`, `events.subscribe`, …). It translates to/from an internal domain model
   (`AgentStatus`, `AgentView`, `SnapshotResponse` — `bridge/types.ts`), so a Herdr API rename is a
   one-file fix, not a shatter.
+- **One protocol, two dialers.** Herdr's control socket is AF_UNIX on Linux/macOS and a *named pipe*
+  on Windows (named after the full socket path). `bridge/dial.ts` is the only place that knows the
+  difference: `Bun.connect({unix})` on POSIX, `node:net` on Windows. The wire protocol is identical —
+  the `interprocess` crate Herdr uses inserts no framing or metadata, so the same newline-delimited
+  JSON-RPC speaks to both, streaming `events.subscribe` included. `COLLIE_HERDR_DIAL=net` forces the
+  Windows dialer anywhere, which is how that branch stays tested off Windows.
 - **Output model: poll, not stream — event-poked.** Herdr exposes `pane.read` (snapshot) and
   `pane.output_matched` (regex event) but **no raw output-stream event**, so there is nothing to
   stream even if we wanted to; the live pane view is poll-on-status-change + caching. The bridge's
@@ -135,6 +141,15 @@ app. Closing this needs the server-side blocking-message capture described above
   relaxes to `COLLIE_POLL_IDLE_MS` (12 s default) whenever the stream is healthy and drops back to
   the fast `COLLIE_POLL_MS` when it isn't. **The snapshot poll stays the source of truth throughout —
   a missed event costs one interval, never correctness.**
+- **Scrollback comes from the transcript, not the terminal.** An agent's TUI runs on the *alternate
+  screen* (`ESC[?1049h`), so the emulator keeps no scrollback ring and `pane.read` can never return
+  more than the visible viewport — the live mirror physically cannot scroll back. Pane history is
+  therefore read from the agent's **own transcript file** off disk (`bridge/transcript.ts`,
+  `/api/pane/:id/history`), a separate source from the mirror with different fidelity: turns and
+  their text, not a replay of the screen. The client fetches the whole conversation in one request
+  and renders a window that grows upward, which is what lets find-in-history and jump-to-user-turn
+  work across turns you haven't scrolled to. Rationale and the measured numbers are commented at the
+  top of `web/src/routes/history.tsx`.
 - **The browser polls too.** `useRevalidator` → `/api/snapshot` on an adaptive interval. There is no
   WebSocket fan-out to the browser and no push of state; pulling is what makes the two recovery loops
   below trivial.
@@ -161,14 +176,32 @@ into live terminals). The posture is single-user, behind one hardened front door
 default). These four are genuine RCE vectors and are **load-bearing — do not regress them:**
 
 - **The bridge binds `127.0.0.1` only** and lets its single front door proxy it. Binding `0.0.0.0`
-  makes the whole access check theater. Under `tailscale serve`, the `Tailscale-User-Login` header is
-  the person gate — trusted **only** when the request source is loopback (i.e. it came from
-  tailscaled), with the owner login asserted and any other tailnet user rejected. That header exists
-  **only** under `tailscale serve` ingress; under a reverse-proxy front door
+  makes the whole access check theater. But be exact about what that bind buys: it bounds **remote**
+  reach, not local. Herdr's socket is a filesystem object, so its permissions bound callers to the
+  owning uid; a TCP port bounds callers to the network namespace, which every uid on the host shares.
+  So a process running as a *different* user — an agent you deliberately put under
+  `sudo -u agent-review` to contain it — cannot open your herdr socket but **can** open
+  `127.0.0.1:$COLLIE_PORT` and drive any pane in the herd. Installing Collie removes that uid
+  boundary; if it is the containment you were relying on, the device gate below makes that port
+  **read-only** — the one write gate that doesn't rest on "local means trusted". Note its scope: it
+  gates writes and only writes, so that uid keeps reading snapshots, pane output and transcript
+  history. It bounds damage, not disclosure. Closing the read side is outside what the bridge does —
+  it needs the port not to be shared in the first place (its own network namespace, or a uid
+  owner-match filter such as nftables `meta skuid`); a plain port firewall rule won't stop a
+  same-host peer (raised in [#33](https://github.com/AltanS/collie/issues/33)).
+  Under `tailscale serve`, the `Tailscale-User-Login` header is the person gate — trusted **only**
+  when the request source is loopback (i.e. it came from tailscaled). `COLLIE_TRUSTED_USER` rejects a
+  *mismatching* login and **passes an absent one**: it narrows which tailnet user is trusted, it does
+  not mandate the header. That is safe under `tailscale serve`, which injects it on every request, and
+  not safe behind anything that might stop injecting it — the header exists **only** under
+  `tailscale serve` ingress. Under a reverse-proxy front door
   ([README → Variant C](./README.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale))
   there is none, and the equivalent write gate is **per-device auth** (`COLLIE_DEVICE_HEADER`) with
-  the proxy contract (README Variant B/C requirements) as the load-bearing piece. The loopback bind is
-  load-bearing either way.
+  the proxy contract (README Variant B/C requirements) as the load-bearing piece. That gate **fails
+  closed since 0.15.0**: with `COLLIE_DEVICE_HEADER` set, a request arriving without the header is
+  read-only, so reaching the port is no longer sufficient to write. Device ids are names your proxy
+  asserts, not secrets — treat them as guessable and keep the front door and its ACL as the real
+  containment.
 - **`pane.read` output renders safely** — it's attacker-influenceable (filenames, agent output,
   fetched web content). Never `innerHTML`; it renders as React text nodes under a **strict CSP**
   (`default-src 'self'`), so an escaping miss can't run injected script that calls back into the
