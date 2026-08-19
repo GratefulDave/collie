@@ -9,13 +9,13 @@
 // matched by POSITION (below the box's bottom border), never by its content strings.
 
 import type { StyledLine } from "../../blocks";
-import { isBlank, isBoxBorder, lineText } from "./markers";
+import { isBlank, isBoxBorder, isInputBoxTopBorder, lineText } from "./markers";
 
-// Lines allowed DIRECTLY under the input box's bottom border: the statusline plus a hint line or two
-// ("← for agents", "⏵⏵ bypass permissions on …"). More than this and we don't recognise the shape, so
-// we leave the buffer raw. The background-agents footer below these (see MAX_FOOTER_LINES) is peeled
-// separately — this bound stays tight because it's the run that must sit flush against the border.
-const MAX_STATUS_LINES = 3;
+// Rows allowed DIRECTLY under the input box's bottom border: the statusline plus its hint row(s)
+// ("← for agents", "⏵⏵ bypass permissions on …"). A statusline is an arbitrary user command's output,
+// so this run is as tall as the user made it. The ceiling only stops a borderless buffer matching
+// unboundedly — it guards less than it looks, and mirrors MAX_FOOTER_LINES: see ADR 0004.
+const MAX_STATUS_LINES = 8;
 
 // A newer Claude Code UI paints a "background agents" footer BELOW the statusline/hint, separated from
 // them by a blank line: a bold "● main" header and one row per background agent
@@ -25,11 +25,21 @@ const MAX_STATUS_LINES = 3;
 const MAX_FOOTER_LINES = 8;
 
 // A long draft WRAPS inside the input box: the "❯ …" prompt line plus continuation lines (indented,
-// no leading "❯") before the bottom border. We scan up past those to find the prompt, but only this
-// many — a bound that keeps the match tight (a borderless buffer can't strip unboundedly) while
-// comfortably covering a very long draft even on a narrow phone pane. A taller box falls back to the
-// raw mirror (safe: at worst the draft stays visible, exactly the pre-wrap-support behaviour).
-const MAX_DRAFT_LINES = 12;
+// no leading "❯") before the bottom border. We scan up past those to find the prompt, bounded by
+// MAX_DRAFT_LINES — but as DEFENSE-IN-DEPTH, not a correctness bound. The caller's read window
+// defaults to 200 lines (COLLIE_READ_LINES, bridge/config.ts) and is client-requestable up to
+// MAX_READ_LINES (10,000, bridge/server.ts), so an unbounded walk would let a stray line that happens
+// to look like a border (see isBoxBorder in markers.ts) pair up with an unrelated quoted "❯" line
+// dozens (or thousands) of lines further up to complete a full (bogus) box shape — the cap, not the
+// border test alone, is what keeps that match from reaching all the way there. Every line the walk
+// crosses counts against this cap, blank or not: a run of blank padding is not a free pass either
+// (see the blank-line skips inside locateInputBox below, both bounded by the same counter). The OLD
+// cap (12) was simply too tight: a real 610-char/25-line CJK draft wraps to ~40 rows at a narrow
+// pane's column count (CJK glyphs are 2 cells wide), well past it, which made locateInputBox return
+// null and stalled the send guard for good (issue #76). Removing the cap entirely was considered and
+// rejected for the reason above. 100 comfortably covers the observed ~40-row case plus a worst case
+// around 70–80 rows at a 19-column pane, with margin, while still capping how far the walk can reach.
+const MAX_DRAFT_LINES = 100;
 
 // Text Claude draws on the "❯" prompt line that is NOT a real user draft — it's a hint the TUI paints
 // when the box is otherwise empty. Must never be surfaced as a recoverable draft. Kept as an array so
@@ -61,30 +71,42 @@ export function stripChrome(lines: StyledLine[]): StyledLine[] {
 }
 
 /**
- * The statusline the agent draws just under its input box — model, ctx%, cwd, branch, tokens,
- * whatever the user configured in their Claude Code statusline. We strip the box off the mirror
- * (stripChrome), so this re-surfaces that one line as app chrome above the composer instead of
- * losing it.
+ * The statusline RUN the agent draws just under its input box — model, ctx%, cwd, branch, tokens,
+ * permission mode, whatever the user configured, plus the TUI's own hint row(s). We strip the box
+ * off the mirror (stripChrome), so this re-surfaces those rows as app chrome above the composer
+ * instead of losing them.
  *
- * POSITIONAL only: the first non-blank line strictly below the box's bottom border. Hint lines after
- * it ("← for agents", "⏵⏵ bypass permissions") are ignored — only the first counts. Returns the
- * trimmed text, or `null` when there's no input box at the tail (a menu is up, or a non-Claude / torn
- * buffer). Never interprets the content — the caller renders it verbatim.
+ * ALL of them, not just the first: a statusline is an arbitrary user command's output and is
+ * routinely 2–3 rows (ctx/limits on one, model + cwd + branch on the next, permission mode on the
+ * third). Surfacing only the first row silently dropped everything after it — the very fields the
+ * mirror can no longer show.
+ *
+ * POSITIONAL only: every non-blank line strictly below the box's bottom border and above where the
+ * background-agents footer starts (locateInputBox draws that line, so the footer never leaks in
+ * here). Returns the rows STYLED, top to bottom, or `[]` when there's no input box at the tail (a
+ * menu is up, or a non-Claude / torn buffer). Never interprets the content — the caller renders it
+ * verbatim.
+ *
+ * Styled, not flattened, because a statusline is colour-carrying by design: the model, the context
+ * meter and the git branch are told apart by colour before they're read. Flattening to text here
+ * threw that away one call before the strip that renders it. The caller draws these in the mirror's
+ * dark space (see mirror-space.ts) — terminal colour only means what it means against a dark
+ * background.
  */
-export function extractStatusLine(lines: StyledLine[]): string | null {
+export function extractStatusLines(lines: StyledLine[]): StyledLine[] {
   const texts = lines.map(lineText);
   let end = lines.length;
   while (end > 0 && isBlank(texts[end - 1]!)) end--;
-  if (end === 0) return null;
+  if (end === 0) return [];
 
   const box = locateInputBox(texts, end);
-  if (box === null) return null;
+  if (box === null) return [];
 
-  for (let j = box.bottomBorder + 1; j < end; j++) {
-    const t = texts[j]!.trim();
-    if (t.length > 0) return t;
+  const rows: StyledLine[] = [];
+  for (let j = box.bottomBorder + 1; j < box.statusEnd; j++) {
+    if (!isBlank(texts[j]!)) rows.push(lines[j]!);
   }
-  return null;
+  return rows;
 }
 
 /**
@@ -123,13 +145,37 @@ export function extractInputDraft(lines: StyledLine[]): string | null {
   return draft;
 }
 
+/**
+ * Whether the agent's own free-text input box is on screen at the tail — i.e. whether typing a reply
+ * would land in the composer input at all. FALSE means a modal (a menu, a dialog, a full-screen
+ * picker) owns the keyboard, so `pane.send_text` would be typed INTO it.
+ *
+ * Two callers, both of which need exactly this and must not re-derive it:
+ *  - the generic menu grammar (menu.ts), whose last-resort footer match would otherwise claim an
+ *    ordinary prompt screen that happens to end in a `·`-separated hint row;
+ *  - the reply path's pre-flight (lib/reply-action.ts via the adapter's `composerReady`), which
+ *    refuses to type at all when the box isn't there.
+ */
+export function hasInputBox(lines: StyledLine[]): boolean {
+  const texts = lines.map(lineText);
+  let end = lines.length;
+  while (end > 0 && isBlank(texts[end - 1]!)) end--;
+  if (end === 0) return false;
+  return locateInputBox(texts, end) !== null;
+}
+
 interface InputBox {
   /** Index of the TOP border — the exclusive bound of everything ABOVE the box (stripChrome uses it). */
   top: number;
   /** Index of the "❯" prompt line, between the two borders — carries the draft (extractInputDraft). */
   prompt: number;
-  /** Index of the BOTTOM border — the statusline, if any, is the first non-blank line after it. */
+  /** Index of the BOTTOM border — the statusline run, if any, starts on the next line. */
   bottomBorder: number;
+  /** EXCLUSIVE end of the statusline run: one past its last row, i.e. where the blank separator +
+   *  background-agents footer begin (or the buffer's last non-blank line when there is no footer).
+   *  `bottomBorder + 1` when the box has no statusline at all. Only the walk down there knows where
+   *  the run stops, so it hands the bound out rather than letting extractStatusLines re-derive it. */
+  statusEnd: number;
 }
 
 /**
@@ -140,7 +186,7 @@ interface InputBox {
  *     ❯ <draft>            (the prompt line)
  *     <continuation…>      (0..MAX_DRAFT_LINES wrapped-draft lines, no leading "❯")
  *     <bottom border>
- *     <statusline>         (0..MAX_STATUS_LINES lines, matched by position not content)
+ *     <statusline>         (statusline + hint rows together are 0..MAX_STATUS_LINES, by position)
  *     <hint line>
  *     <blank>              (optional — separates the background-agents footer, if present)
  *     <● main>             (0..MAX_FOOTER_LINES footer lines, matched by position not content)
@@ -170,7 +216,9 @@ function locateInputBox(texts: string[], end: number): InputBox | null {
   }
 
   // (b) Up to MAX_STATUS_LINES status/hint lines directly above the bottom border: non-blank,
-  //     non-border text. Stop as soon as a border is reached.
+  //     non-border text. Stop as soon as a border is reached. `i` is now the last row of that run
+  //     (the footer, if any, has been peeled off above), so it fixes the run's exclusive end.
+  const statusEnd = i + 1;
   let status = 0;
   while (i >= 0 && !isBoxBorder(texts[i]!) && !isBlank(texts[i]!) && status < MAX_STATUS_LINES) {
     status++;
@@ -184,9 +232,12 @@ function locateInputBox(texts: string[], end: number): InputBox | null {
 
   // (d) the "❯" prompt line — the FIRST line of the draft. A long draft wraps onto continuation lines
   //     (indented, no "❯") between the prompt and the bottom border, so scan up past them to the
-  //     prompt. Bounded by MAX_DRAFT_LINES, and any box border en route aborts the match (we'd have
-  //     left the box). Blank padding on either side is tolerated defensively.
-  while (i >= 0 && isBlank(texts[i]!)) i--;
+  //     prompt. Bounded by MAX_DRAFT_LINES (see the comment above — defense-in-depth, not a
+  //     correctness bound), and any box border en route aborts the match (we'd have left the box).
+  //     Blank padding is tolerated on either side, but it draws from the SAME budget as real
+  //     continuation lines — a bare `while (isBlank) i--` here used to skip an unlimited run of blank
+  //     lines for free before this loop even started counting, which let a wall of blanks stand in for
+  //     the non-blank filler the draft-walk cap is supposed to bound.
   let wrapped = 0;
   while (
     i >= 0 &&
@@ -200,9 +251,20 @@ function locateInputBox(texts: string[], end: number): InputBox | null {
   if (i < 0 || !texts[i]!.trimStart().startsWith("❯")) return null;
   const prompt = i;
   i--;
-  while (i >= 0 && isBlank(texts[i]!)) i--;
+  // Blank padding between the prompt and the top border (e.g. a blank first line inside a freshly
+  // opened box) — same shared `wrapped` budget as above, for the same reason: this used to be its own
+  // unbounded `while (isBlank) i--`, so a wall of blanks here could reach an arbitrarily distant top
+  // border for free.
+  while (i >= 0 && isBlank(texts[i]!) && wrapped < MAX_DRAFT_LINES) {
+    wrapped++;
+    i--;
+  }
 
-  // (e) top border
-  if (i < 0 || !isBoxBorder(texts[i]!)) return null;
-  return { top: i, prompt, bottomBorder };
+  // (e) top border — the LAST anchor checked, so it alone gets the looser flank floor
+  //     (isInputBoxTopBorder): the renderer can clamp a labelled top border's flank down to 1 glyph
+  //     (see the comment on isInputBoxTopBorder in markers.ts), and by this point the bottom border,
+  //     the "❯" line, and the draft-walk cap have already pinned the rest of the shape down, so the
+  //     looser test doesn't reopen the false-positive risk a bare 1-glyph flank would elsewhere.
+  if (i < 0 || !isInputBoxTopBorder(texts[i]!)) return null;
+  return { top: i, prompt, bottomBorder, statusEnd };
 }

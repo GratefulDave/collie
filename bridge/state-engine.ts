@@ -1,3 +1,4 @@
+import { meaningfulTabLabel, meaningfulTerminalTitle } from "./activity.ts";
 import type { HerdrClient } from "./herdr-client.ts";
 import {
   type AgentStatus,
@@ -12,9 +13,19 @@ import {
 // transition events. Polling (vs the per-pane event subscription) keeps this resync-free: a failed
 // poll just retries next tick, and reconnection needs no special handling. See HERDR_API.md.
 
-// How many recent lines to read per claude pane when sniffing its `/rename` session name. Claude's
-// input box (and the named rule above it) sits at the very tail, so a small window is plenty and
-// keeps the extra per-poll reads cheap.
+// How many lines to read per claude pane when sniffing its `/rename` session name. Claude's input
+// box (and the named rule above it) sits at the very tail, so a small window is plenty and keeps the
+// extra per-poll reads cheap.
+//
+// The source MUST stay `visible`. A `recent` text read asking for more rows than the pane currently
+// shows makes Herdr harvest the pages above the viewport, and on a full-screen agent (Claude runs on
+// the alternate screen, which has no host scrollback) the only way to reach them is to drive the
+// agent's own mouse-scroll interface: Herdr scrolls the pane up page by page, then restores it. The
+// operator watches their terminal jump and snap back — once per poll, per idle claude pane.
+// `visible` cannot do that whatever this count is: it is the rendered viewport, clamped to it. Which
+// is also why this number is free to stay generous — the run below the ❯ prompt is a statusline of
+// unknown height ([ADR 0004](../.adr/0004-the-statusline-run-is-bounded.md)), so headroom is worth
+// more here than a smaller read. See HERDR_API.md → `pane.read`.
 const SESSION_NAME_READ_LINES = 40;
 
 // Claude renders its input box as a horizontal rule, the ❯ prompt line, then a closing rule. After
@@ -28,7 +39,7 @@ const NAMED_RULE = /^[─━]{2,}[ \t]+(\S.*?\S|\S)[ \t]+[─━]+[ \t]*$/;
 const PROMPT_LINE = /^❯/;
 
 /**
- * Pull Claude's own session name (set via `/rename`) out of a pane's recent text, or `undefined` when
+ * Pull Claude's own session name (set via `/rename`) out of a pane's visible text, or `undefined` when
  * the session is unnamed (a plain rule) or the pane isn't showing its input box (a dialog, a working
  * spinner). Claude draws the name INTO the horizontal rule directly above the ❯ prompt, e.g.
  * `────────── my-name ──`; we accept that rule ONLY when the very next line is the ❯ prompt, so a
@@ -193,6 +204,7 @@ export class StateEngine {
     try {
       const { workspaces, panes, tabs } = await this.fetchWire();
       const wsById = new Map(workspaces.map((w) => [w.workspace_id, w]));
+      const tabById = new Map(tabs.map((t) => [t.tab_id, t]));
 
       const toView = (
         p: (typeof panes)[number],
@@ -200,10 +212,22 @@ export class StateEngine {
         kind: "agent" | "shell",
       ): AgentView => {
         const ws = wsById.get(p.workspace_id);
+        // The tab's label, denormalised alongside workspaceLabel so no client has to join tabs[].
+        // Dropped when it's Herdr's positional default in a single-tab space — see meaningfulTabLabel.
+        const tabLabel = meaningfulTabLabel(tabById.get(p.tab_id)?.label, ws?.tab_count ?? 0);
+        const workspaceLabel = ws?.label ?? p.workspace_id;
+        // What the pane says it is doing. Dropped when it only repeats the agent name or the
+        // project already on line one — see meaningfulTerminalTitle.
+        const terminalTitle = meaningfulTerminalTitle(
+          p.terminal_title,
+          p.terminal_title_stripped,
+          agent,
+          workspaceLabel,
+        );
         return {
           paneId: p.pane_id,
           workspaceId: p.workspace_id,
-          workspaceLabel: ws?.label ?? p.workspace_id,
+          workspaceLabel,
           workspaceNumber: ws?.number ?? 0,
           tabId: p.tab_id,
           agent,
@@ -213,10 +237,29 @@ export class StateEngine {
           kind,
           // A user-set pane label (herdr pane.rename); omitted when unset so "absent stays absent".
           ...(typeof p.label === "string" && p.label.length > 0 ? { paneLabel: p.label } : {}),
-          // The agent's own session id — only the "id" kind names an on-disk transcript. Omitted
-          // otherwise, so "no history for this pane" is simply the field being absent.
-          ...(p.agent_session?.kind === "id" && typeof p.agent_session.value === "string"
-            ? { agentSessionId: p.agent_session.value }
+          ...(tabLabel ? { tabLabel } : {}),
+          ...(terminalTitle ? { terminalTitle } : {}),
+          // How the agent named its session. BOTH kinds are kept: Claude and Codex report an `id`,
+          // while pi reports a `path` (its herdr integration prefers `agent_session_path` whenever
+          // the session manager has a file open). Keeping only `id` — as this did until journals
+          // became per-agent — silently denied pi any history at all. Which kinds are meaningful is
+          // now the adapter's call, not this function's; anything else is omitted, so "no history
+          // for this pane" stays simply the field being absent.
+          //
+          // The ref must also BELONG to the agent currently in the pane. Herdr keeps reporting the
+          // last session announced for a pane, so relaunching a pane's agent as a different harness
+          // leaves the old one's ref behind — live-observed: a pane running `pi` still advertising
+          // `{source:"herdr:claude", kind:"id"}` from the claude that had been there before. Serving
+          // that would hand pi's adapter a Claude uuid; harmless today (it resolves to nothing) but
+          // only by luck. `agent_session.agent` is compared when Herdr reports it, and absence stays
+          // permissive so an older server that omits the field still works.
+          ...((p.agent_session?.kind === "id" || p.agent_session?.kind === "path") &&
+          typeof p.agent_session.value === "string" &&
+          p.agent_session.value !== "" &&
+          (typeof p.agent_session.agent !== "string" ||
+            p.agent_session.agent === "" ||
+            p.agent_session.agent === agent)
+            ? { agentSession: { kind: p.agent_session.kind, value: p.agent_session.value } }
             : {}),
           // Scrollback depth + viewport = what a `recent` read can yield. Omitted when the server
           // predates `scroll`, so an older Herdr simply reads as "unknown" rather than "zero".
@@ -314,7 +357,7 @@ export class StateEngine {
   }
 
   /**
-   * Read each claude pane's recent text and attach its `/rename` session name (see
+   * Read each claude pane's visible text and attach its `/rename` session name (see
    * {@link extractClaudeSessionName}) to the view, exactly parallel to `paneLabel`. The name lives
    * only in the pane's rendered text — Herdr's pane metadata doesn't carry it — so this is the one
    * place all panes can pick it up (the web app only holds text for the open pane). Reads run in
@@ -329,7 +372,11 @@ export class StateEngine {
     await Promise.all(
       claude.map(async (a) => {
         try {
-          const read = await this.herdr.readPane(a.paneId, "recent", SESSION_NAME_READ_LINES, "text");
+          // `visible` — never `recent`; see SESSION_NAME_READ_LINES for what a `recent` read does
+          // to the operator's screen. The visible grid is also strictly safer to parse: `recent`
+          // hands back transcript scrollback, where Claude echoes past user messages as `❯ …` lines
+          // that the prompt anchor below would have to discriminate against.
+          const read = await this.herdr.readPane(a.paneId, "visible", SESSION_NAME_READ_LINES, "text");
           const name = extractClaudeSessionName(read.text);
           if (name) this.sessionNames.set(a.paneId, name);
         } catch {

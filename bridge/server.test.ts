@@ -4,6 +4,8 @@ import {
   BUILD_HEADER,
   cacheControlFor,
   checkAccess,
+  marksPaneSeen,
+  SEEN_HEADER,
   deviceAuth,
   guard,
   historyParams,
@@ -45,9 +47,17 @@ function cfg(overrides: Partial<Config> = {}): Config {
     notifyDelayMs: 30_000,
     readLines: 200,
     transcript: true,
-    transcriptRoot: "/tmp/claude-projects",
+    journalRoots: {
+      claude: ["/tmp/claude-projects"],
+      codex: ["/nope/codex"],
+      pi: ["/nope/pi"],
+      opencode: ["/nope/opencode"],
+    },
     submitKeys: ["Enter"],
+    commandsFile: "/nope/commands.toml",
+    keysFile: "/nope/keys.toml",
     trustedUser: "",
+    auditContent: "preview",
     deviceHeader: "",
     deviceAllowlist: [],
     allowedOrigins: [],
@@ -745,7 +755,9 @@ describe("startupWarnings — security-posture nags", () => {
     const ws = startupWarnings(cfg({ skipServe: true, trustedUser: "me@example.com" }));
     expect(has(ws, "requires the reverse proxy to inject")).toBe(true);
     expect(has(ws, "COLLIE_DEVICE_HEADER")).toBe(true);
-    expect(has(ws, "Variant C")).toBe(true);
+    // The pointer must name the doc the variant actually lives in — B–E moved to DEPLOYMENT.md in
+    // 0.31.0, while Variant A stayed in the README (pinned in the empty-trustedUser test below).
+    expect(has(ws, "DEPLOYMENT.md → Variant C")).toBe(true);
     // The Variant-A empty-trustedUser nag must NOT also fire (it's meaningless behind a proxy).
     expect(has(ws, "any tailnet device/user")).toBe(false);
   });
@@ -758,7 +770,7 @@ describe("startupWarnings — security-posture nags", () => {
   test("no skipServe + empty trustedUser: the existing Variant-A warning still fires", () => {
     const ws = startupWarnings(cfg({ skipServe: false, trustedUser: "" }));
     expect(has(ws, "COLLIE_TRUSTED_USER is empty")).toBe(true);
-    expect(has(ws, "Variant A")).toBe(true);
+    expect(has(ws, "README → Variant A")).toBe(true);
   });
 
   test("no skipServe + trustedUser set: no identity warning (correctly configured)", () => {
@@ -866,5 +878,37 @@ describe("isReservedAuthPath — the namespace a fronting proxy owns", () => {
     for (const path of ["/", "/settings", "/pane/w1:p1", "/authors", "/api/snapshot"]) {
       expect(isReservedAuthPath(path)).toBe(false);
     }
+  });
+});
+
+// marksPaneSeen guards the one place a READ mutates server state. checkAccess lets a read through
+// without an Origin (browsers omit it on same-origin GETs), so without this a cross-site <img> at a
+// guessed pane id could silently clear the "Ready · unseen" section.
+describe("marksPaneSeen — CSRF guard on marking a pane seen", () => {
+  const withHeader = (h: Record<string, string> = {}) => new Request("http://x/api/pane/w1:p1", { headers: h });
+
+  test("a read carrying the client header counts — only our own page can set it", () => {
+    expect(marksPaneSeen(withHeader({ [SEEN_HEADER]: "1" }), undefined)).toBe(true);
+  });
+
+  test("a bare cross-site GET does NOT count", () => {
+    // What an <img src="…/api/pane/w1:p1"> produces: no Origin, no custom header.
+    expect(marksPaneSeen(withHeader(), undefined)).toBe(false);
+  });
+
+  test("history is a read — it needs the header too", () => {
+    expect(marksPaneSeen(withHeader(), "history")).toBe(false);
+    expect(marksPaneSeen(withHeader({ [SEEN_HEADER]: "1" }), "history")).toBe(true);
+  });
+
+  test("write actions count without it — they already cleared the Origin-requiring write gate", () => {
+    for (const action of ["reply", "keys", "upload", "close", "rename"]) {
+      expect(marksPaneSeen(withHeader(), action)).toBe(true);
+    }
+  });
+
+  test("any header value counts — presence is the proof, not the contents", () => {
+    expect(marksPaneSeen(withHeader({ [SEEN_HEADER]: "" }), undefined)).toBe(true);
+    expect(marksPaneSeen(withHeader({ [SEEN_HEADER]: "anything" }), undefined)).toBe(true);
   });
 });

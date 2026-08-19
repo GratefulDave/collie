@@ -1,7 +1,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { AuditContent } from "./audit.ts";
 import type { DialMode } from "./dial.ts";
+import type { JournalRoots } from "./journal/registry.ts";
 
 // All bridge configuration, resolved once at startup. Env-driven so the systemd unit and the
 // plugin launcher can configure it without code changes. Defaults are safe for a single-user,
@@ -39,6 +41,19 @@ function envList(name: string): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+}
+
+/**
+ * A journal root setting: a list of directories, or `fallback` when unset.
+ *
+ * Comma-separated, like every other list Collie reads ({@link envList}) — deliberately NOT `PATH`'s
+ * separator, which is `:` on Unix and `;` on Windows and would make the same setting mean different
+ * things on the two platforms this bridge supports. One path stays one path, so an existing value
+ * parses to exactly what it always meant.
+ */
+function envRoots(name: string, fallback: string): string[] {
+  const list = envList(name);
+  return list.length > 0 ? list : [fallback];
 }
 
 /**
@@ -113,25 +128,42 @@ export interface Config {
   readLines: number;
   /**
    * Serve agent conversation history from the agent's own on-disk session log. This is the only
-   * way to get scrollback for a Claude pane at all — Claude runs on the terminal's alternate
+   * way to get scrollback for most agent panes at all — they run on the terminal's alternate
    * screen, which has no scrollback ring, so Herdr retains nothing behind the viewport (see
-   * transcript.ts). Off disables the feature and its route wholesale.
+   * journal/claude.ts). Off disables the feature and its route wholesale, for every harness.
    */
   transcript: boolean;
   /**
-   * Root of the agent's session logs — Claude Code's `~/.claude/projects`. Every transcript read is
-   * confined to this directory (after symlink resolution). Override only to relocate a non-default
-   * Claude home; it is never derived from a request.
+   * Where each harness keeps its session logs — one directory or several, searched in order. Every
+   * read is confined to the root it was found under, after symlink resolution, so these double as the
+   * security boundary for a feature that touches the filesystem — override only to relocate (or add)
+   * a non-default agent home, never from a request.
    */
-  transcriptRoot: string;
+  journalRoots: JournalRoots;
   /** Key sequence sent to submit a reply after the text (agent-dependent; see HERDR_API.md). */
   submitKeys: string[];
+  /**
+   * Where the operator's Agent-commands rows live — `commands.toml` in the same dir as their
+   * `.env`. Read at request time behind an mtime check (bridge/operator-commands.ts), so it is
+   * resolved here but never read here.
+   */
+  commandsFile: string;
+  /**
+   * Where the operator's Keys-tray preset rows live — `keys.toml`, the sibling of `commands.toml`
+   * in the same dir, read the same way (bridge/operator-keys.ts) and likewise never read here.
+   */
+  keysFile: string;
   /**
    * Tailscale identity gate. If set, every request must carry a matching
    * `Tailscale-User-Login` header injected by `tailscale serve`; missing and mismatching
    * identities are rejected. Empty disables this gate.
    */
   trustedUser: string;
+  /**
+   * How much of each value's content the audit trail keeps — see {@link AuditContent} in audit.ts
+   * for what `none` does and does not redact.
+   */
+  auditContent: AuditContent;
   /**
    * Per-device authorisation. Name of a request header carrying an opaque device identifier,
    * injected by a trusted upstream reverse proxy. Empty = the feature is off (no behaviour change).
@@ -173,10 +205,9 @@ export interface Config {
   multiSession: boolean;
   /**
    * Whether `tailscale serve` is bypassed (COLLIE_SKIP_SERVE=1) because an operator-run reverse
-   * proxy (Caddy/Nginx) fronts the loopback bridge instead. The bridge itself handles every request
-   * identically either way — this flag only informs the startup warnings: without `tailscale serve`
-   * in front, the `Tailscale-User-Login` header is never injected, so {@link trustedUser} is inert
-   * and per-device auth ({@link deviceHeader}) becomes the way to gate writes (README → Variant C).
+   * proxy (Caddy/Nginx) fronts the loopback bridge instead. If {@link trustedUser} is set, the
+   * proxy must inject a matching `Tailscale-User-Login` or every API request is denied; leave it
+   * empty and use {@link deviceHeader} for per-device write auth (DEPLOYMENT.md → Variant C).
    */
   skipServe: boolean;
 }
@@ -206,6 +237,13 @@ export function loadConfig(): Config {
 
   const submitKeys = envList("COLLIE_SUBMIT_KEYS");
 
+  // The operator's config dir — where their `.env` lives, and now their `commands.toml` beside it.
+  // Resolved exactly the way scripts/collie-ctl.sh resolves it MINUS the `herdr` shell-out: the
+  // launcher passes HERDR_PLUGIN_CONFIG_DIR into the unit (and the launchd plist) precisely so this
+  // process never has to ask the CLI, and the two entry points must not disagree about which dir
+  // that is. ~/.config/collie is the same last-resort default the shim ends on.
+  const configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? join(homedir(), ".config", "collie");
+
   return {
     socketPath: process.env.HERDR_SOCKET_PATH ?? defaultSocketPath(),
     dialMode: envEnum("COLLIE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto"),
@@ -217,10 +255,34 @@ export function loadConfig(): Config {
     notifyDelayMs: envInt("COLLIE_NOTIFY_DELAY_MS", 30_000, { min: 0 }),
     readLines: envInt("COLLIE_READ_LINES", 200, { min: 1 }),
     transcript: envBool("COLLIE_TRANSCRIPT", true),
-    transcriptRoot:
-      process.env.COLLIE_TRANSCRIPT_ROOT ?? join(homedir(), ".claude", "projects"),
+    journalRoots: {
+      // COLLIE_TRANSCRIPT_ROOT predates the per-harness split and meant Claude's root, so it keeps
+      // meaning exactly that — an existing deployment's env keeps working untouched. It takes SEVERAL
+      // roots (comma-separated) because `CLAUDE_CONFIG_DIR` gives each Claude profile its own
+      // projects tree, and a herd routinely mixes them (issue #92); one value is still one root.
+      claude: envRoots("COLLIE_TRANSCRIPT_ROOT", join(homedir(), ".claude", "projects")),
+      // Each harness's own home var is honoured first, so relocating the agent relocates its journal
+      // without a second Collie setting to keep in sync. The Collie override takes a list too — the
+      // multi-home case isn't Claude's alone, and one setting shouldn't behave differently per agent.
+      codex: envRoots(
+        "COLLIE_CODEX_ROOT",
+        join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions"),
+      ),
+      pi: envRoots(
+        "COLLIE_PI_ROOT",
+        join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "sessions"),
+      ),
+      // OpenCode keeps one SQLite database at the top of its XDG data dir, not per-session files.
+      opencode: envRoots(
+        "COLLIE_OPENCODE_ROOT",
+        join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode"),
+      ),
+    },
     submitKeys: submitKeys.length ? submitKeys : ["Enter"],
+    commandsFile: join(configDir, "commands.toml"),
+    keysFile: join(configDir, "keys.toml"),
     trustedUser: process.env.COLLIE_TRUSTED_USER ?? "",
+    auditContent: envEnum("COLLIE_AUDIT_CONTENT", ["preview", "none"] as const, "preview"),
     deviceHeader: (process.env.COLLIE_DEVICE_HEADER ?? "").trim(),
     deviceAllowlist: envList("COLLIE_DEVICE_ALLOWLIST"),
     allowedOrigins: envList("COLLIE_ALLOWED_ORIGINS"),

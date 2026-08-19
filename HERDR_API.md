@@ -18,6 +18,13 @@ the socket assumptions behind the design in [`ARCHITECTURE.md`](./ARCHITECTURE.m
 - Malformed requests close the connection too, and the serde error message names the missing/
   wrong field — which is how this contract was reverse-engineered without side effects.
 - **Exception:** `events.subscribe` keeps the connection open and streams events.
+- **A request line is capped at 1 MiB.** Live-probed 2026-08-17 against herdr 0.7.5: a request of
+  1 048 575 bytes (newline included) still gets a normal reply; 1 048 576 gets no reply at all —
+  the server drops the connection or simply never answers. Nothing Collie sends is near that, but
+  it is the ceiling to design against, and a hang at that size is the server, not the client. (The
+  client-side hazard at large sizes was Collie's own: Bun's `socket.write()` accepts only what the
+  socket has room for, and the unwritten tail must be resumed on `drain` — see
+  [`bridge/write-drain.ts`](./bridge/write-drain.ts).)
 
 ## Methods the bridge uses (verified params)
 
@@ -31,7 +38,40 @@ the socket assumptions behind the design in [`ARCHITECTURE.md`](./ARCHITECTURE.m
 | `pane.send_keys` | `{pane_id, keys}` | (ack) |
 | `agent.send` | `{target, text}` | (ack) — writes **literal** text, no Enter |
 
-- `pane.read` `source` ∈ `visible | recent | recent-unwrapped`; `format` ∈ `text | ansi`.
+- `pane.read` `source` ∈ `visible | recent | recent_unwrapped | detection` — **snake_case on the
+  wire**: `recent-unwrapped` gets `invalid_request: unknown variant` (live-probed 2026-08-03,
+  herdr 0.7.5; the variant list above is quoted from that error). `detection`'s semantics are
+  unverified. `format` ∈ `text | ansi`.
+  - **`recent_unwrapped` is a no-op for Claude panes** (byte-identical to `recent` across working
+    and idle panes, live-probed 2026-08-03): Claude Code runs on the alt screen, so the read is the
+    visible grid, and its renderer hard-wraps prose at the pane width — there are no soft-wrapped
+    rows for the unwrap to merge. It only differs on scrollback-accumulating panes (shells: one
+    probe measured 199 → 188 lines with logical lines up to 222 cols re-joined).
+  - **A `recent` text read can scroll the pane it reads.** Herdr's agent-automation docs state that
+    for an idle, recognized agent at the bottom of its transcript, `recent` / `recent_unwrapped`
+    reads "automatically use the agent's mouse-scroll interface" when `lines` asks for more than the
+    visible screen, collecting overlapping pages and "returning the viewport to the bottom before
+    completing the read". Claude runs on the alt screen, which has no host scrollback, so that is the
+    only way those rows can be reached — and the operator watches their terminal scroll up and snap
+    back, once per read. Live-probed 2026-08-10 (herdr 0.8.0), idle claude pane, `viewport_rows: 71`:
+
+    | `source` | `lines` | `format` | elapsed | lines returned |
+    |---|---|---|---|---|
+    | `recent` | 70 | `text` | 0.00s | 71 |
+    | `recent` | 71 | `text` | 0.00s | 72 |
+    | `recent` | 72 | `text` | 0.85s | 73 |
+    | `recent` | 400 | `text` | 13.8s | 401 |
+    | `recent` | 200 | `ansi` | 0.00s | 71 |
+    | `recent` | 600 | `ansi` | 0.00s | 71 |
+    | `visible` | 600 | `ansi` | 0.00s | 71 |
+
+    The threshold is exactly `lines > viewport_rows`; one row over is enough. **`format: "ansi"` was
+    never observed to harvest** — that is an observation across the probes above, not a documented
+    guarantee, so don't lean on it. `visible` is immune by construction: it *is* the rendered
+    viewport, clamped to it however large `lines` is, so there is nothing above to collect. A
+    background poll that reads panes on a timer must therefore use `visible`
+    (`bridge/state-engine.ts`); anything asking for scrollback is asking to move the operator's
+    screen, and should be a deliberate, user-initiated read.
   **`format: "text"` returns clean plain text (no ANSI escapes)** → safe to render, no XSS surface.
 - `agent.send` writes literal text only; to submit a reply, follow with an Enter keypress
   (`pane.send_keys {keys: ["Enter"]}`) — submit-key name needs live confirmation per agent.
@@ -49,6 +89,21 @@ the socket assumptions behind the design in [`ARCHITECTURE.md`](./ARCHITECTURE.m
   successful RPC pair is not evidence a reply was delivered — a focused TUI dialog can swallow the
   text and consume the Enter with both calls reporting success. Anything that needs delivery
   *confirmed* must read the pane back and look (`web/src/lib/reply-action.ts`).
+
+> **Herdr answers no `OSC 10` / `OSC 11` background query, and relays SGR verbatim** (live-probed
+> 2026-07-29 in a pane running a raw-mode `stty` probe: both queries returned nothing).
+>
+> Two things follow, and both matter to anything that renders pane output:
+> - **A harness that asks what background it is on gets no answer and falls back to dark.** Codex
+>   emits both queries at startup; with no reply its output is dark-authored (`#f6e2b7`, `#abdfa7` —
+>   L=0.774 and 0.642, light values that only make sense on a dark ground). Collie cannot answer
+>   either: it reads a rendered buffer downstream of the PTY, so the negotiation happens between the
+>   harness and herdr on a channel Collie does not own.
+> - **Herdr does not rewrite escape codes into its own theme.** `format:"ansi"` returns what the
+>   program wrote — `\x1b[38;5;1m` stays a palette index, never a resolved RGB. So herdr's
+>   `[theme]` setting governs how *herdr's own UI* paints a pane, not what a client receives, and the
+>   same palette-index colour can legitimately differ between the desktop TUI and Collie (which
+>   applies its own 16-slot table). See [`.adr/0002`](./.adr/0002-invert-the-light-terminal-mirror.md).
 
 ## `session.snapshot` — one RPC, the whole herd (new in 0.7.2)
 
@@ -199,6 +254,21 @@ Two sibling structural ops reorder objects. Both live-verified 2026-07-20 on the
 ```
 
 `agent_status` ∈ `idle | working | blocked | done | unknown`. Panes without an agent omit/null `agent`.
+
+> **`agent_session` has TWO kinds, and it can outlive the agent that reported it** (live-verified
+> 2026-07-29 against claude, codex and pi panes). Each harness's herdr integration reports through
+> `pane.report_agent_session`, and what it reports differs:
+> - `kind:"id"` + a uuid — claude (`source:"herdr:claude"`) and codex (`source:"herdr:codex"`, from
+>   codex's `SessionStart` hook; verified on codex 0.145.0).
+> - `kind:"path"` + an **absolute path to the log file** — pi (`source:"herdr:pi"`). pi's integration
+>   prefers `agent_session_path` over an id whenever its session manager has a file open.
+>
+> Two consequences. A harness only reports at all once `herdr integration install <agent>` has been
+> run — pi's was missing on this host and the pane simply carried no session of its own. And Herdr
+> keeps reporting the LAST session announced for a pane, so relaunching a pane's agent as a different
+> harness leaves the previous one's ref behind: a pane running `pi` was observed still advertising a
+> `herdr:claude` id. The record's own `agent` field is what distinguishes the two — compare it against
+> the pane's `agent` before trusting the ref (`bridge/state-engine.ts`).
 
 > **Pane records now carry `scroll`** (new in 0.7.2, live-verified 2026-07-07): `pane.list`,
 > `pane.get`, `pane.current`, and `session.snapshot` panes all include

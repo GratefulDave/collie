@@ -48,6 +48,21 @@ interface WirePane {
   /** User-set pane label (herdr `pane.rename`). Present only once set — the key disappears when
    *  cleared with `label: null`, so absent/null both read as "no label". */
   label?: string | null;
+  /**
+   * The pane's OSC title, as the process running in it set it, and Herdr's own attempt at stripping
+   * a leading status glyph off it. Both optional: older servers omit them.
+   *
+   * Carried on the PANE — not only on `session.snapshot`'s `agents[]` — which is why reading it
+   * costs nothing architecturally: agents stay derived from `panes`, one code path (see
+   * {@link WireSnapshot}).
+   *
+   * `terminal_title_stripped` is NOT a drop-in for display. Herdr strips the settled `✳` but leaves
+   * Claude's rotating spinner frames in place (live-observed in one snapshot: `✳ Read Notes From
+   * Underground` stripped, `◐ Custom UI for Collie…` not). Those frames advance on every poll, so a
+   * label bound straight to it churns. `meaningfulTerminalTitle` does the strip Collie can rely on.
+   */
+  terminal_title?: string | null;
+  terminal_title_stripped?: string | null;
   revision: number;
   /**
    * The agent's OWN session identity, as the agent reported it to Herdr (herdr ≥ 0.7.2). For Claude
@@ -111,7 +126,11 @@ export interface PaneRead {
   revision: number;
 }
 
-type ReadSource = "visible" | "recent" | "recent-unwrapped";
+// Wire names are snake_case: `recent-unwrapped` is REJECTED by the server (`unknown variant`,
+// live-probed 2026-08-03, herdr 0.7.5). Nothing called it before that probe, so the kebab spelling
+// this type carried since day one was never caught. `detection` also exists (listed by the server's
+// own error message); semantics unverified, so it stays out of the union until something needs it.
+type ReadSource = "visible" | "recent" | "recent_unwrapped";
 type ReadFormat = "text" | "ansi";
 
 let idCounter = 0;
@@ -212,6 +231,10 @@ export class HerdrClient {
           }
           socket = s;
           // Write only once the connection is established — matches the verified probe pattern.
+          // A long request (a big paste, a wide pane's text) can exceed what the socket accepts in
+          // one go; the dialer owns that continuation, so there is nothing to retry here (dial.ts,
+          // write-drain.ts). A connection that dies mid-write lands in close/error above and
+          // rejects like any other transport failure.
           s.write(JSON.stringify({ id, method, params }) + "\n");
           s.flush();
         })

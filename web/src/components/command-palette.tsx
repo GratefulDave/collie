@@ -6,19 +6,29 @@ import { BottomSheet } from "@/components/ui/sheet";
 import { AgentIcon } from "@/components/agent-icon";
 import { usePendingConfirm } from "@/hooks/use-pending-confirm";
 import { commandsFor, type AgentCommand } from "@/lib/agent-commands";
+import type { OperatorCommand } from "@/lib/types";
 
 interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
   agent: string | undefined | null;
+  /** The operator's own rows (`commands.toml`); they replace the catalog on panes they address. */
+  mine?: readonly OperatorCommand[];
   /** Insert "/cmd " into the composer for the user to complete (arg-taking commands). */
   onInsert: (text: string) => void;
   /** Send "/cmd" immediately and submit (no-arg commands). */
   onSubmit: (text: string) => void;
 }
 
-export function CommandPalette({ open, onClose, agent, onInsert, onSubmit }: CommandPaletteProps) {
-  const all = commandsFor(agent);
+export function CommandPalette({
+  open,
+  onClose,
+  agent,
+  mine,
+  onInsert,
+  onSubmit,
+}: CommandPaletteProps) {
+  const all = commandsFor(agent, mine);
   const [query, setQuery] = useState("");
   const { pending, confirm, reset } = usePendingConfirm();
 
@@ -70,7 +80,7 @@ export function CommandPalette({ open, onClose, agent, onInsert, onSubmit }: Com
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder={`Search ${all.length} commands…`}
-          className="h-11 w-full rounded-md border border-input bg-transparent pl-9 pr-3 text-base outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+          className="h-11 w-full rounded-md border border-input bg-transparent pl-9 pr-3 text-base outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring"
         />
       </div>
 

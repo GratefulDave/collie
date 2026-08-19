@@ -1,12 +1,13 @@
 import { useState } from "react";
 import type { ComponentProps } from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { clearStatus, useStatus } from "@/lib/status";
 import { isReloadHeld, __resetReloadGuard } from "@/lib/reload-guard";
+import { loadDraft } from "@/lib/drafts";
 import { server } from "@/test/setup";
 import { recordReply } from "@/test/handlers";
 import { Composer } from "./composer";
@@ -44,16 +45,34 @@ function renderComposer(overrides: Partial<ComponentProps<typeof Composer>> = {}
     text: "pane output",
     terminalDraft: null,
     rawTerminalDraft: null,
-    prefs: { wrap: true, fontSize: 11, rawTerminal: false },
+    prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
     setWrap: vi.fn(),
     stepFontSize: vi.fn(),
     setRawTerminal: vi.fn(),
+    setTapToFocus: vi.fn(),
     onSent: vi.fn(),
     ...overrides,
   };
   const router = createMemoryRouter([{ path: "/", element: <Composer {...props} /> }]);
   render(<RouterProvider router={router} />);
   return props;
+}
+
+/**
+ * Wait for a send that can never verify to reach its terminal `stalled` outcome.
+ *
+ * A reply handler that doesn't `recordReply` leaves the fake pane's input line empty, so the
+ * type-then-verify guard polls POLL_ATTEMPTS × POLL_DELAY_MS (~2.8s) and only then reports. That
+ * report is a `setStatus` on a MODULE-SCOPED singleton, which outlives the test that started it: a
+ * test that returns first hands its stall to whichever test is running ~2.8s later, past this file's
+ * `clearStatus()`, where it reads as that test's own failure. Every test that fires a send it never
+ * lets verify ends with this. Needs a status sentinel in the render (`renderComposerWithStatus`).
+ */
+async function awaitTerminalStall() {
+  await waitFor(
+    () => expect(screen.getByTestId("status")).toHaveTextContent(/didn't reach the input box/i),
+    { timeout: 5000 },
+  );
 }
 
 function StatusSentinel() {
@@ -73,10 +92,11 @@ function renderComposerWithStatus(overrides: Partial<ComponentProps<typeof Compo
     text: "pane output",
     terminalDraft: null,
     rawTerminalDraft: null,
-    prefs: { wrap: true, fontSize: 11, rawTerminal: false },
+    prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
     setWrap: vi.fn(),
     stepFontSize: vi.fn(),
     setRawTerminal: vi.fn(),
+    setTapToFocus: vi.fn(),
     onSent: vi.fn(),
     ...overrides,
   };
@@ -122,6 +142,105 @@ describe("Composer — send", () => {
     expect(props.onSent).not.toHaveBeenCalled();
   });
 
+  // The same #34 failure one step upstream. `dialogPresent` and the stranded draft are both derived
+  // from the mirror's snapshot, which lags the live pane by a poll while following and is FROZEN
+  // while the user has scrolled back or opened find — so both can say "composer, with a draft on the
+  // ❯ line" about a pane that has since put a dialog up. The pre-clear sweep is ctrl+k plus a run of
+  // Backspaces; fired at that dialog it is keystrokes into a modal, which is exactly what must never
+  // happen. Nothing destructive may go out until something has read the LIVE pane.
+  it("does not sweep the terminal line when the live pane no longer shows a composer", async () => {
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    server.use(
+      // The live pane: a dialog owns it, and there is no input box anywhere on screen.
+      http.get(/\/api\/pane\/[^/]+$/, () =>
+        HttpResponse.json({
+          paneId: "w1:p1",
+          text: "Do you want to proceed?\n❯ 1. Yes\n  2. No",
+          truncated: false,
+          revision: 2,
+        }),
+      ),
+      http.post(/\/api\/pane\/[^/]+\/keys$/, () => {
+        calls.push("keys");
+        return HttpResponse.json({ ok: true });
+      }),
+      replyHandler(() => calls.push("reply")),
+    );
+    // What the composer still believes, from the stale mirror: no dialog, and a draft to sweep.
+    const props = renderComposerWithStatus({ dialogPresent: false, rawTerminalDraft: "leftover" });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "please do not approve anything");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent(/input box isn't on screen/i),
+    );
+    expect(calls).toEqual([]); // no sweep, no reply — the pre-flight ran first and refused
+    expect(box).toHaveValue("please do not approve anything");
+    expect(props.onSent).not.toHaveBeenCalled();
+  });
+
+  // The override tap, end to end, on an omp pane. omp lifts no interactive block kind at all, so
+  // `dialogPresent` is STRUCTURALLY false for it and the reply pre-flight is the only guard there is —
+  // which makes this the pane where the force path matters most. `force` is armed by a `blocked`
+  // outcome, i.e. by the app having just PROVEN a dialog owns the keyboard, and the retry used to make
+  // the destructive sweep the first thing on the wire, into that dialog.
+  it("the `Type anyway?` retry types into the pane but never sweeps it", async () => {
+    const user = userEvent.setup();
+    const wire: string[] = [];
+    const COLS = 189;
+    const pad = (open: string, body: string, close: string, filler: string) =>
+      open + body + filler.repeat(COLS - open.length - body.length - close.length) + close;
+    // omp with a `/model` picker up: no `╰─ … ─╯` anywhere, so `composerReady` is false.
+    const ompModal = [
+      pad("╭──", " Select a model ", "╮", "─"),
+      pad("│ ", " ❯ 1. claude-opus  ", " │", " "),
+      pad("╰──", "", "──╯", "─"),
+    ].join("\n");
+    server.use(
+      http.get(/\/api\/pane\/[^/]+$/, () =>
+        HttpResponse.json({ paneId: "w1:p1", text: ompModal, truncated: false, revision: 2 }),
+      ),
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        const body = (await request.json()) as { keys: string[] };
+        wire.push(`keys:${body.keys[0]}×${body.keys.length}`);
+        return HttpResponse.json({ ok: true });
+      }),
+      replyHandler(
+        (text) => wire.push(`type:${text}`),
+        () => wire.push("submit"),
+      ),
+    );
+    // The frozen mirror still shows a stranded draft on the ❯ line — what arms the sweep.
+    renderComposerWithStatus({ agent: "omp", rawTerminalDraft: "leftover" });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "please do not approve anything");
+
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent(/Tap Send again to type anyway/i),
+    );
+    expect(wire).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: "Type anyway?" }));
+    await waitFor(() => expect(wire).toContain("type:please do not approve anything"));
+    // The picker never turns into an input box, so type-then-verify polls out and reports `stalled`.
+    // Wait for that terminal outcome INSIDE the test: it lands on the module-scoped status singleton
+    // ~2.8s after the type (POLL_ATTEMPTS × POLL_DELAY_MS), and a test that ended first would have
+    // it write into whichever test was running by then, past this file's `clearStatus()`.
+    await waitFor(
+      () => expect(screen.getByTestId("status")).toHaveTextContent(/didn't reach the input box/i),
+      { timeout: 5000 },
+    );
+    // No `ctrl+k` + 41 Backspaces into the picker. The override is about the MESSAGE; the keys the
+    // guard cannot take back stay home, and the submit key is still withheld by type-then-verify.
+    expect(wire.some((w) => w.startsWith("keys:"))).toBe(false);
+    expect(wire).not.toContain("submit");
+    expect(box).toHaveValue("please do not approve anything");
+  }, 15000);
+
   it("sends non-destructive input on the first tap and clears the draft", async () => {
     const user = userEvent.setup();
     const props = renderComposer();
@@ -152,7 +271,7 @@ describe("Composer — send", () => {
     );
     // The pre-clear keys on the RAW line (the actual current "❯" content), independent of whether the
     // draft ever stabilised into a visible preview — a stranded raw draft is still swept before send.
-    renderComposer({ terminalDraft: null, rawTerminalDraft: "leftover" });
+    renderComposerWithStatus({ terminalDraft: null, rawTerminalDraft: "leftover" });
     const box = screen.getByPlaceholderText(/type a reply/i);
 
     await user.type(box, "new message");
@@ -163,6 +282,190 @@ describe("Composer — send", () => {
     // Draft length + the 32-Backspace overshoot (mid-poll-gap host typing margin) + the ctrl+k.
     expect(sentKeys).toHaveLength([..."leftover"].length + 33);
     expect(sentKeys!.slice(1).every((k) => k === "Backspace")).toBe(true);
+    await awaitTerminalStall(); // see the helper: an unawaited stall lands in a later test
+  }, 15000);
+
+  // The burst is the only destructive keystroke path in the app not bound to the screen that
+  // authorised it. Ordering ("the read happens first") is not a freshness bound: the read's answer
+  // describes the pane at the moment the BRIDGE snapshotted it, and the keys go out when the answer
+  // arrives — a whole round-trip later, capped only by GET_TIMEOUT_MS. `expected_prompt` gives the
+  // bridge the last word: it re-reads the pane immediately before send_keys and 409s if the row has
+  // gone, which is the same mitigation lib/dialog-guard.ts gives every dialog tap.
+  describe("the pre-clear burst is bound to the screen that authorised it", () => {
+    const COLS = 189;
+    const pad = (open: string, body: string, close: string, filler: string) =>
+      open + body + filler.repeat(Math.max(0, COLS - open.length - body.length - close.length)) + close;
+    const ompComposer = (draft: string) =>
+      [
+        "transcript above the composer",
+        "",
+        pad("╭── ⬢ Auto > ⑂ master ", "", "╮", "─"),
+        pad("╰─ ", draft, " ─╯", " "),
+      ].join("\n");
+    const promptRow = (draft: string) => ompComposer(draft).split("\n")[3]!.replace(/\s+$/, "");
+
+    it("sends the composer's own `╰─ … ─╯` row as expected_prompt", async () => {
+      const user = userEvent.setup();
+      const wire: string[] = [];
+      let bound: string | undefined;
+      server.use(
+        http.get(/\/api\/pane\/[^/]+$/, () =>
+          HttpResponse.json({
+            paneId: "w1:p1",
+            text: ompComposer("new message"), // the composer echoes our text back, so the send lands
+            truncated: false,
+            revision: 2,
+          }),
+        ),
+        http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+          const body = (await request.json()) as { expected_prompt?: string };
+          bound = body.expected_prompt;
+          wire.push("keys");
+          return HttpResponse.json({ ok: true });
+        }),
+        replyHandler(
+          (text) => wire.push(`type:${text}`),
+          () => wire.push("submit"),
+        ),
+      );
+      renderComposer({ agent: "omp", rawTerminalDraft: "leftover" });
+
+      await user.type(screen.getByPlaceholderText(/type a reply/i), "new message");
+      await user.click(screen.getByRole("button", { name: "Send" }));
+
+      await waitFor(() => expect(wire).toContain("submit"));
+      expect(wire).toEqual(["keys", "type:new message", "submit"]);
+      // Verbatim, and the row the Backspaces are aimed at — not a paraphrase of the screen.
+      expect(bound).toBe(promptRow("new message"));
+    }, 15000);
+
+    it("abandons the send with nothing typed when the bridge refuses the binding", async () => {
+      const user = userEvent.setup();
+      const wire: string[] = [];
+      server.use(
+        http.get(/\/api\/pane\/[^/]+$/, () =>
+          HttpResponse.json({
+            paneId: "w1:p1",
+            text: ompComposer("leftover"),
+            truncated: false,
+            revision: 2,
+          }),
+        ),
+        // What the bridge answers when its own re-read no longer finds the bound row: the composer
+        // left the screen between the pre-flight and the keys, so the burst would have landed on
+        // whatever replaced it.
+        http.post(/\/api\/pane\/[^/]+\/keys$/, () => {
+          wire.push("keys-refused");
+          return HttpResponse.json(
+            { ok: false, error: "prompt changed", code: "prompt_changed" },
+            { status: 409 },
+          );
+        }),
+        replyHandler(
+          (text) => wire.push(`type:${text}`),
+          () => wire.push("submit"),
+        ),
+      );
+      const props = renderComposerWithStatus({ agent: "omp", rawTerminalDraft: "leftover" });
+      const box = screen.getByPlaceholderText(/type a reply/i);
+
+      await user.type(box, "please do not approve anything");
+      await user.click(screen.getByRole("button", { name: "Send" }));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("status")).toHaveTextContent(/input box changed while clearing/i),
+      );
+      // The refusal aborts the whole send: no reply text follows the keys onto a screen that moved.
+      expect(wire).toEqual(["keys-refused"]);
+      expect(box).toHaveValue("please do not approve anything");
+      expect(props.onSent).not.toHaveBeenCalled();
+    }, 15000);
+
+    it("does not sweep a pane that went read-only while the pre-flight was in flight", async () => {
+      // `send()` checks `locked` once, before the pre-flight's round-trip. The burst goes out on the
+      // far side of it and — unlike every other key this component sends — does not go through
+      // `pressKeys`, which has its own check. A pane that died in that window used to get it anyway.
+      const user = userEvent.setup();
+      const wire: string[] = [];
+      // The pre-flight's read is held open until the test says so, so the window this is about — the
+      // one between "a read saw the composer" and "the burst goes out" — is the test's to control
+      // rather than a race against the scheduler.
+      let announcePreflight!: () => void;
+      let releasePreflight!: () => void;
+      const preflightIssued = new Promise<void>((resolve) => {
+        announcePreflight = resolve;
+      });
+      const preflightHeld = new Promise<void>((resolve) => {
+        releasePreflight = resolve;
+      });
+      // A pane id of this test's own, so a poll still in flight from an earlier test cannot be the
+      // read this one holds open (they all use w1:p1 and fall through to the default handler).
+      const PANE = "w9:p9";
+      server.use(
+        http.get(/\/api\/pane\/w9%3Ap9$/, async () => {
+          announcePreflight();
+          await preflightHeld;
+          return HttpResponse.json({
+            paneId: PANE,
+            text: ompComposer("leftover"),
+            truncated: false,
+            revision: 2,
+          });
+        }),
+        http.post(/\/api\/pane\/w9%3Ap9\/keys$/, () => {
+          wire.push("keys");
+          return HttpResponse.json({ ok: true });
+        }),
+        http.post(/\/api\/pane\/w9%3Ap9\/reply$/, async ({ request }) => {
+          const body = (await request.json()) as { text: string; submit?: boolean };
+          recordReply(body);
+          wire.push(body.submit ? "submit" : `type:${body.text}`);
+          return HttpResponse.json({ ok: true });
+        }),
+      );
+
+      let setLocked: ((v: boolean) => void) | null = null;
+      function Harness() {
+        const [gone, setGone] = useState(false);
+        setLocked = setGone;
+        return (
+          <>
+            <StatusSentinel />
+            <Composer
+              paneId={PANE}
+              agent="omp"
+              isShell={false}
+              gone={gone}
+              readOnly={false}
+              dialogPresent={false}
+              text="pane output"
+              terminalDraft={null}
+              rawTerminalDraft="leftover"
+              prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+              setWrap={vi.fn()}
+              stepFontSize={vi.fn()}
+              setRawTerminal={vi.fn()}
+              setTapToFocus={vi.fn()}
+              onSent={vi.fn()}
+            />
+          </>
+        );
+      }
+      const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
+      render(<RouterProvider router={router} />);
+
+      await user.type(screen.getByPlaceholderText(/type a reply/i), "please do not approve anything");
+      await user.click(screen.getByRole("button", { name: "Send" }));
+      await preflightIssued;
+      act(() => setLocked?.(true)); // the pane died while the read was still in flight
+      releasePreflight(); // …and only now does the read's "yes, a composer" come back
+
+      await waitFor(() =>
+        expect(screen.getByTestId("status")).toHaveTextContent(/no longer writable/i),
+      );
+      expect(wire).toEqual([]); // no burst, and no reply behind it
+      expect(screen.getByPlaceholderText(/pane is gone/i)).toBeTruthy();
+    }, 15000);
   });
 
   it("does not call keys before reply when terminalDraft is null", async () => {
@@ -178,14 +481,15 @@ describe("Composer — send", () => {
         return HttpResponse.json({ ok: true });
       }),
     );
-    renderComposer({ terminalDraft: null });
+    renderComposerWithStatus({ terminalDraft: null });
     const box = screen.getByPlaceholderText(/type a reply/i);
 
     await user.type(box, "hello");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
     await waitFor(() => expect(callOrder).toEqual(["reply"]));
-  });
+    await awaitTerminalStall(); // see the helper: an unawaited stall lands in a later test
+  }, 15000);
 
   it("sequential sends with no stranded draft do not call keys before reply", async () => {
     const user = userEvent.setup();
@@ -230,10 +534,11 @@ describe("Composer — send", () => {
       text: "pane output",
       terminalDraft: null,
       rawTerminalDraft: null,
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false },
+      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
+      setTapToFocus: vi.fn(),
       onSent: vi.fn(),
     };
     const router = createMemoryRouter([
@@ -256,6 +561,605 @@ describe("Composer — send", () => {
     await waitFor(() => expect(box).toHaveValue("almost sent"));
     await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent(partialError));
     expect(props.onSent).not.toHaveBeenCalled();
+  });
+});
+
+describe("Composer — typing into the terminal", () => {
+  /** The entry point: the named "Type" toggle in the Controls row, beside Keys. */
+  function startDirectTyping() {
+    fireEvent.click(screen.getByRole("button", { name: /^type into terminal$/i }));
+    return screen.getByPlaceholderText(/type into the terminal/i);
+  }
+
+  it("focuses the textarea synchronously so the activation gesture opens the phone keyboard", () => {
+    renderComposer();
+
+    expect(startDirectTyping()).toHaveFocus();
+  });
+
+  // The entry point must be a deliberate press and nothing else: it sits in a row of dock toggles,
+  // so it must not send, and it must not leave a half-open dock covering the keyboard it needs.
+  it("arms from the Controls row without sending, and closes an open dock", async () => {
+    let replyCalls = 0;
+    server.use(replyHandler(() => replyCalls++));
+    renderComposer();
+    fireEvent.click(screen.getByRole("button", { name: /^keys$/i }));
+    expect(screen.getByRole("button", { name: /close keys/i })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^type into terminal$/i }));
+
+    expect(screen.getByPlaceholderText(/type into the terminal/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /close keys/i })).toBeNull();
+    expect(replyCalls).toBe(0);
+    expect(screen.getByRole("button", { name: /^type into terminal$/i })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("shows the armed strip and stops from it", async () => {
+    renderComposer();
+    startDirectTyping();
+
+    const strip = screen.getByText(/typing into terminal/i);
+    expect(strip).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^stop$/i }));
+
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText(/type into the terminal/i)).toBeNull(),
+    );
+  });
+
+  // The other half of the same rule: the composer locking (pane gone, device demoted to read-only,
+  // or the idle pause) means the view is no longer live either.
+  it("stops when the composer locks under it", async () => {
+    function Harness() {
+      const [gone, setGone] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setGone(true)}>
+            lock it
+          </button>
+          <Composer
+            paneId="w1:p1"
+            agent="claude"
+            isShell={false}
+            gone={gone}
+            readOnly={false}
+            dialogPresent={false}
+            text="pane output"
+            terminalDraft={null}
+            rawTerminalDraft={null}
+            prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+            setWrap={vi.fn()}
+            stepFontSize={vi.fn()}
+            setRawTerminal={vi.fn()}
+            setTapToFocus={vi.fn()}
+            onSent={vi.fn()}
+          />
+        </>
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
+    render(<RouterProvider router={router} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /^type into terminal$/i }));
+    expect(screen.getByPlaceholderText(/type into the terminal/i)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "lock it" }));
+
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText(/type into the terminal/i)).toBeNull(),
+    );
+  });
+
+  // The mirror stops tracking the pane when the page is backgrounded, so the next keystroke would
+  // go into a terminal the user is not looking at.
+  it("stops when the page is hidden", async () => {
+    renderComposer();
+    startDirectTyping();
+
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText(/type into the terminal/i)).toBeNull(),
+    );
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+  });
+
+  // The disarm above is invisible while the page is hidden — lib/status.ts expires a non-error in
+  // 2.5s, so a message published on the way out is gone before anyone can read it. Coming back to a
+  // focused field with the mode silently off is how keystrokes meant for the terminal end up in the
+  // reply draft instead, so the message has to wait for the return trip.
+  it("says the mode stopped once the page comes back", async () => {
+    renderComposerWithStatus();
+    startDirectTyping();
+
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText(/type into the terminal/i)).toBeNull(),
+    );
+    expect(screen.getByTestId("status")).not.toHaveTextContent(/backgrounded/i);
+
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent(/stopped typing into the terminal/i),
+    );
+  });
+
+  // The notice above expires; a focused field does not. Handing the composer back with the keyboard
+  // still up is what turns "the mode stopped" into keystrokes buffered as a reply, so the disarm
+  // puts the keyboard away — same as the blur on a failed batch.
+  it("puts the keyboard away when the page is hidden, rather than leaving the field primed", async () => {
+    renderComposerWithStatus();
+    const box = startDirectTyping();
+    box.focus();
+    expect(document.activeElement).toBe(box);
+
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() => expect(document.activeElement).not.toBe(box));
+    expect(screen.queryByPlaceholderText(/type into the terminal/i)).toBeNull();
+
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent(/stopped typing into the terminal/i),
+    );
+    // Still not focused on the way back: the reply field must be entered on purpose.
+    expect(document.activeElement).not.toBe(box);
+  });
+
+  // The blur above is deferred, so it can outlive the disarm that scheduled it. Re-arming is the
+  // ordinary way that happens: you come back, tap Type again, and the old timer must not fire into
+  // the session that replaced it and drop the keyboard you just asked for. What prevents it is
+  // activate()'s cancelPendingBlur() — remove that one line and this test fails, which is the whole
+  // reason it runs the timers by hand instead of waiting them out.
+  it("does not blur a re-armed session with the disarm it already superseded", () => {
+    renderComposerWithStatus();
+    const box = startDirectTyping();
+    const blurred = vi.spyOn(box, "blur");
+
+    // Fake timers only for the race itself: the deferred blur must be held, not waited out.
+    vi.useFakeTimers();
+    try {
+      Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+      fireEvent(document, new Event("visibilitychange")); // schedules the blur
+      Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+      fireEvent(document, new Event("visibilitychange"));
+      fireEvent.click(screen.getByRole("button", { name: /^type into terminal$/i })); // re-arm
+      act(() => vi.runOnlyPendingTimers());
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(blurred).not.toHaveBeenCalled();
+    expect(screen.getByPlaceholderText(/type into the terminal/i)).toBeInTheDocument();
+  });
+
+  // The notice is owed by the pane that was armed, and a pane can change WHILE the page is hidden —
+  // a push notification deep-links straight into another one. Delivering it on arrival would tell
+  // you the mode stopped on a pane where it was never running.
+  it("does not announce the background disarm over a pane it was never armed on", async () => {
+    function Harness() {
+      const [paneId, setPaneId] = useState("w1:p1");
+      return (
+        <>
+          <StatusSentinel />
+          <button type="button" onClick={() => setPaneId("w1:p2")}>
+            Switch pane
+          </button>
+          <Composer
+            paneId={paneId}
+            agent="claude"
+            isShell={false}
+            gone={false}
+            readOnly={false}
+            dialogPresent={false}
+            text="pane output"
+            terminalDraft={null}
+            rawTerminalDraft={null}
+            prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+            setWrap={vi.fn()}
+            stepFontSize={vi.fn()}
+            setRawTerminal={vi.fn()}
+            setTapToFocus={vi.fn()}
+            onSent={vi.fn()}
+          />
+        </>
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
+    render(<RouterProvider router={router} />);
+    startDirectTyping();
+
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+    fireEvent.click(screen.getByRole("button", { name: "Switch pane" }));
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    fireEvent(document, new Event("visibilitychange"));
+
+    await waitFor(() => expect(screen.getByPlaceholderText(/type a reply/i)).toBeInTheDocument());
+    expect(screen.getByTestId("status")).not.toHaveTextContent(/backgrounded/i);
+  });
+
+  it("sends committed keyboard text as literal ordered keys with no implicit Enter", async () => {
+    const keyCalls: string[][] = [];
+    let replyCalls = 0;
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        keyCalls.push(((await request.json()) as { keys: string[] }).keys);
+        return HttpResponse.json({ ok: true });
+      }),
+      replyHandler(() => replyCalls++),
+    );
+    renderComposerWithStatus({ dialogPresent: true });
+
+    const box = startDirectTyping();
+    expect(screen.getByRole("button", { name: /^type into terminal$/i })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.change(box, { target: { value: "b a" } });
+
+    await waitFor(() => expect(keyCalls).toEqual([["b", "Space", "a"]]));
+    expect(keyCalls.flat()).not.toContain("Enter");
+    expect(replyCalls).toBe(0);
+    expect(box).toHaveValue("");
+    expect(screen.getByTestId("status")).toHaveTextContent(/typing into the terminal/i);
+  });
+
+  it("sends a swiped/IME-composed word once when composition commits", async () => {
+    const keyCalls: string[][] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        keyCalls.push(((await request.json()) as { keys: string[] }).keys);
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderComposer();
+    const box = startDirectTyping();
+
+    fireEvent.compositionStart(box);
+    fireEvent.input(box, {
+      target: { value: "swipe" },
+      data: "swipe",
+      inputType: "insertCompositionText",
+      isComposing: true,
+    });
+    expect(keyCalls).toEqual([]);
+    fireEvent.compositionEnd(box, { data: "swipe" });
+
+    await waitFor(() => expect(keyCalls).toEqual([["s", "w", "i", "p", "e"]]));
+    // Gboard may emit the committed value once more as an ordinary input after compositionend.
+    fireEvent.input(box, {
+      target: { value: "swipe" },
+      data: "swipe",
+      inputType: "insertText",
+      isComposing: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(keyCalls).toEqual([["s", "w", "i", "p", "e"]]);
+  });
+
+  it("sends terminal keys that do not change the textarea value", async () => {
+    const keyCalls: string[][] = [];
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        keyCalls.push(((await request.json()) as { keys: string[] }).keys);
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderComposer();
+    const box = startDirectTyping();
+
+    fireEvent.keyDown(box, { key: "Backspace" });
+    await waitFor(() => expect(keyCalls).toEqual([["Backspace"]]));
+    fireEvent.keyDown(box, { key: "Enter" });
+    await waitFor(() => expect(keyCalls).toEqual([["Backspace"], ["Enter"]]));
+
+    // Android can omit keydown for its virtual Backspace and expose only beforeinput.
+    fireEvent(
+      box,
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "deleteContentBackward",
+      }),
+    );
+    await waitFor(() =>
+      expect(keyCalls).toEqual([["Backspace"], ["Enter"], ["Backspace"]]),
+    );
+
+    // Gboard can mark its virtual Enter as composing while it commits the current candidate.
+    fireEvent(
+      box,
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertParagraph",
+        isComposing: true,
+      }),
+    );
+    await waitFor(() =>
+      expect(keyCalls).toEqual([["Backspace"], ["Enter"], ["Backspace"], ["Enter"]]),
+    );
+  });
+
+  it("exits on a tap of the highlighted keyboard button", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    const box = startDirectTyping();
+
+    fireEvent.blur(box); // dismissing the Android keyboard does not silently disarm the mode
+    expect(screen.getByPlaceholderText(/type into the terminal/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /stop typing into terminal/i }));
+
+    expect(screen.getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("stops direct typing when a key batch is refused", async () => {
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, () =>
+        HttpResponse.json({ ok: false, error: "pane unavailable" }, { status: 500 }),
+      ),
+    );
+    renderComposerWithStatus();
+    const box = startDirectTyping();
+
+    fireEvent.change(box, { target: { value: "b" } });
+
+    const replyBox = await screen.findByPlaceholderText(/type a reply/i);
+    await waitFor(() => expect(replyBox).not.toHaveFocus());
+    expect(screen.getByTestId("status")).toHaveTextContent(/pane unavailable/i);
+  });
+
+  it("refuses activation while a buffered reply exists", async () => {
+    const user = userEvent.setup();
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "keep this draft");
+
+    // The refusal belongs on the named choice, where there is somewhere to explain it.
+    fireEvent.click(screen.getByRole("button", { name: /^type into terminal$/i }));
+
+    expect(screen.getByPlaceholderText(/type a reply/i)).toHaveValue("keep this draft");
+    expect(screen.queryByPlaceholderText(/type into the terminal/i)).not.toBeInTheDocument();
+    expect(screen.getByTestId("status")).toHaveTextContent(/send or clear the draft/i);
+  });
+
+  it("resets when the composer changes panes", () => {
+    function Harness() {
+      const [paneId, setPaneId] = useState("w1:p1");
+      return (
+        <>
+          <button type="button" onClick={() => setPaneId("w1:p2")}>
+            Switch pane
+          </button>
+          <Composer
+            paneId={paneId}
+            agent="claude"
+            isShell={false}
+            gone={false}
+            readOnly={false}
+            dialogPresent={false}
+            text="pane output"
+            terminalDraft={null}
+            rawTerminalDraft={null}
+            prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+            setWrap={vi.fn()}
+            stepFontSize={vi.fn()}
+            setRawTerminal={vi.fn()}
+            setTapToFocus={vi.fn()}
+            onSent={vi.fn()}
+          />
+        </>
+      );
+    }
+    const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
+    render(<RouterProvider router={router} />);
+    startDirectTyping();
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch pane" }));
+
+    expect(screen.getByPlaceholderText(/type a reply/i)).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText(/type keys/i)).not.toBeInTheDocument();
+  });
+});
+
+// .adr/0009: a modal that owns the keyboard has no input box, so the reply path's PRE-FLIGHT refuses
+// before typing anything. The composer's job is to keep the draft, say why, and offer one deliberate
+// override — which still runs the type-then-verify guard behind it.
+describe("Composer — blocked pre-flight override", () => {
+  // A pane with no input box at all: the /model picker's shape.
+  const PICKER = [
+    "▔".repeat(60),
+    "   Select model",
+    "   ❯ 1. Default",
+    "     2. Opus",
+    "",
+    "   Enter to set as default · s to use this session only · Esc to cancel",
+  ].join("\n");
+
+  function servePicker(calls: string[]) {
+    server.use(
+      http.get(/\/api\/pane\/[^/]+$/, () =>
+        HttpResponse.json({ paneId: "w1:p1", text: PICKER, truncated: false, revision: 1 }),
+      ),
+      http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+        const body = (await request.json()) as { text: string; submit?: boolean };
+        calls.push(body.submit ? "submit" : "type");
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+  }
+
+  it("keeps the draft, explains, and types nothing on the first tap", async () => {
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    servePicker(calls);
+    const props = renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "use fable please");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent(/input box isn't on screen/i),
+    );
+    expect(screen.getByTestId("status")).toHaveTextContent(/tap send again to type anyway/i);
+    expect(calls).toEqual([]); // nothing was typed into the picker
+    expect(box).toHaveValue("use fable please"); // the message survives
+    expect(props.onSent).not.toHaveBeenCalled();
+    // The button names what the override actually does — type, not send.
+    expect(screen.getByRole("button", { name: /type anyway/i })).toBeInTheDocument();
+  });
+
+  it("the second tap types anyway, but STILL withholds the submit key", async () => {
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    servePicker(calls);
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "use fable please");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("button", { name: /type anyway/i });
+
+    await user.click(screen.getByRole("button", { name: /type anyway/i }));
+
+    // The text goes in (the user overruled the pre-flight) — but the pane never echoes it onto an
+    // input line, so the verify step never passes and Enter is never fired. THE #34 invariant.
+    await waitFor(() => expect(calls).toContain("type"));
+    expect(calls).not.toContain("submit");
+    expect(box).toHaveValue("use fable please");
+    await awaitTerminalStall(); // see the helper: an unawaited stall lands in a later test
+  }, 15000);
+});
+
+// A draft too big for the disk tier survives a pane switch but not the app closing, and the only
+// thing that makes that difference visible is this row. Before it, the oversize write was skipped
+// and a remount silently restored an OLDER, SHORTER draft — text the user never wrote.
+describe("Composer — oversize draft notice", () => {
+  it("says an oversize draft won't survive the app closing, and stops saying it when it fits", async () => {
+    const props = renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    expect(screen.queryByText(/too long to keep as a saved draft/i)).not.toBeInTheDocument();
+
+    // Paste, rather than type: 8 KiB of userEvent keystrokes would take minutes.
+    fireEvent.change(box, { target: { value: "# heading\n".repeat(1200) } });
+    expect(await screen.findByText(/too long to keep as a saved draft/i)).toBeInTheDocument();
+    // …and the whole paste is still what the store hands back, which is the actual fix.
+    expect(loadDraft(undefined, props.paneId)).toHaveLength(12000);
+
+    fireEvent.change(box, { target: { value: "short again" } });
+    await waitFor(() =>
+      expect(screen.queryByText(/too long to keep as a saved draft/i)).not.toBeInTheDocument(),
+    );
+  });
+});
+
+// #103. A password prompt is the one refusal that never becomes a success: `sudo` turns echo off, so
+// the evidence Send needs is exactly what the screen is refusing to show, and the reporter tapped Send
+// at it for three days. These pin the two halves of the answer — say what it is, and get the operator
+// into the mode that works without leaving the secret behind.
+describe("Composer — password prompt", () => {
+  const SUDO = "$ sudo systemctl restart collie\n[sudo] password for altan:";
+
+  function serveSudo(calls: string[]) {
+    server.use(
+      http.get(/\/api\/pane\/[^/]+$/, () =>
+        HttpResponse.json({ paneId: "w1:p1", text: SUDO, truncated: false, revision: 1 }),
+      ),
+      http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+        const body = (await request.json()) as { text: string; submit?: boolean };
+        calls.push(body.submit ? "submit" : "type");
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+  }
+
+  it("names the prompt and offers Type, without replacing the override", async () => {
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    serveSudo(calls);
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "hunter2hunter2");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    // The refusal names the mechanism, not "a menu or dialog is probably up".
+    await waitFor(() =>
+      expect(screen.getByTestId("status")).toHaveTextContent(/password prompt/i),
+    );
+    // The prompt is quoted off the mirror, so the claim is checkable against the screen.
+    expect(screen.getByText("[sudo] password for altan:")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /use type/i })).toBeInTheDocument();
+    // The pre-existing override is untouched — a false positive costs a dismissal, not an action.
+    expect(screen.getByRole("button", { name: /type anyway/i })).toBeInTheDocument();
+    expect(calls).toEqual([]);
+  });
+
+  it("the handoff clears the draft before arming Type", async () => {
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    serveSudo(calls);
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "hunter2hunter2");
+    // The write-through has already put the secret in the 48h store, before any send was attempted —
+    // the leak #103 asked about. Asserted here so the assertion below isn't vacuously true.
+    expect(localStorage.getItem("collie:draft:default:w1:p1")).toContain("hunter2hunter2");
+
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await user.click(await screen.findByRole("button", { name: /use type/i }));
+
+    // Armed, and the secret is gone from the field (and from its localStorage copy with it) — which
+    // is also what lets it arm at all: useDirectTyping refuses while any draft is present.
+    await waitFor(() =>
+      expect(screen.getByPlaceholderText(/type into the terminal/i)).toHaveValue(""),
+    );
+    expect(localStorage.getItem("collie:draft:default:w1:p1")).toBeNull();
+    expect(screen.queryByRole("button", { name: /use type/i })).not.toBeInTheDocument();
+    expect(calls).toEqual([]); // nothing was ever typed by the reply path
+  });
+
+  it("drops the stored draft the moment it recognises the prompt, button or no button", async () => {
+    // The reporter's actual behaviour: tap Send, give up, walk to a laptop. No button is ever pressed,
+    // so a handoff that clears on its way through would never have run — and the pane-leave save would
+    // have written the password back out. The store has to be empty from the refusal onwards.
+    const user = userEvent.setup();
+    const calls: string[] = [];
+    serveSudo(calls);
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box, "hunter2hunter2");
+    expect(localStorage.getItem("collie:draft:default:w1:p1")).toContain("hunter2hunter2");
+
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("button", { name: /use type/i });
+    expect(localStorage.getItem("collie:draft:default:w1:p1")).toBeNull();
+    // Through the store's own reader, not just the storage key: the draft store has a second,
+    // in-memory tier (lib/drafts.ts) and a secret surviving in a tier this assertion cannot see
+    // would be #103 all over again, invisibly. clearDraft must empty both.
+    expect(loadDraft(undefined, "w1:p1")).toBeNull();
+
+    // Dismissing keeps the text on screen — the operator may still need to read it — but the typing
+    // that happened while the notice was up was never stored either.
+    await user.click(screen.getByRole("button", { name: /dismiss password-prompt notice/i }));
+    expect(box).toHaveValue("hunter2hunter2");
+    expect(localStorage.getItem("collie:draft:default:w1:p1")).toBeNull();
   });
 });
 
@@ -311,10 +1215,11 @@ function renderDraftHarness(overrides: Partial<ComponentProps<typeof Composer>> 
       readOnly: false,
       dialogPresent: false,
       text: "pane output",
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false },
+      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
+      setTapToFocus: vi.fn(),
       onSent: vi.fn(),
       ...rest,
       terminalDraft: stable,
@@ -581,10 +1486,11 @@ describe("Composer — in-flight echo suppression (match-last-sent)", () => {
       text: "pane output",
       terminalDraft: draft,
       rawTerminalDraft: draft,
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false },
+      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
+      setTapToFocus: vi.fn(),
       onSent: vi.fn(),
     };
     return (
@@ -880,7 +1786,7 @@ describe("Composer — quick dock (in-flow, matches the keys dock)", () => {
     expect(screen.queryByRole("button", { name: "yes" })).not.toBeInTheDocument();
   });
 
-  it("a quick-action tap sends its text through the reply path and closes the dock", async () => {
+  it("a quick-action tap sends its text through the reply path, then closes the dock", async () => {
     const user = userEvent.setup();
     let replyText: string | null = null;
     server.use(replyHandler((typed) => (replyText = typed)));
@@ -891,7 +1797,308 @@ describe("Composer — quick dock (in-flow, matches the keys dock)", () => {
 
     await waitFor(() => expect(replyText).toBe("continue"));
     expect(props.onSent).toHaveBeenCalled();
-    // fire() closes the dock after sending.
-    expect(screen.queryByRole("button", { name: "continue" })).not.toBeInTheDocument();
+    // The dock deliberately OUTLIVES the send — the ✓ has to land somewhere the user is still
+    // looking — and closes itself once the echo has been seen.
+    await waitFor(
+      () => expect(screen.queryByRole("button", { name: "continue" })).not.toBeInTheDocument(),
+      { timeout: 3000 },
+    );
+  });
+
+  it("a quick reply echoes on its OWN button and locks its siblings while in flight", async () => {
+    const user = userEvent.setup();
+    // Hold the TYPE half of the guarded send open, so the in-flight state is observable rather than
+    // a race against a handler that resolves instantly.
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+        const body = (await request.json()) as { text: string; submit?: boolean };
+        if (!body.submit) await gate;
+        recordReply(body);
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderComposer();
+
+    await user.click(screen.getByRole("button", { name: "Quick" }));
+    await user.click(screen.getByRole("button", { name: "continue" }));
+
+    // The tapped reply is busy; an untapped sibling is locked out so a second send can't race it.
+    await waitFor(() => expect(screen.getByRole("button", { name: "continue" })).toBeDisabled());
+    expect(screen.getByRole("button", { name: "skip" })).toBeDisabled();
+
+    release();
+    // Once it settles the dock closes itself — proof the flight actually resolved.
+    await waitFor(
+      () => expect(screen.queryByRole("button", { name: "continue" })).not.toBeInTheDocument(),
+      { timeout: 3000 },
+    );
+  });
+
+  it("a failed quick reply keeps the dock open and re-enables the grid", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/reply$/, () =>
+        HttpResponse.json({ ok: false, error: "nope" }, { status: 500 }),
+      ),
+    );
+    renderComposer();
+
+    await user.click(screen.getByRole("button", { name: "Quick" }));
+    await user.click(screen.getByRole("button", { name: "continue" }));
+
+    // No ✓, no close — the reply never landed, so the dock stays put for a retry.
+    await waitFor(() => expect(screen.getByRole("button", { name: "continue" })).toBeEnabled());
+    expect(screen.getByRole("button", { name: "skip" })).toBeEnabled();
+  });
+});
+
+describe("Composer — display prefs behind the gear", () => {
+  it("the View row is gone; wrap/raw/font live behind the Display gear as labelled controls", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+
+    // Nothing display-related is on the permanent rows any more.
+    expect(screen.queryByRole("button", { name: "Decrease font size" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Display settings" }));
+
+    // Named controls, not bare glyphs — the whole point of the move.
+    expect(screen.getByRole("switch", { name: "Wrap lines" })).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Raw terminal" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Decrease font size" })).toBeInTheDocument();
+  });
+
+  it("the Display dock shares the single drawer slot with Keys", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+
+    await user.click(screen.getByRole("button", { name: "Display settings" }));
+    expect(screen.getByRole("switch", { name: "Wrap lines" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Keys" }));
+    expect(screen.queryByRole("switch", { name: "Wrap lines" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Esc" })).toBeInTheDocument();
+  });
+
+  it("display prefs stay reachable on a read-only device", async () => {
+    const user = userEvent.setup();
+    renderComposer({ readOnly: true });
+
+    // Keys/Quick are write affordances and lock; the gear is local view state and must not.
+    expect(screen.getByRole("button", { name: "Keys" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Display settings" }));
+    expect(screen.getByRole("switch", { name: "Wrap lines" })).toBeInTheDocument();
+  });
+});
+
+describe("Composer — a composed key queue is guarded on the way out", () => {
+  /** Open Keys and stage one chord, so the queue is genuinely dirty. */
+  async function stageAKey(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole("button", { name: "Keys" }));
+    await user.click(screen.getByRole("button", { name: "Ctrl" }));
+    await user.click(screen.getByRole("button", { name: "Tab" }));
+    expect(screen.getByRole("button", { name: "Remove Ctrl Tab" })).toBeInTheDocument();
+  }
+
+  it("the dock's X needs a second tap while keys are staged", async () => {
+    const user = userEvent.setup();
+    renderComposerWithStatus();
+    await stageAKey(user);
+
+    await user.click(screen.getByRole("button", { name: "Close Keys" }));
+    // Still open — the composed sequence is not thrown away on one tap.
+    expect(screen.getByRole("button", { name: "Remove Ctrl Tab" })).toBeInTheDocument();
+    expect(screen.getByTestId("status")).toHaveTextContent(/discard 1 queued key/i);
+
+    await user.click(screen.getByRole("button", { name: "Close Keys" }));
+    expect(screen.queryByRole("button", { name: "Esc" })).not.toBeInTheDocument();
+  });
+
+  // The ✕ is not the only exit — the Keys toggle and the other drawer buttons unmount the tray just
+  // as effectively, which is why the guard lives on the drawer transition rather than the button.
+  // The Controls row's "Keys" toggle and the tray's own "Keys" segmented tab share an accessible
+  // name; only the toggle carries aria-expanded, which is what ties it to the dock.
+  const controlsToggle = (name: string) =>
+    screen
+      .getAllByRole("button", { name })
+      .find((b) => b.hasAttribute("aria-expanded")) as HTMLElement;
+
+  it.each([
+    ["the Keys toggle", () => controlsToggle("Keys")],
+    ["the Quick toggle", () => controlsToggle("Quick")],
+    ["the Display gear", () => screen.getByRole("button", { name: "Display settings" })],
+  ])("%s also needs a second tap while keys are staged", async (_label, getButton) => {
+    const user = userEvent.setup();
+    renderComposerWithStatus();
+    await stageAKey(user);
+
+    await user.click(getButton());
+    expect(screen.getByRole("button", { name: "Remove Ctrl Tab" })).toBeInTheDocument();
+
+    await user.click(getButton());
+    expect(screen.queryByRole("button", { name: "Remove Ctrl Tab" })).not.toBeInTheDocument();
+  });
+
+  // Over-guarding trains you to double-tap through the confirm reflexively, which kills its value
+  // where it matters. One tap of setup is not work worth protecting.
+  it("an armed modifier with NO staged keys closes on the first tap", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+
+    await user.click(screen.getByRole("button", { name: "Keys" }));
+    await user.click(screen.getByRole("button", { name: "Ctrl" })); // armed, but nothing staged
+    await user.click(screen.getByRole("button", { name: "Close Keys" }));
+
+    expect(screen.queryByRole("button", { name: "Esc" })).not.toBeInTheDocument();
+  });
+
+  it("a clean Keys dock closes on the first tap", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+
+    await user.click(screen.getByRole("button", { name: "Keys" }));
+    await user.click(screen.getByRole("button", { name: "Close Keys" }));
+
+    expect(screen.queryByRole("button", { name: "Esc" })).not.toBeInTheDocument();
+  });
+
+  // The count must not outlive the tray: a stale value would arm a phantom confirm on a later,
+  // perfectly clean close.
+  it("does not arm a phantom confirm on a later clean open", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    await stageAKey(user);
+
+    await user.click(screen.getByRole("button", { name: "Close Keys" })); // arm
+    await user.click(screen.getByRole("button", { name: "Close Keys" })); // discard
+
+    await user.click(screen.getByRole("button", { name: "Keys" })); // reopen, empty
+    await user.click(screen.getByRole("button", { name: "Close Keys" }));
+    expect(screen.queryByRole("button", { name: "Esc" })).not.toBeInTheDocument();
+  });
+});
+
+describe("Composer — quick replies follow the pane kind", () => {
+  it("an agent pane gets the agent set", async () => {
+    const user = userEvent.setup();
+    renderComposer({ agent: "claude", isShell: false });
+    await user.click(screen.getByRole("button", { name: "Quick" }));
+
+    expect(screen.getByRole("button", { name: "continue" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "commit and push" })).toBeInTheDocument();
+  });
+
+  it("a shell pane gets y/n, not the agent phrases", async () => {
+    const user = userEvent.setup();
+    renderComposer({ agent: "shell", isShell: true });
+    await user.click(screen.getByRole("button", { name: "Quick" }));
+
+    expect(screen.getByRole("button", { name: "y" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "n" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "commit and push" })).not.toBeInTheDocument();
+  });
+});
+
+// The draft is the message you are in the middle of writing — and the whole reason you leave a pane
+// mid-reply is to go read another tab. The composer unmounts when you do (DetailRoute keys AgentChat
+// by paneId), so without persistence the message is simply gone. These pin the round trip, the
+// per-pane isolation (pane A's text must never appear in pane B), and the clear-on-send.
+describe("Composer — draft persistence", () => {
+  function draftProps(
+    overrides: Partial<ComponentProps<typeof Composer>> = {},
+  ): ComponentProps<typeof Composer> {
+    return {
+      paneId: "w1:p1",
+      agent: "claude",
+      isShell: false,
+      gone: false,
+      readOnly: false,
+      dialogPresent: false,
+      text: "pane output",
+      terminalDraft: null,
+      rawTerminalDraft: null,
+      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+      setWrap: vi.fn(),
+      stepFontSize: vi.fn(),
+      setRawTerminal: vi.fn(),
+      setTapToFocus: vi.fn(),
+      onSent: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  /** Mounts the composer under a harness that can swap `paneId` IN PLACE (no remount) — the harder
+   *  of the two realities the component has to survive. */
+  function renderSwitchable(initialPane: string) {
+    let swap: ((id: string) => void) | null = null;
+    function Harness() {
+      const [paneId, setPaneId] = useState(initialPane);
+      swap = setPaneId;
+      return <Composer {...draftProps({ paneId })} />;
+    }
+    const router = createMemoryRouter([{ path: "/", element: <Harness /> }]);
+    const view = render(<RouterProvider router={router} />);
+    return { view, swap: (id: string) => act(() => swap?.(id)) };
+  }
+
+  function mount(paneId = "w1:p1") {
+    const router = createMemoryRouter([
+      { path: "/", element: <Composer {...draftProps({ paneId })} /> },
+    ]);
+    return render(<RouterProvider router={router} />);
+  }
+
+  it("restores the draft after a remount", async () => {
+    const user = userEvent.setup();
+    const first = mount();
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "half a thought");
+    first.unmount();
+
+    mount();
+    expect(screen.getByPlaceholderText(/type a reply/i)).toHaveValue("half a thought");
+  });
+
+  it("keeps drafts per pane — pane A's text never shows in pane B", async () => {
+    const user = userEvent.setup();
+    const { swap } = renderSwitchable("w1:p1");
+    const box = () => screen.getByPlaceholderText(/type a reply/i);
+
+    await user.type(box(), "for pane A");
+    swap("w1:p2");
+    expect(box()).toHaveValue(""); // no bleed
+    await user.type(box(), "for pane B");
+
+    swap("w1:p1");
+    expect(box()).toHaveValue("for pane A");
+    swap("w1:p2");
+    expect(box()).toHaveValue("for pane B");
+  });
+
+  it("forgets the draft once the user empties the box", async () => {
+    const user = userEvent.setup();
+    const first = mount();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "never mind");
+    await user.clear(box);
+    first.unmount();
+
+    mount();
+    expect(screen.getByPlaceholderText(/type a reply/i)).toHaveValue("");
+  });
+
+  it("clears the stored draft on a verified send", async () => {
+    const user = userEvent.setup();
+    const first = mount();
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "looks good");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(screen.getByPlaceholderText(/type a reply/i)).toHaveValue(""));
+    first.unmount();
+
+    mount();
+    expect(screen.getByPlaceholderText(/type a reply/i)).toHaveValue("");
   });
 });

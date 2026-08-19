@@ -164,7 +164,7 @@ describe("AgentChat — raw-terminal escape hatch", () => {
 
   it("shows the plain mirror (no buttons, menu as raw text) when raw terminal is on", () => {
     localStorage.setItem(
-      "collie:display-prefs:v3",
+      "collie:display-prefs:v4",
       JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: true }),
     );
     renderChat({ text: MENU_TEXT });
@@ -172,6 +172,37 @@ describe("AgentChat — raw-terminal escape hatch", () => {
     expect(screen.queryByRole("button", { name: "Yes" })).not.toBeInTheDocument();
     // …and the menu is rendered verbatim in the mirror, drivable by the keys pad.
     expect(screen.getByText(/1\. Yes/)).toBeInTheDocument();
+  });
+
+  // "Tap to type" — on, the mirror is one big "start typing" target; off, it is a document. The
+  // pref must gate ONLY the focus, never the mirror's own controls: someone who turned it off to
+  // stop the keyboard appearing has not asked to lose the prompt buttons.
+  it("focuses the composer on a mirror tap by default", async () => {
+    renderChat({ text: "just some output\n" });
+    const line = screen.getByText(/just some output/);
+    fireEvent.click(line);
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByPlaceholderText(/Type a reply/i)));
+  });
+
+  it("leaves focus alone on a mirror tap when Tap to type is off", async () => {
+    localStorage.setItem(
+      "collie:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: false }),
+    );
+    renderChat({ text: "just some output\n" });
+    const before = document.activeElement;
+    fireEvent.click(screen.getByText(/just some output/));
+    expect(document.activeElement).toBe(before);
+    expect(document.activeElement).not.toBe(screen.getByPlaceholderText(/Type a reply/i));
+  });
+
+  it("still lifts a menu into buttons with Tap to type off — it gates focus, not the grammars", async () => {
+    localStorage.setItem(
+      "collie:display-prefs:v4",
+      JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: false }),
+    );
+    renderChat({ text: MENU_TEXT });
+    expect(await screen.findByRole("button", { name: "Yes" })).toBeInTheDocument();
   });
 
   it("lifts a multi-question wizard into native controls by default (grammars on)", async () => {
@@ -184,7 +215,7 @@ describe("AgentChat — raw-terminal escape hatch", () => {
 
   it("raw terminal bypasses the wizard too — the dialog shows verbatim, keys-pad drivable", () => {
     localStorage.setItem(
-      "collie:display-prefs:v3",
+      "collie:display-prefs:v4",
       JSON.stringify({ wrap: true, fontSize: 11, rawTerminal: true }),
     );
     renderChat({ text: WIZARD_TEXT });
@@ -330,10 +361,11 @@ describe("AgentChat — prompt-select race guard wiring (frozen {text, revision}
   });
 });
 
-// The block grammars are provably scoped to Claude Code (spec T8): a non-Claude pane gets the plain
-// raw mirror — no prompt-select buttons, no chrome stripping, no re-surfaced status strip — because
-// running Claude-tuned matchers on an unverified TUI could mis-lift or mis-strip its output.
-describe("AgentChat — block-grammar scoping (Claude-only)", () => {
+// The block grammars are provably scoped to the pane's own adapter (spec T8): an agent with no
+// adapter gets the plain raw mirror — no prompt-select buttons, no chrome stripping, no re-surfaced
+// status strip — because running Claude-tuned matchers on an unverified TUI could mis-lift or
+// mis-strip its output. codex is such an agent; omp has an adapter but lifts no dialog kind at all.
+describe("AgentChat — block-grammar scoping (an agent with no adapter)", () => {
   // A codex agent sharing the Claude fixture's ids, so only the agent kind differs from the default.
   const codexAgent = { ...fixtureAgents[0]!, agent: "codex" };
 
@@ -345,10 +377,18 @@ describe("AgentChat — block-grammar scoping (Claude-only)", () => {
     expect(screen.getByText(/1\. Yes/)).toBeInTheDocument();
   });
 
-  it("re-surfaces the Claude input-box statusline as an app strip above the composer", () => {
+  it("re-surfaces EVERY row of the Claude input-box statusline as an app strip above the composer", () => {
     renderChat({ text: STATUS_TEXT }); // default claude agent
     const strip = screen.getByText("[Opus 4.8] ~/webapp · main");
     expect(strip.closest("pre")).toBeNull(); // the strip is app chrome, not <pre> mirror text
+    // Row 2 of the run: it used to be stripped off the mirror and rendered nowhere at all.
+    const second = screen.getByText("← for agents");
+    expect(second.closest("pre")).toBeNull();
+    // Stacked in the one strip. Compared at the ROW level: each row renders one <span> per ANSI
+    // segment (colour is carried through now), so the text node's own parent is a span, not the row.
+    const row = (el: HTMLElement) => el.closest("div.truncate");
+    expect(row(second)).not.toBe(row(strip));
+    expect(row(second)?.parentElement).toBe(row(strip)?.parentElement);
     expect(screen.queryByText(/❯/)).toBeNull(); // the input box was stripped off the mirror
   });
 
@@ -447,13 +487,13 @@ describe("AgentChat — shared header: stale-status dimming", () => {
 // lead to an empty screen.
 describe("AgentChat — history affordance", () => {
   it("is offered when the pane reports an agent session id", () => {
-    const agent = { ...fixtureAgents[0]!, agentSessionId: "d7e62e23-8576-4c63-98ba-ec1b02902c6b" };
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
     renderChat({ agent, agents: [agent] });
     expect(screen.getByRole("button", { name: /conversation history/i })).toBeInTheDocument();
   });
 
   it("is hidden when the pane has no agent session (a shell, or a harness without one)", () => {
-    renderChat(); // fixture agents carry no agentSessionId
+    renderChat(); // fixture agents carry no session
     expect(screen.queryByRole("button", { name: /conversation history/i })).not.toBeInTheDocument();
   });
 
@@ -462,7 +502,7 @@ describe("AgentChat — history affordance", () => {
   //
   // (The top-of-mirror affordance is covered separately below.)
   it("sits to the LEFT of the status pill", () => {
-    const agent = { ...fixtureAgents[0]!, agentSessionId: "d7e62e23-8576-4c63-98ba-ec1b02902c6b" };
+    const agent = { ...fixtureAgents[0]!, hasSession: true };
     renderChat({ agent, agents: [agent] });
     const history = screen.getByRole("button", { name: /conversation history/i });
     const pill = screen.getByText("needs you"); // fixtureAgents[0] is blocked → "needs you"
@@ -476,13 +516,12 @@ describe("AgentChat — history affordance", () => {
 // working signal is `readableLines` (scrollback depth + viewport), and which button appears is
 // decided by what the pane can actually offer — the two are never simultaneously possible.
 describe("AgentChat — top-of-mirror history affordance", () => {
-  const SESSION_ID = "d7e62e23-8576-4c63-98ba-ec1b02902c6b";
   const showHistory = () => screen.queryByRole("button", { name: /show entire history/i });
   const loadOlder = () => screen.queryByRole("button", { name: /load older/i });
 
   it("an agent pane with a transcript offers the full history, not scrollback paging", () => {
     // A Claude pane: alt-screen, so readableLines is just its viewport — there IS no scrollback.
-    const agent = { ...fixtureAgents[0]!, agentSessionId: SESSION_ID, readableLines: 51 };
+    const agent = { ...fixtureAgents[0]!, hasSession: true, readableLines: 51 };
     renderChat({ agent, agents: [agent], requestedLines: 600 });
     expect(showHistory()).toBeInTheDocument();
     expect(loadOlder()).not.toBeInTheDocument();
@@ -517,7 +556,7 @@ describe("AgentChat — top-of-mirror history affordance", () => {
   });
 
   it("a transcript wins even when the pane also reports scrollback", () => {
-    const agent = { ...fixtureAgents[0]!, agentSessionId: SESSION_ID, readableLines: 6946 };
+    const agent = { ...fixtureAgents[0]!, hasSession: true, readableLines: 6946 };
     renderChat({ agent, agents: [agent], requestedLines: 600 });
     expect(showHistory()).toBeInTheDocument();
     expect(loadOlder()).not.toBeInTheDocument();

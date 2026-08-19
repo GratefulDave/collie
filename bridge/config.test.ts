@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { defaultSocketPath, loadConfig } from "./config.ts";
@@ -16,6 +17,14 @@ const KEYS = [
   "COLLIE_READ_LINES",
   "COLLIE_TRANSCRIPT",
   "COLLIE_TRANSCRIPT_ROOT",
+  "COLLIE_CODEX_ROOT",
+  "COLLIE_PI_ROOT",
+  "COLLIE_OPENCODE_ROOT",
+  // Each harness's own home var participates in journal-root resolution, so the suite must own them
+  // too — otherwise a developer with CODEX_HOME set gets different results than CI.
+  "CODEX_HOME",
+  "PI_CODING_AGENT_DIR",
+  "XDG_DATA_HOME",
   "COLLIE_SUBMIT_KEYS",
   "COLLIE_TRUSTED_USER",
   "COLLIE_DEVICE_HEADER",
@@ -30,6 +39,7 @@ const KEYS = [
   "COLLIE_SKIP_SERVE",
   "HERDR_SOCKET_PATH",
   "HERDR_PLUGIN_STATE_DIR",
+  "HERDR_PLUGIN_CONFIG_DIR",
   "COLLIE_HERDR_DIAL",
 ];
 
@@ -62,7 +72,11 @@ describe("loadConfig", () => {
     expect(cfg.readLines).toBe(200);
     // Transcript history defaults ON — it's the only scrollback a Claude pane can ever have.
     expect(cfg.transcript).toBe(true);
-    expect(cfg.transcriptRoot).toEndWith("/.claude/projects");
+    // One root by default, and it is a list of one rather than a special case (issue #92).
+    expect(cfg.journalRoots.claude).toHaveLength(1);
+    expect(cfg.journalRoots.claude[0]).toEndWith("/.claude/projects");
+    // OpenCode keeps ONE sqlite database at the top of its XDG data dir — no per-session files.
+    expect(cfg.journalRoots.opencode).toEqual([join(homedir(), ".local", "share", "opencode")]);
     expect(cfg.submitKeys).toEqual(["Enter"]);
     expect(cfg.trustedUser).toBe("");
     expect(cfg.allowedOrigins).toEqual([]);
@@ -129,9 +143,70 @@ describe("loadConfig", () => {
     expect(loadConfig().transcript).toBe(true);
   });
 
-  test("COLLIE_TRANSCRIPT_ROOT relocates the transcript root", () => {
+  // COLLIE_TRANSCRIPT_ROOT predates the per-harness split and meant Claude's root — it keeps meaning
+  // exactly that, so an existing deployment's env survives the change untouched.
+  test("COLLIE_TRANSCRIPT_ROOT relocates the CLAUDE journal root", () => {
     process.env.COLLIE_TRANSCRIPT_ROOT = "/srv/claude/projects";
-    expect(loadConfig().transcriptRoot).toBe("/srv/claude/projects");
+    expect(loadConfig().journalRoots.claude).toEqual(["/srv/claude/projects"]);
+  });
+
+  // The multi-profile case from issue #92: CLAUDE_CONFIG_DIR gives each Claude profile its own
+  // projects tree, so one root can only ever serve half the herd's history.
+  test("COLLIE_TRANSCRIPT_ROOT takes several roots, comma-separated and in order", () => {
+    process.env.COLLIE_TRANSCRIPT_ROOT = "/srv/work/projects,/srv/personal/projects";
+    expect(loadConfig().journalRoots.claude).toEqual([
+      "/srv/work/projects",
+      "/srv/personal/projects",
+    ]);
+  });
+
+  test("whitespace and empty entries around the separators are dropped", () => {
+    process.env.COLLIE_TRANSCRIPT_ROOT = " /a/projects , , /b/projects ,";
+    expect(loadConfig().journalRoots.claude).toEqual(["/a/projects", "/b/projects"]);
+  });
+
+  // An empty value used to become a root of `""` — which resolves against the bridge's cwd, not a
+  // journal. Falling back to the default is both safer and what the operator meant.
+  test("an empty value falls back to the default root", () => {
+    process.env.COLLIE_TRANSCRIPT_ROOT = "   ";
+    expect(loadConfig().journalRoots.claude).toEqual([join(homedir(), ".claude", "projects")]);
+  });
+
+  test("every harness root takes a list, not just Claude's", () => {
+    process.env.COLLIE_CODEX_ROOT = "/a/sessions,/b/sessions";
+    process.env.COLLIE_PI_ROOT = "/c/sessions,/d/sessions";
+    process.env.COLLIE_OPENCODE_ROOT = "/e/opencode,/f/opencode";
+    const cfg = loadConfig();
+    expect(cfg.journalRoots.codex).toEqual(["/a/sessions", "/b/sessions"]);
+    expect(cfg.journalRoots.pi).toEqual(["/c/sessions", "/d/sessions"]);
+    expect(cfg.journalRoots.opencode).toEqual(["/e/opencode", "/f/opencode"]);
+  });
+
+  test("each harness's own home var relocates its journal root", () => {
+    process.env.CODEX_HOME = "/srv/codex";
+    process.env.PI_CODING_AGENT_DIR = "/srv/pi";
+    process.env.XDG_DATA_HOME = "/srv/share";
+    const cfg = loadConfig();
+    expect(cfg.journalRoots.codex).toEqual(["/srv/codex/sessions"]);
+    expect(cfg.journalRoots.pi).toEqual(["/srv/pi/sessions"]);
+    expect(cfg.journalRoots.opencode).toEqual(["/srv/share/opencode"]);
+  });
+
+  test("an explicit COLLIE_* root beats the harness's home var", () => {
+    process.env.CODEX_HOME = "/srv/codex";
+    process.env.COLLIE_CODEX_ROOT = "/elsewhere/rollouts";
+    expect(loadConfig().journalRoots.codex).toEqual(["/elsewhere/rollouts"]);
+  });
+
+  // The operator's rows sit beside their .env, and the launcher hands us that dir precisely so the
+  // bridge and scripts/collie-ctl.sh never disagree about which one it is.
+  test("commands.toml is resolved in the plugin config dir the launcher passed", () => {
+    process.env.HERDR_PLUGIN_CONFIG_DIR = "/srv/herdr/plugins/collie";
+    expect(loadConfig().commandsFile).toBe(join("/srv/herdr/plugins/collie", "commands.toml"));
+    expect(loadConfig().keysFile).toBe(join("/srv/herdr/plugins/collie", "keys.toml"));
+    delete process.env.HERDR_PLUGIN_CONFIG_DIR;
+    expect(loadConfig().commandsFile).toBe(join(homedir(), ".config", "collie", "commands.toml"));
+    expect(loadConfig().keysFile).toBe(join(homedir(), ".config", "collie", "keys.toml"));
   });
 
   test("reads the per-device auth header and allowlist", () => {

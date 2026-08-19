@@ -28,7 +28,7 @@ A Herdr web bridge — a long-lived local process that
 - translates browser actions → socket methods,
 - sits behind **one hardened front door** — `tailscale serve` (default; tailnet-only HTTPS +
   MagicDNS) or a conforming reverse proxy
-  ([README → Variant C](./README.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)) —
+  ([DEPLOYMENT.md → Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)) —
   installable as a **PWA**.
 
 The browser never touches the socket directly; the bridge is the only thing that does.
@@ -64,6 +64,13 @@ watching the TUI. A long-lived network daemon must be supervised independently.
   it and build lazily on first `start`. Concretely that's `[[actions]]` + `[[build]]` and nothing
   else: `[[panes]]` is what this section argues against, and `[[events]]` would duplicate the
   bridge's own `events.subscribe` stream (§5).
+- **The checkout on disk *is* the plugin — in one of two shapes.** `herdr plugin install` does not
+  clone: it `git init`s, `git fetch --depth 1 origin HEAD`s and `git checkout --detach FETCH_HEAD`s
+  into `~/.config/herdr/plugins/github/<hashed-id>`, so a turnkey install is **detached and shallow**
+  with no remote-tracking refs, while a linked clone sits on a branch. The `update` action carries
+  both ([ADR 0006](./.adr/0006-update-advances-the-checkout-herdr-installed.md)) because Herdr has no
+  `plugin update` of its own — its refresh is a reinstall, which replaces the checkout but does not
+  restart the service.
 - **Socket-path discovery:** a non-Herdr-launched daemon won't get `$HERDR_SOCKET_PATH` injected, so
   it resolves the path from a well-known location (`~/.config/herdr/herdr.sock` default, or the
   bridge's own config) and re-resolves on reconnect in case it moves.
@@ -144,9 +151,15 @@ app. Closing this needs the server-side blocking-message capture described above
 - **Scrollback comes from the transcript, not the terminal.** An agent's TUI runs on the *alternate
   screen* (`ESC[?1049h`), so the emulator keeps no scrollback ring and `pane.read` can never return
   more than the visible viewport — the live mirror physically cannot scroll back. Pane history is
-  therefore read from the agent's **own transcript file** off disk (`bridge/transcript.ts`,
+  therefore read from the agent's **own transcript file** off disk (`bridge/journal/`,
   `/api/pane/:id/history`), a separate source from the mirror with different fidelity: turns and
-  their text, not a replay of the screen. The client fetches the whole conversation in one request
+  their text, not a replay of the screen. Each harness writes a different log in a different place,
+  so this is a **per-agent adapter** (`bridge/journal/registry.ts` maps the pane's `agent` to one);
+  a harness with no adapter simply has no journal. A harness can have **several roots** — one machine
+  routinely holds more than one agent home (`CLAUDE_CONFIG_DIR` per Claude profile), so each
+  `COLLIE_*_ROOT` takes a comma-separated list, searched in order until a root holds the session id;
+  ids are globally unique, so that's a lookup, not a preference. Containment is checked **per root**,
+  never against their union. The client fetches the whole conversation in one request
   and renders a window that grows upward, which is what lets find-in-history and jump-to-user-turn
   work across turns you haven't scrolled to. Rationale and the measured numbers are commented at the
   top of `web/src/routes/history.tsx`.
@@ -168,6 +181,13 @@ app. Closing this needs the server-side blocking-message capture described above
 - **PWA cache-busting.** Service workers serve stale clients after an update, so the build stamp
   travels in every response (`X-Collie-Build` header + `/api/config`); on mismatch the footer offers
   "new build — tap to update."
+- **The operator's slash-command rows ride `/api/config`** too, read from their `commands.toml`
+  behind an mtime check (`bridge/operator-commands.ts`), so editing the file is live like a web
+  rebuild. On a pane they address they **replace** the shipped catalog rather than merging into it —
+  [ADR 0018](./.adr/0018-operator-command-rows-replace-the-catalog.md). Their **Keys-tray presets**
+  ride the same request on the same terms, from `keys.toml` (`bridge/operator-keys.ts`); the two
+  files share one reader (`bridge/operator-file.ts`) and one scope ladder
+  (`web/src/lib/operator-scope.ts`).
 
 ## 6. Security model
 
@@ -195,9 +215,9 @@ default). These four are genuine RCE vectors and are **load-bearing — do not r
   not mandate the header. That is safe under `tailscale serve`, which injects it on every request, and
   not safe behind anything that might stop injecting it — the header exists **only** under
   `tailscale serve` ingress. Under a reverse-proxy front door
-  ([README → Variant C](./README.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale))
+  ([DEPLOYMENT.md → Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale))
   there is none, and the equivalent write gate is **per-device auth** (`COLLIE_DEVICE_HEADER`) with
-  the proxy contract (README Variant B/C requirements) as the load-bearing piece. That gate **fails
+  the proxy contract (DEPLOYMENT.md Variant B/C requirements) as the load-bearing piece. That gate **fails
   closed since 0.15.0**: with `COLLIE_DEVICE_HEADER` set, a request arriving without the header is
   read-only, so reaching the port is no longer sufficient to write. Device ids are names your proxy
   asserts, not secrets — treat them as guessable and keep the front door and its ACL as the real
@@ -211,19 +231,16 @@ default). These four are genuine RCE vectors and are **load-bearing — do not r
   device can't CSRF the bridge. With a plain `tailscale serve` on the MagicDNS name these match
   automatically (no config). When Collie is fronted by a *different* public hostname or an extra
   reverse proxy / TLS terminator (custom domain, load balancer, Headscale + upstream TLS, or a
-  reverse-proxy front door — [README → Variant C](./README.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)),
+  reverse-proxy front door — [DEPLOYMENT.md → Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)),
   the public origin no longer matches the forwarded `Host` — list that exact origin in
   `COLLIE_ALLOWED_ORIGINS` (the only sanctioned way to widen the gate; never bind off-loopback to
   "fix" it).
-- **Idle timeout.** Tailscale identity proves the *device*, not *who's holding it*. The PWA stays
-  "signed in" with no session, so a stolen unlocked phone would be a root shell. The idle-lock
-  unmounts the router — pausing all polling — until tapped.
-
 Also shipped, as defence in depth:
 
 - **Audit log** — every write-level action appends a JSONL line (timestamp, method, truncated params)
   to `<stateDir>/audit.log`, mode 0600 since it may echo reply text. An audit failure never fails the
-  user's action (`bridge/audit.ts`).
+  user's action. `COLLIE_AUDIT_CONTENT=none` keeps the trail and drops the bodies — what survives is
+  an allowlist of action parameters, documented at the list itself (`bridge/audit.ts`).
 - **Destructive-action confirm** — a browser-side prompt when input pattern-matches `rm`, `sudo`,
   `git push --force`, `dd`, etc. (`web/src/lib/destructive.ts`). Prevents catastrophic mistaps.
 
@@ -231,7 +248,9 @@ Considered, not built:
 
 - **Tailscale ACL scoping** to your specific devices (`src: tag:my-phone → dst: this:bridge`).
   Promote this to mandatory the moment the tailnet has any device you don't fully control.
-- **A short PIN** gating reconnection — friction against a grabbed phone, on top of the idle lock.
+- **A short PIN** gating reconnection — friction against a grabbed phone. This, not the idle lock, is
+  where that friction would have to live: the lock is a pause on an unattended screen and deliberately
+  gates nothing ([ADR 0007](./.adr/0007-the-idle-lock-is-a-pause-not-a-gate.md)).
 
 Full passthrough (no command allow-list) is acceptable for a personal tool — an allow-list would
 defeat the purpose. **Never use `tailscale funnel`** (public exposure).
@@ -255,11 +274,10 @@ so they don't get re-discovered from scratch or acted on by accident.
 - **`herdr terminal session observe` / `control` (new in 0.7.2).** A CLI subcommand pair that streams
   a pane as NDJSON live ANSI frames — `observe` is read-only; `control` additionally accepts stdin
   commands (`terminal.input`, `terminal.resize`, `terminal.scroll`, `terminal.release`) with
-  one-controller-at-a-time semantics (`--takeover` to steal control). A bridge process could spawn
-  either as a child and get a true live pane mirror, or even a full interactive terminal, instead of
-  polled snapshots. **But raw ANSI frames need a real terminal emulator to render** (cursor movement,
-  screen clears, scroll regions — well beyond the current SGR-color-only parser, see
-  [`HERDR_API.md`](./HERDR_API.md)), and rendering that faithfully in the browser would breach §6's
-  "pane output is React text nodes only" XSS boundary. Adopt this deliberately, with a real
-  terminal-emulator library and a re-examined threat model — or not at all. This is the designated
-  parking spot for that idea; don't half-do it.
+  one-controller-at-a-time semantics (`--takeover` to steal control). Consuming either would mean
+  running a terminal emulator, and **Collie doesn't** — the emulation already happened one process
+  upstream, so `pane.read` hands us a rendered grid rather than a byte stream. Latency is a transport
+  question and cursor position is an upstream ask; `control` would resize the *shared* PTY and fight
+  the desktop. The full argument, the costs the proposal hides, and the narrow shape that would be
+  admissible if this is ever revisited:
+  [ADR 0008](./.adr/0008-collie-does-not-run-a-terminal-emulator.md).

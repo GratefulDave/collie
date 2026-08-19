@@ -41,6 +41,16 @@ export function updateNotice(update: UpdateInfo | undefined): UpdateNotice | nul
   if (update.releaseAvailable && update.latest) {
     return { line: `Collie ${update.latest} available`, href: update.latestUrl ?? undefined };
   }
+  // A MAJOR is out. It ranks below a routine release because it is the one thing the plain update
+  // action will NOT take (ADR 0020) — so this line names the consent command instead of leaving the
+  // operator to tap update, see it succeed, and still see a banner.
+  if (update.majorAvailable) {
+    return {
+      line: `Collie ${update.majorAvailable} — a new major`,
+      href: update.majorUrl ?? undefined,
+      command: "herdr plugin action invoke update-major --plugin herdr.collie",
+    };
+  }
   return null;
 }
 
@@ -67,7 +77,7 @@ export function UpdateBanner({ className }: { className?: string }) {
   return (
     <div
       className={cn(
-        "text-center text-[11px] leading-relaxed text-muted-foreground/70",
+        "text-center text-[11px] leading-relaxed text-muted-foreground",
         className,
       )}
     >
