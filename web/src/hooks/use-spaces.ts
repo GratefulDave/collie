@@ -1,11 +1,13 @@
 import { useCallback, useRef } from "react";
-import { useNavigate, useRevalidator, useRouteLoaderData } from "react-router";
+import { useNavigate, useRevalidator } from "react-router";
 
 import * as api from "@/lib/api";
 import { setStatus } from "@/lib/status";
 import { panePath } from "@/lib/nav";
-import { ROOT_ROUTE_ID, type HomeData } from "@/lib/loaders";
 import { isReadOnly, type AgentView, type CreateResponse } from "@/lib/types";
+import { usePairing } from "@/lib/pairing";
+import type { Scope } from "@/lib/scope";
+import { useOptionalRootData } from "@/lib/route-data";
 
 // Shared "create a tab/space, then jump into its fresh shell" flow, used by the home space view and
 // the detail Herdr palette. The new pane won't be in the snapshot until the next poll, so we pass
@@ -19,17 +21,20 @@ export function useSpaceActions() {
   const revalidatorRef = useRef(revalidator);
   revalidatorRef.current = revalidator;
 
-  // Creating a tab/space is a sensitive (structural) action — a read-only device can't, and the
-  // bridge rejects it anyway. Short-circuit centrally so every create entry point (tab strip,
-  // space list, command palette) is covered with one friendly notice. Read via a ref so the
-  // returned callbacks stay stable across revalidations.
-  const root = useRouteLoaderData(ROOT_ROUTE_ID) as HomeData | undefined;
+  const root = useOptionalRootData();
   const readOnlyRef = useRef(false);
-  readOnlyRef.current = isReadOnly(root?.device);
-  // The session the new tab/space must be created in (and navigated into). Read via a ref so the
-  // returned callbacks stay stable across revalidations, like readOnly above.
-  const sessionRef = useRef<string | undefined>(undefined);
-  sessionRef.current = root?.session;
+  // Either write gate refusing is the same answer here: the create would 403 anyway. The notice
+  // names the pairing gate first where it applies, because that one is fixable from this phone.
+  const { refused: notPaired } = usePairing();
+  readOnlyRef.current = isReadOnly(root?.device) || notPaired;
+  const blockedTextRef = useRef("");
+  blockedTextRef.current = notPaired
+    ? "Not paired — pair this device in Settings"
+    : "Read-only — device not authorised";
+  // The scope (machine + named session) the new tab/space must be created in, and navigated into.
+  // Read via a ref so the returned callbacks stay stable across revalidations, like readOnly above.
+  const scopeRef = useRef<Scope | undefined>(undefined);
+  scopeRef.current = root?.scope;
 
   const open = useCallback(
     (res: CreateResponse, what: "tab" | "space") => {
@@ -52,16 +57,16 @@ export function useSpaceActions() {
       };
       setStatus(`New ${what} ready — launch your agent`, "success");
       revalidatorRef.current.revalidate();
-      navigate(panePath(p.paneId, sessionRef.current), { state: { freshPane: fresh } });
+      navigate(panePath(p.paneId, scopeRef.current), { state: { freshPane: fresh } });
     },
     [navigate],
   );
 
   const newTab = useCallback(
     async (workspaceId: string) => {
-      if (readOnlyRef.current) return setStatus("Read-only — device not authorised", "error");
+      if (readOnlyRef.current) return setStatus(blockedTextRef.current, "error");
       try {
-        open(await api.createTab(workspaceId, {}, sessionRef.current), "tab");
+        open(await api.createTab(workspaceId, {}, scopeRef.current), "tab");
       } catch (e) {
         setStatus(e instanceof Error ? e.message : String(e), "error");
       }
@@ -71,9 +76,9 @@ export function useSpaceActions() {
 
   const newSpace = useCallback(
     async (opts: { label?: string; cwd?: string } = {}) => {
-      if (readOnlyRef.current) return setStatus("Read-only — device not authorised", "error");
+      if (readOnlyRef.current) return setStatus(blockedTextRef.current, "error");
       try {
-        open(await api.createWorkspace(opts, sessionRef.current), "space");
+        open(await api.createWorkspace(opts, scopeRef.current), "space");
       } catch (e) {
         setStatus(e instanceof Error ? e.message : String(e), "error");
       }

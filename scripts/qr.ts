@@ -1,6 +1,7 @@
 // Render a URL as a QR code in the terminal, so a phone can scan its way onto the bridge instead of
-// typing a MagicDNS name on a phone keyboard. Called only by `collie-ctl.sh qr`, which decides WHICH
-// url (the tailnet front door, or COLLIE_PUBLIC_URL under DEPLOYMENT.md's Variant C/E) and whether it's worth one.
+// typing a MagicDNS name on a phone keyboard. Called by `collie qr` (cli/qr.ts), which decides WHICH
+// url (the tailnet front door, or COLLIE_PUBLIC_URL under DEPLOYMENT.md's Variant C/E) and whether
+// it's worth one.
 //
 // A plain dependency, NOT an optional one like web-push (bridge/push.ts). The distinction is which
 // contract it belongs to: push is optional at RUNTIME (no VAPID keys, no push, bridge unaffected),
@@ -59,7 +60,7 @@ export async function renderQr(url: string): Promise<string> {
   if (url.length > MAX_URL_LEN) throw new Error(`url too long to render as a QR code (${url.length} > ${MAX_URL_LEN})`);
   let qrcode: QrModule;
   try {
-    qrcode = (await import("qrcode-terminal")).default as unknown as QrModule;
+    qrcode = (await import("qrcode-terminal")).default;
   } catch {
     throw new Error("qrcode-terminal isn't installed — run 'bun install' in the plugin root");
   }

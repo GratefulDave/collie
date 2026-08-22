@@ -58,7 +58,9 @@ function home(lastSeenAt?: number): HomeData {
     workspaces: [],
     tabs: [],
     sessions: [],
-    session: undefined,
+    servers: [],
+    ts: 0,
+    scope: {},
     snoozedUntil: null,
     update: undefined,
     error: true,
@@ -70,7 +72,7 @@ function home(lastSeenAt?: number): HomeData {
 function pane(overrides: Partial<PaneData>): PaneData {
   return {
     paneId: "w1:p1",
-    session: undefined,
+    scope: {},
     text: "old terminal text",
     truncated: false,
     requestedLines: 600,

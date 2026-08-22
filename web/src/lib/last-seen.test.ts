@@ -6,6 +6,7 @@ import {
   saveLastPaneText,
   saveLastSnapshot,
 } from "./last-seen";
+import { paneScopeKey, scopeKey } from "@/lib/scope";
 import { fixtureSnapshot } from "@/test/handlers";
 
 beforeEach(() => {
@@ -20,9 +21,10 @@ describe("the write-through last-seen cache", () => {
     expect(got?.value.agents).toHaveLength(fixtureSnapshot.agents.length);
   });
 
-  it("keeps sessions apart", () => {
+  it("keeps scopes apart", () => {
     saveLastSnapshot(undefined, fixtureSnapshot);
-    expect(loadLastSnapshot("demo")).toBeNull();
+    expect(loadLastSnapshot({ session: "demo" })).toBeNull();
+    expect(loadLastSnapshot({ host: "bruno" })).toBeNull();
   });
 
   it("reads back a pane mirror verbatim, newlines and all", () => {
@@ -46,10 +48,10 @@ describe("the write-through last-seen cache", () => {
   // Every read is total: a hand-edited or format-drifted entry reads as a miss, never a throw — a
   // cache miss costs a stale render, an exception costs the whole boot this cache exists to save.
   it.each([
-    ["not json at all", "collie:last-snapshot:", "{{{"],
-    ["a json array", "collie:last-snapshot:", "[]"],
-    ["an entry with no stamp", "collie:last-snapshot:", JSON.stringify({ value: {} })],
-    ["a pane with no stamp line", "collie:last-pane: w1:p1", "just text"],
+    ["not json at all", `collie:last-snapshot:${scopeKey()}`, "{{{"],
+    ["a json array", `collie:last-snapshot:${scopeKey()}`, "[]"],
+    ["an entry with no stamp", `collie:last-snapshot:${scopeKey()}`, JSON.stringify({ value: {} })],
+    ["a pane with no stamp line", `collie:last-pane:${paneScopeKey(undefined, "w1:p1")}`, "just text"],
   ])("treats %s as a miss", (_name, key, raw) => {
     sessionStorage.setItem(key, raw);
     expect(loadLastSnapshot(undefined) ?? loadLastPaneText(undefined, "w1:p1")).toBeNull();

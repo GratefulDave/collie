@@ -1,11 +1,14 @@
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { extname, join, normalize, sep } from "node:path";
+import type { JsonObject, JsonValue } from "./json.ts";
 import type { ActivityLedger } from "./activity.ts";
-import type { AuditLog } from "./audit.ts";
+import { type AuditDetail, type AuditEntry, AuditLog } from "./audit.ts";
 import type { Config } from "./config.ts";
-import type { HerdrClient, PaneRead } from "./herdr-client.ts";
+import { MUX_CAPABILITIES, type MuxCapability, type MuxCapabilityDeclaration } from "./mux/capabilities.ts";
+import type { MuxAdapter, MuxAck, MuxGrid } from "./mux/types.ts";
 import { computeEtag, gzipJsonResponse, notModified } from "./http-cache.ts";
+import { pluginRoot } from "./root.ts";
 import type { NotifyPrefs, NotifyPrefsStore } from "./notify-prefs.ts";
 import { createOperatorCommands } from "./operator-commands.ts";
 import { createOperatorKeys } from "./operator-keys.ts";
@@ -15,33 +18,44 @@ import {
   type PromptBindingResult,
 } from "./prompt-binding.ts";
 import type { Push, PushSubscription } from "./push.ts";
-import { herdTagFor, type SessionRegistry } from "./sessions.ts";
+import { herdTagFor, type SessionRegistry, type SessionRuntime } from "./sessions.ts";
 import type { Snooze } from "./snooze.ts";
 import type { UpdateMonitor } from "./update.ts";
 import type { StateEngine } from "./state-engine.ts";
 import { adapterFor, buildJournalRegistry } from "./journal/registry.ts";
 import { TranscriptStore } from "./journal/store.ts";
 import type { JournalAdapter } from "./journal/types.ts";
-import { toPaneWire } from "./types.ts";
+import {
+  bearerToken,
+  normalizeLabel,
+  toDeviceWire,
+  type ClaimFailure,
+  type PairingStore,
+} from "./pairing.ts";
+import { modeForWire } from "./pack/mode.ts";
+import type { PackRuntime } from "./pack/config.ts";
+import type { PackLead } from "./pack/lead.ts";
+import { packDeviceOf, packGate } from "./pack/peer-gate.ts";
+import { selectHostFrom, type HostSelector } from "./pack/registry.ts";
+import type { PackHandler, PackSurface } from "./pack/router.ts";
+import type { PackTlsOptions } from "./pack/transport.ts";
+import { MAX_UPLOAD_BYTES, uploadTooLarge } from "./uploads.ts";
+import { MUX_LOGO_PATH, toPaneWire } from "./types.ts";
 import type {
   ActionResponse,
   AgentView,
   BridgeConfig,
   CreateResponse,
   DeviceAuth,
+  OperatorCommand,
+  MuxConfig,
+  OperatorKeyRow,
   PaneHistoryResponse,
   PaneReadResponse,
   SnapshotResponse,
   UploadResponse,
 } from "./types.ts";
 
-// Image upload limits. Herdr's socket only carries text/keys, so we can't paste an image into the
-// terminal — instead we save it to a host file and the client references its path in the message
-// (the agent reads images by path). See uploadPane().
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
-// Multipart wraps the file in a boundary + part headers, so a legitimately-sized image arrives a
-// little over MAX_UPLOAD_BYTES on the wire. Allow a small slack for the Content-Length pre-check.
-const MAX_UPLOAD_OVERHEAD = 64 * 1024; // 64 KB
 // Hard cap the runtime enforces on ANY request body (Bun.serve maxRequestBodySize). Bigger than the
 // upload cap + overhead so the handler's own 413 fires first for honest clients; this cuts off a
 // chunked or lying client that never sends an accurate Content-Length.
@@ -50,28 +64,33 @@ const MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024; // 12 MB
 const MAX_READ_LINES = 10_000;
 const MAX_EXPECTED_PROMPT_CHARS = 8192;
 const PROMPT_BINDING_BLANK_LINE_HEADROOM = 6;
-const IMAGE_EXT: Record<string, string> = {
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/webp": "webp",
-  "image/gif": "gif",
-};
+// A Map, not an object literal: the key is a client-supplied MIME string, and a Map lookup can
+// never reach `Object.prototype`. The accepted set is unchanged.
+const IMAGE_EXT = new Map<string, string>([
+  ["image/png", "png"],
+  ["image/jpeg", "jpg"],
+  ["image/webp", "webp"],
+  ["image/gif", "gif"],
+]);
 
 // The built PWA lives in web/dist (Vite output). If it's missing, the bridge still runs the API
-// — only the static UI 503s with a hint to build.
-const WEB_DIR = join(import.meta.dir, "..", "web", "dist");
+// — only the static UI 503s with a hint to build. Anchored on the resolved checkout root, NOT on
+// this module's directory: under `bun build --compile` that is the embedded `/$bunfs` root and the
+// served directory would vanish (see bridge/root.ts).
+const WEB_DIR = join(pluginRoot(), "web", "dist");
 
-const CONTENT_TYPES: Record<string, string> = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".css": "text/css; charset=utf-8",
-  ".json": "application/json; charset=utf-8",
-  ".webmanifest": "application/manifest+json; charset=utf-8",
-  ".png": "image/png",
-  ".svg": "image/svg+xml",
-  ".ico": "image/x-icon",
-  ".woff2": "font/woff2",
-};
+// A Map for the same reason {@link IMAGE_EXT} is one: the key is derived from a request path.
+const CONTENT_TYPES = new Map<string, string>([
+  [".html", "text/html; charset=utf-8"],
+  [".js", "text/javascript; charset=utf-8"],
+  [".css", "text/css; charset=utf-8"],
+  [".json", "application/json; charset=utf-8"],
+  [".webmanifest", "application/manifest+json; charset=utf-8"],
+  [".png", "image/png"],
+  [".svg", "image/svg+xml"],
+  [".ico", "image/x-icon"],
+  [".woff2", "font/woff2"],
+]);
 
 // Strict CSP. Scripts are external, hashed bundles (script-src 'self'); pane text is rendered by
 // React as text nodes, never markup, so terminal output can't inject. 'unsafe-inline' is allowed
@@ -83,16 +102,23 @@ const CSP =
 
 // Hardening headers set on EVERY response (static + API), applied centrally in the fetch wrapper.
 // nosniff stops content-type confusion; no-referrer keeps the tailnet URL out of any Referer.
-const SECURITY_HEADERS: Record<string, string> = {
+const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
-};
+} satisfies Record<string, string>;
 
 // Loopback Host/Origin forms (with an optional port). These bypass only Host/Origin checks for
 // on-host operation; a configured trusted-user identity is still mandatory.
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
 const PANE_ROUTE = /^\/api\/pane\/([^/]+)(?:\/(reply|keys|upload|close|rename|history))?$/;
+
+/**
+ * The host selector every request takes when this collie has no trust store — i.e. the only one a
+ * solo instance ever sees. Named rather than parsed so that on solo the `?host=` grammar is never
+ * applied to a URL at all: not a lookup, not a regex, not a branch a client can steer (§11).
+ */
+const LOCAL_HOST: HostSelector = { kind: "local" };
 // Turns per history page. "Show entire history" means the WHOLE conversation, so the client asks for
 // everything and this ceiling is a safety net against a pathological log, not the normal path — a
 // 1400-turn session is ~1.4 MB raw / ~400 KB gzipped, which a tailnet link serves fine. The default
@@ -134,6 +160,156 @@ export function marksPaneSeen(req: Request, action: string | undefined): boolean
   return action !== undefined && action !== "history";
 }
 
+/**
+ * The `/api/config` body. Pure, and exported for that reason: the handler lives inside `Bun.serve`,
+ * which `bun test` cannot stand up (CLAUDE.md), so the shape is asserted here instead.
+ *
+ * `mode` is present only when this collie is in a pack — see {@link modeForWire}. A solo instance's
+ * body is byte-identical to the pre-federation one, which is the whole zero-tax point; a client
+ * reads the mode as `mode ?? "solo"`.
+ */
+/**
+ * Who is asking for a session-scoped route, and everything that differs between them.
+ *
+ * There are exactly two implementations and there must never be a third: the browser at this
+ * collie's front door, and a lead over an admitted pack link (PACK_PROTOCOL.md §5). Each route
+ * handler below is written once and consumes this — so the answer to "does a peer run the same code
+ * my phone does?" is structural rather than a promise.
+ */
+interface RouteCaller {
+  /**
+   * `(host, session)` → the runtime to act on, or the Response refusing/answering it. For a browser
+   * this may resolve to *another machine*, in which case the request is forwarded and the peer's own
+   * response comes back here (§9.1). For a pack caller it is always local.
+   */
+  resolve(): Promise<SessionRuntime | Response>;
+  /** The caller's own authorisation at this level, or `null` to proceed. */
+  gate(level: "read" | "write"): Response | null;
+  /** The device a write is attributed to. */
+  device(): string | null;
+  /** Where a write's audit line lands — the peer's is pre-stamped `via:"pack"` + originator (§12). */
+  readonly audit: AuditLog;
+}
+
+/**
+ * One adapter's declaration, as the phone reads it (M10/06).
+ *
+ * Takes the two fields off {@link MuxAdapter} rather than the adapter itself, so this stays a pure
+ * function `bun test` can call — and so it is obvious that publishing capabilities cannot reach into
+ * a multiplexer.
+ *
+ * `notes` is filtered to the ABSENT capabilities. A note on a supported one explains nothing to an
+ * operator (Herdr ships one, about how its scrollback depth is known), and shipping it would put
+ * developer prose on the wire for every page load of the reference adapter.
+ */
+export function muxConfigBody(mux: MuxPublication): MuxConfig {
+  const decl = mux.capabilities;
+  const notes: Partial<Record<MuxCapability, string>> = {};
+  for (const cap of MUX_CAPABILITIES) {
+    if (decl.supports[cap]) continue;
+    const note = decl.notes[cap];
+    if (note !== undefined) notes[cap] = note;
+  }
+  const wire: MuxConfig = {
+    name: mux.mux,
+    capabilities: { ...decl.supports },
+    unsupportedKeys: [...decl.unsupportedKeys],
+    notes,
+  };
+  // Assigned only when the adapter actually has a mark — the key's ABSENCE is what tells the phone
+  // to render its text alone, so a bridge that published `logoUrl` unconditionally would point every
+  // header at a 404.
+  if (mux.logo !== undefined) wire.logoUrl = MUX_LOGO_PATH;
+  return wire;
+}
+
+/**
+ * What publishing an adapter needs off it — its name, its declaration, and its mark.
+ *
+ * The three FIELDS rather than the {@link MuxAdapter} itself, so this stays a pure shape `bun test`
+ * can build by hand, and so it is structurally obvious that publishing a config cannot reach into a
+ * multiplexer.
+ */
+interface MuxPublication {
+  readonly mux: string;
+  readonly capabilities: MuxCapabilityDeclaration;
+  readonly logo?: string;
+}
+
+/**
+ * `GET /api/mux/logo.svg` — the active adapter's mark, as the adapter wrote it.
+ *
+ * Pure + exported: the handler lives inside `Bun.serve`, which `bun test` cannot stand up, so the
+ * headers are asserted against this instead.
+ *
+ * The two headers this adds beyond {@link secure}'s are the SVG-serving hardening, and they are not
+ * decoration. An SVG is a document, not a picture: served same-origin it could in principle carry
+ * script, so `Content-Security-Policy: sandbox` drops the whole response into an opaque origin with
+ * scripting off. `nosniff` (already on every response) then keeps a browser from re-deciding what
+ * these bytes are. Collie's own three logos contain no script — bridge/mux/logo.test.ts pins that
+ * for each of them — but the bytes come from an ADAPTER, and the next adapter's author is not
+ * necessarily in this repo.
+ *
+ * Caching follows the dist rule (see {@link cacheControlFor}): the path is not content-addressed and
+ * its bytes change with a release, so `no-cache` + a strong ETag means a warm client spends a 304
+ * and no body, while a rebuilt bridge is picked up on the next load rather than at the end of some
+ * max-age.
+ */
+export function muxLogoResponse(svg: string, ifNoneMatch: string | null): Response {
+  const etag = computeEtag(svg);
+  const headers = {
+    "content-type": "image/svg+xml; charset=utf-8",
+    "cache-control": "no-cache",
+    "content-security-policy": "sandbox",
+    etag,
+  };
+  if (notModified(ifNoneMatch, etag)) {
+    // RFC 7232 §4.1: a 304 echoes the validators and carries no body.
+    return secure(new Response(null, { status: 304, headers }));
+  }
+  return secure(new Response(svg, { headers }));
+}
+
+export function bridgeConfigBody(opts: {
+  push: boolean;
+  vapidPublicKey: string;
+  build: string;
+  mode: PackRuntime["mode"];
+  /**
+   * The active adapter, when there is one. Optional so the pack-mode assertions below (and any
+   * caller that has no session registry) stay about the pack and nothing else; the real handler
+   * always passes it.
+   */
+  mux?: MuxPublication;
+  /**
+   * The operator's own palette rows. Omitted entirely when there are none, so an operator who never
+   * wrote a `commands.toml` ships the same payload as before — the same reasoning `mode` follows.
+   */
+  operatorCommands?: readonly OperatorCommand[];
+  /** The operator's own Keys-tray rows. Same omit-when-empty rule as `operatorCommands`. */
+  operatorKeys?: readonly OperatorKeyRow[];
+}): BridgeConfig {
+  const mode = modeForWire(opts.mode);
+  const mine = opts.operatorCommands ?? [];
+  const myKeys = opts.operatorKeys ?? [];
+  const wire: BridgeConfig = {
+    push: opts.push,
+    vapidPublicKey: opts.vapidPublicKey,
+    build: opts.build,
+  };
+  // Assigned, never conditionally spread: a solo instance's body must carry NEITHER key, byte for
+  // byte as before the pack existed (PACK_PROTOCOL.md §11).
+  if (mode !== undefined) wire.mode = mode;
+  if (mine.length > 0) wire.operatorCommands = [...mine];
+  if (myKeys.length > 0) wire.operatorKeys = [...myKeys];
+  // Appended last, and unconditional once an adapter is in hand: unlike `mode`, this is not
+  // omit-when-default. There is no default to omit — "no mux key" already means something on the
+  // phone (an older bridge, read as fully capable), so a Herdr bridge staying silent here would be
+  // indistinguishable from one that cannot answer.
+  if (opts.mux !== undefined) wire.mux = muxConfigBody(opts.mux);
+  return wire;
+}
+
 export function startServer(opts: {
   cfg: Config;
   registry: SessionRegistry;
@@ -143,8 +319,80 @@ export function startServer(opts: {
   updateMonitor: UpdateMonitor;
   audit: AuditLog;
   activity: ActivityLedger;
+  /** Resolved once at startup in index.ts, before anything is wired. Solo is `SOLO_RUNTIME`. */
+  pack: PackRuntime;
+  /**
+   * The federated surface, supplied by index.ts **only** when a trust store exists. Undefined on
+   * every solo instance, and the paths it owns are declared in `bridge/pack/router.ts` rather than
+   * here — deliberately, so this file names no pack route and `solo-baseline.test.ts` can prove by
+   * grep that solo registers nothing (PACK_PROTOCOL.md §11, "`/pack/v1/*`: not routed at all").
+   *
+   * A **factory**, not a handler, for one reason: a peer's `/pack/v1/*` must answer exactly what its
+   * own `/api/*` would, and the only way to guarantee that is to hand the pack router the very
+   * closures this file serves browsers from — the snapshot body, and the session-scoped route block.
+   * Two assemblies that "agree" would be two assemblies that drift.
+   */
+  packRouter?: (surface: PackSurface) => PackHandler;
+  /**
+   * The **deposed** answer, when this collie has learned the crown has moved (PACK_PROTOCOL.md
+   * §18.12). Returns a `Response` for every request it should swallow and `null` otherwise — so an
+   * instance that has not been deposed passes `undefined` and this file's dispatch is byte-identical
+   * to today's.
+   *
+   * A closure rather than a route, for the reason `packRouter` is one: the paths it owns are declared
+   * in `bridge/pack/deposed.ts`, so this file names none of them and `solo-baseline.test.ts` can keep
+   * proving by grep that the route table here is exactly today's.
+   */
+  deposed?: (req: Request, url: URL) => Response | null;
+  /**
+   * The peer listener's pinned-mTLS options, supplied **only** by a peer that could build them
+   * (`bridge/pack/transport.ts`). Absent on solo and on a lead, so this file's `Bun.serve` call is
+   * byte-identical to today's for every instance that is not a peer (§11).
+   */
+  tls?: PackTlsOptions;
+  /**
+   * The lead runtime, supplied **only** when this collie leads a pack with at least one enrolled
+   * member. Its presence is exactly the condition under which `servers` goes on the wire and every
+   * session and pane gains a `host` (PACK_PROTOCOL.md §9.2, §11) — undefined here means the snapshot
+   * body that leaves this file is the object literal it has always been.
+   */
+  packLead?: PackLead;
+  /**
+   * The lead's per-peer notification coordinators, supplied under the same condition as
+   * {@link startServer} `packLead`. The two notification-policy routes below fan across it exactly as
+   * they fan across `registry.all()` — snooze and prefs are one pack-wide setting the lead owns
+   * (PACK_PROTOCOL.md §5), and the lead being the only sender is what makes that fan complete.
+   * Structurally typed, not the class: this file needs "fan a pref change, list the live slots".
+   */
+  peerNotifier?: { applyPrefs(): void; tags(): string[] };
+  /**
+   * Device pairing (bridge/pairing.ts). Always supplied by index.ts — it is not an opt-in feature
+   * flag: the store reads its own registry off disk, and an empty registry means "nothing paired",
+   * which enforces nothing. Optional here only so the existing tests can build a server without it.
+   *
+   * It is deliberately NOT threaded into the pack surface. `/pack/v1/*` is admitted by pinned mutual
+   * TLS plus the pack secret and shares nothing with a browser credential (PACK_PROTOCOL.md §6,
+   * ADR 0013) — a lead does not hold one of this collie's pairing tokens and must never need one.
+   *
+   * **ONE EXCEPTION, added 2026-08-20, and the rule above survives verbatim** (RFC §16, decision 5;
+   * PACK_PROTOCOL.md §18.14). `POST /pack/v1/pairing` carries a lead's registry — **hashes only** — to
+   * the one member it has named DEPUTY, so that member's standby door can check a phone's bearer
+   * credential when the lead is gone. What is unchanged: **no pack request is ever admitted by a
+   * pairing token**, and that route is admitted by the pack's own two factors plus a role check like
+   * every other one. What is new: a browser credential's hash rides a pack route and lands on a
+   * peer's disk — in `standby-devices.json`, its own file, **never** merged into
+   * `paired-devices.json`, because `PairingStore.enforced()` is "the registry is non-empty" and a
+   * merge would arm the deputy's own write gate for its own operator. The reasoning, at length, is in
+   * `bridge/pack/standby-devices.ts`.
+   */
+  pairing?: PairingStore;
 }) {
-  const { cfg, registry, push, snooze, notifyPrefs, updateMonitor, audit, activity } = opts;
+  const { cfg, registry, push, snooze, notifyPrefs, updateMonitor, audit, activity, pack } = opts;
+  const pairing = opts.pairing;
+  /** Who the requester is, across both device gates — see {@link requestDevice}. */
+  const whois = (req: Request): DeviceAuth => requestDevice(req, cfg, pairing);
+  const packLead = opts.packLead;
+  const peerNotifier = opts.peerNotifier;
   const listen = cfg.unixSocket
     ? { unix: cfg.unixSocket }
     : { hostname: cfg.host, port: cfg.port };
@@ -160,19 +408,230 @@ export function startServer(opts: {
   const transcripts = cfg.transcript ? new TranscriptStore() : null;
   /** Does this agent have a journal at all — the snapshot's History-affordance gate. */
   const hasJournal = (agent: string) => adapterFor(journals ?? {}, agent) !== undefined;
+
+  /**
+   * This collie's own snapshot body — the whole of what `/api/snapshot` answered before packs
+   * existed, and (with `device` omitted) exactly what a peer serves its lead on `/pack/v1/snapshot`.
+   *
+   * `undefined` means the session name is unknown, which every caller turns into the same 404 it
+   * always did. Nothing federated happens in here: the host tag and the `servers` array are added
+   * afterwards, by the lead and only by a lead, so a solo instance's bytes are untouched (§11).
+   */
+  const localSnapshot = (
+    sessionName: string | undefined,
+    device: DeviceAuth | null,
+  ): SnapshotResponse | undefined => {
+    const rt = registry.get(sessionName);
+    if (!rt) return undefined;
+    const { agents, shellPanes, workspaces, tabs, bridge } = rt.engine.current();
+    // Attach each pane's activity timestamps. Done here rather than in the state engine so the
+    // engine stays a pure Herdr-poller with no knowledge of the ledger — and so the two numbers
+    // are read at serialise time, i.e. as fresh as the request.
+    const withActivity = (p: AgentView): AgentView => {
+      const a = activity.get(rt.name, p.paneId);
+      return a ? { ...p, lastActiveAt: a.activeAt, lastSeenAt: a.seenAt } : p;
+    };
+    // `device` is ASSIGNED below, never conditionally spread: an off deployment sends no such key.
+    const body: SnapshotResponse = {
+      bridge,
+      // The one place a pane leaves the bridge: the session ref is stripped to a presence flag
+      // here, so an agent-reported filesystem path never reaches a browser (see toPaneWire).
+      // The flag is computed against the registry, so a harness Herdr detects but Collie has no
+      // journal for doesn't advertise a History button that can only ever come back empty.
+      // withActivity runs FIRST: it returns an AgentView, which is what toPaneWire consumes,
+      // and the two timestamps then ride through its rest-spread onto the wire shape.
+      agents: agents.map((p) => toPaneWire(withActivity(p), hasJournal)),
+      shellPanes: shellPanes.map((p) => toPaneWire(withActivity(p), hasJournal)),
+      workspaces,
+      tabs,
+      sessions: registry.list(),
+      notifications: { snoozedUntil: snooze.until() },
+      update: updateMonitor.status(),
+      ts: Date.now(),
+    };
+    // Only report device state when the feature is on, so an off deployment sends nothing new.
+    if (device !== null) body.device = device;
+    return body;
+  };
+
+  /**
+   * This collie's own `(session)` resolution: the identical `registry.get` call the bridge made
+   * before packs existed, plus the 404 it always answered. Named once so that BOTH the browser's host
+   * gate and the peer's pack dispatch reach a local runtime through the same expression — two
+   * spellings of "the primary session, or 404" would be two chances to disagree about what `?session=`
+   * means, and §5 says a peer resolves it with today's exact semantics.
+   */
+  const localRuntime = (session: string | undefined, acceptEncoding: string | null): SessionRuntime | Response =>
+    registry.get(session) ?? jsonError(`unknown session: ${session ?? ""}`, 404, acceptEncoding);
+
+  /**
+   * Everything session-scoped: the pane family, tab create/rename/close, workspace create.
+   *
+   * ── ONE BLOCK, TWO CALLERS, NO SECOND HANDLER SET ────────────────────────────
+   * A browser reaches it through `Bun.serve`'s dispatch below; a LEAD reaches it through this
+   * collie's `/pack/v1/*` surface, which hands over this very closure (PACK_PROTOCOL.md §5: "a 1:1
+   * re-exposure of the routes the phone already calls, dispatched into the same handlers"). Not a
+   * copy that agrees — the same code, so `reply` cannot acquire a pack-only behaviour and `history`
+   * cannot acquire a host parameter.
+   *
+   * What differs between the two callers is *only* who is asking, which is exactly the
+   * {@link RouteCaller} it takes: how the caller's request resolves to a runtime (a browser's may
+   * resolve to another machine and be forwarded), how the caller is authorised (a browser by
+   * `guard()`, a lead by the pack link plus the peer's own device policy — §12), and which audit log
+   * the write lands in (the peer's is stamped `via:"pack"`).
+   *
+   * `null` ⇒ not a session-scoped path; the caller carries on with its own routing.
+   */
+  const serveSessionRoute = async (
+    req: Request,
+    url: URL,
+    caller: RouteCaller,
+  ): Promise<Response | null> => {
+    const { pathname } = url;
+
+    // ── Structural creates: new tab / new space (each opens a fresh shell pane) ──
+    if (pathname === "/api/tab" && req.method === "POST") {
+      const denied = caller.gate("write");
+      if (denied) return denied;
+      const rt = await caller.resolve();
+      if (rt instanceof Response) return rt;
+      return createTab(rt.herdr, rt.engine, req, caller.audit, caller.device(), rt.name);
+    }
+    if (pathname === "/api/workspace" && req.method === "POST") {
+      const denied = caller.gate("write");
+      if (denied) return denied;
+      const rt = await caller.resolve();
+      if (rt instanceof Response) return rt;
+      return createWorkspace(rt.herdr, req, caller.audit, caller.device(), rt.name);
+    }
+
+    // ── Tab actions: rename (set its label) / close (kill it + every pane in it) ──
+    const tabMatch = pathname.match(TAB_ACTION_ROUTE);
+    if (tabMatch && req.method === "POST") {
+      const denied = caller.gate("write");
+      if (denied) return denied;
+      const rt = await caller.resolve();
+      if (rt instanceof Response) return rt;
+      const tabId = decodeURIComponent(tabMatch[1]!);
+      const action = tabMatch[2];
+      const device = caller.device();
+      if (action === "close") return closeTab(rt.herdr, tabId, req, caller.audit, device, rt.name);
+      return renameTab(rt.herdr, tabId, req, caller.audit, device, rt.name);
+    }
+
+    // ── Per-pane read / send ─────────────────────────────────────────────
+    const paneMatch = pathname.match(PANE_ROUTE);
+    if (paneMatch) {
+      const paneId = decodeURIComponent(paneMatch[1]!);
+      const action = paneMatch[2];
+      // Reading a pane is allowed for any access-gated client; every action (reply/keys/upload/
+      // close) types into or restructures a terminal, so it additionally needs an authorised device.
+      // `history` is a READ despite being an action segment — it only ever reads a log off disk.
+      const isRead = !action || action === "history";
+      const denied = caller.gate(isRead ? "read" : "write");
+      if (denied) return denied;
+      const rt = await caller.resolve();
+      if (rt instanceof Response) return rt;
+      const { herdr, name: session } = rt;
+      // You are in this pane: reading it, replying, sending keys, browsing its history. That is
+      // the whole definition of "seen" (.adr/0003), and this is the one place every such request
+      // passes through. It cannot false-positive from background polling — the dashboard loader
+      // only ever fetches /api/snapshot; paneLoader is the sole reader of pane text — nor from a
+      // cross-site request forged at a guessed pane id (see marksPaneSeen).
+      //
+      // Gated on the request actually being ROUTED below. PANE_ROUTE constrains `action` to the
+      // known set, so the only way to reach here unrouted is a method mismatch (a GET at /reply, a
+      // POST at /history) — which 405s. Without this a malformed request still marked the pane seen.
+      //
+      // ── AND IT IS RECORDED EXACTLY ONCE, ON THE OWNING HOST ────────────────
+      // A pane on a peer never reaches this line on the LEAD: `caller.resolve()` returned the peer's
+      // forwarded response above. It reaches it on the PEER, through the pack dispatch, against the
+      // peer's own ledger — which is what makes "seen" one shared fact (.adr/0003) rather than two
+      // machines' guesses, and why the `x-collie-seen` header is forwarded verbatim.
+      const routed = isRead ? req.method === "GET" : req.method === "POST";
+      if (routed && marksPaneSeen(req, action)) activity.noteSeen(session, paneId);
+      // Every action is a write; attribute it to the authorised device for the audit trail.
+      // `history` is a read, so it gets no device attribution (nothing is written to attribute).
+      const device = isRead ? null : caller.device();
+      const audit_ = caller.audit;
+
+      if (!action && req.method === "GET") return readPane(herdr, cfg, paneId, url, req);
+      if (action === "history" && req.method === "GET")
+        return paneHistory(cfg, journals, transcripts, rt.engine, paneId, url, req);
+      if (action === "reply" && req.method === "POST") return replyPane(herdr, cfg, paneId, req, audit_, device, session);
+      if (action === "keys" && req.method === "POST") return keysPane(herdr, cfg, paneId, req, audit_, device, session);
+      if (action === "upload" && req.method === "POST") return uploadPane(cfg, paneId, req, audit_, device, session);
+      if (action === "close" && req.method === "POST") return closePane(herdr, paneId, req, audit_, device, session);
+      if (action === "rename" && req.method === "POST") return renamePane(herdr, paneId, req, audit_, device, session);
+      return text("method not allowed", 405);
+    }
+
+    return null;
+  };
+
+  // A peer answers its lead with its OWN view and never a merged one — a pack link never forwards a
+  // `host=` because a peer has no peers (§4). Hence `localSnapshot`, not the merged body below.
+  //
+  // The second closure is the per-pane half of the same idea (§5): the lead's request is dispatched
+  // into the block above, authorised by the PEER's own gate (bridge/pack/peer-gate.ts) and audited in
+  // the PEER's own log with `via:"pack"` and the originating member (§12). The lead's verdict is not
+  // an input — it never crosses the wire.
+  const packHandler = opts.packRouter?.({
+    snapshot: (session) => localSnapshot(session, null),
+    dispatch: async (req, url, from) => {
+      const session = url.searchParams.get("session") ?? undefined;
+      const device = packDeviceOf(req);
+      const routed = await serveSessionRoute(req, url, {
+        resolve: async () => localRuntime(session, null),
+        gate: (level) => {
+          const verdict = packGate(level, cfg, device);
+          return verdict.ok ? null : text(verdict.reason, 403);
+        },
+        device: () => device,
+        audit: audit.scoped({ via: "pack", from }),
+      });
+      return routed ?? jsonError("not found", 404, null);
+    },
+  });
   // Per-session background notifications live in each session's runtime (built by the factory in
   // index.ts, wired to its StateEngine transitions). The routes here only fan preference changes and
   // snooze-clears across every live session's coordinator.
+
+  // Present ONLY on a peer that pins its lead; ASSIGNED below rather than conditionally spread, so
+  // solo and lead keep the zero-tax shape — an absent key, not a disabled one.
+  // `ca` is copied out of its readonly array because Bun's `TLSOptions` wants a mutable one.
+  const listenerTls = opts.tls === undefined ? undefined : { ...opts.tls, ca: [...opts.tls.ca] };
 
   const server = Bun.serve({
     ...listen,
     // Runtime cap on any request body — a chunked/lying client is cut off here even if its
     // Content-Length is absent or false. The upload handler still does its own precise check.
     maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
+    // When TLS is present the handshake itself is the first factor: an unpinned or absent client
+    // certificate never reaches `fetch` at all, so nothing below has to defend against it.
+    tls: listenerTls,
 
     async fetch(req) {
       const url = new URL(req.url);
       const { pathname } = url;
+
+      // The federated surface, before anything else. It answers only the prefix it owns and returns
+      // null otherwise, so this is not a branch a browser request can take. Its admission is two
+      // independent factors and shares nothing with `checkAccess()` below — a pack credential never
+      // admits an `/api/*` request and a browser credential never admits a pack one
+      // (PACK_PROTOCOL.md §6, ADR 0013).
+      if (packHandler) {
+        const packed = await packHandler(req, url);
+        if (packed) return secure(packed);
+      }
+
+      // A DEPOSED collie serves one page and fails its health check (§18.12). It sits AFTER the
+      // federated surface on purpose: the machine that just deposed this one must still be able to
+      // reach `/pack/v1/*` here — that is how it was told, and how it will be told again — while the
+      // app, the PWA and `/api/*` are gone. Everything below this line is the front door, and a
+      // deposed collie has none.
+      const deposedAnswer = opts.deposed?.(req, url);
+      if (deposedAnswer) return secure(deposedAnswer);
 
       // Session-scoped routes accept an optional `?session=<name>`; absent → the primary session
       // (identical to pre-multi-session behaviour). The name is only ever a registry Map lookup — it
@@ -181,116 +640,93 @@ export function startServer(opts: {
       const unknownSession = () =>
         jsonError(`unknown session: ${sessionName ?? ""}`, 404, req.headers.get("accept-encoding"));
 
+      // The host dimension of the `(host, session, paneId)` address (§4), read exactly where the
+      // session name is and by the same rule: a client-supplied value that is ONLY ever a registry
+      // key. Parsed only when this collie has a trust store — the same predicate the pack surface
+      // mounts on — so a solo instance never applies the grammar to a URL and `?h=` stays a
+      // parameter that provably does not exist there (§11).
+      const host = packHandler ? selectHostFrom(url) : LOCAL_HOST;
+
+      /**
+       * The `(host, session)` target of a session-scoped route, or the Response refusing it.
+       *
+       * An unknown host is a 404, mirroring `unknownSession()` exactly (§4) — and so is an
+       * ill-formed one, which is the shape a probe takes (a path, a URL, an IP). A *known* peer is
+       * FORWARDED, and the peer's own answer is what comes back (§5, §9.1): the load-bearing part is
+       * that it is never silently served from the LEAD's registry, because pane ids collide across
+       * machines and `?h=laptop` + `w1:p1` must never type into the desk's `w1:p1`.
+       *
+       * The forward is the only asynchrony this adds, and it is why `target()` is async: a local
+       * request does not await a thing it did not do — `registry.get` is still one Map lookup.
+       */
+      const target = async (): Promise<SessionRuntime | Response> => {
+        if (host.kind !== "local") {
+          const resolved = packLead?.resolve(host, sessionName);
+          if (resolved === undefined) {
+            return jsonError(
+              `unknown host: ${host.kind === "member" ? host.id : host.raw}`,
+              404,
+              req.headers.get("accept-encoding"),
+            );
+          }
+          if (resolved.kind === "peer") {
+            // The lead's own record of the forward (§12): one line, the same `action` the peer will
+            // write, plus the target host — two independent logs of one event, neither depending on
+            // the other machine's disk.
+            return secure(
+              await packLead!.forward(req, url, resolved, {
+                device: whois(req).device,
+                audit: (entry) => {
+                  // Assigned, never conditionally spread: an entry without a pane or session must
+                  // carry NO such key rather than record it as `undefined`.
+                  const row: AuditEntry = {
+                    action: entry.action,
+                    host: entry.host,
+                    device: whois(req).device,
+                    detail: { forwarded: entry.outcome },
+                  };
+                  if (entry.paneId !== undefined) row.paneId = entry.paneId;
+                  if (entry.session !== undefined) row.session = entry.session;
+                  audit.record(row);
+                },
+              }),
+            );
+          }
+          return resolved.runtime;
+        }
+        return localRuntime(sessionName, req.headers.get("accept-encoding"));
+      };
+
       // ── Live state (polled by the client) ────────────────────────────────
       if (pathname === "/api/snapshot") {
         const gate = checkAccess(req, cfg);
         if (!gate.ok) return text(gate.reason, 403);
-        const rt = registry.get(sessionName);
-        if (!rt) return unknownSession();
-        const { agents, shellPanes, workspaces, tabs, bridge } = rt.engine.current();
-        const device = deviceAuth(req, cfg);
-        // Attach each pane's activity timestamps. Done here rather than in the state engine so the
-        // engine stays a pure Herdr-poller with no knowledge of the ledger — and so the two numbers
-        // are read at serialise time, i.e. as fresh as the request.
-        const withActivity = (p: AgentView): AgentView => {
-          const a = activity.get(rt.name, p.paneId);
-          return a ? { ...p, lastActiveAt: a.activeAt, lastSeenAt: a.seenAt } : p;
-        };
+        const device = whois(req);
+        const body = localSnapshot(sessionName, device.enforced ? device : null);
+        if (!body) return unknownSession();
+        // The ONE place the lead re-serialises (§9.2). With no pack this is the identity function's
+        // absence: `body` goes out as assembled, same keys, same order, same bytes, same ETag.
+        // The merged body's ETag is then the lead's own assertion about its own merged view — a
+        // peer's ETag is never recomputed here, because no peer body is re-hashed on this path.
         // Tag every snapshot poll with the on-disk build id so an open client notices a live rebuild
         // between polls — the no-service-worker self-update path (web/src/lib/self-update.ts).
         return withBuildHeader(
-          json({
-            bridge,
-            // Only report device state when the feature is on, so an off deployment sends nothing new.
-            ...(device.enforced ? { device } : {}),
-            // The one place a pane leaves the bridge: the session ref is stripped to a presence flag
-            // here, so an agent-reported filesystem path never reaches a browser (see toPaneWire).
-            // The flag is computed against the registry, so a harness Herdr detects but Collie has no
-            // journal for doesn't advertise a History button that can only ever come back empty.
-            // withActivity runs FIRST: it returns an AgentView, which is what toPaneWire consumes,
-            // and the two timestamps then ride through its rest-spread onto the wire shape.
-            agents: agents.map((p) => toPaneWire(withActivity(p), hasJournal)),
-            shellPanes: shellPanes.map((p) => toPaneWire(withActivity(p), hasJournal)),
-            workspaces,
-            tabs,
-            sessions: registry.list(),
-            notifications: { snoozedUntil: snooze.until() },
-            update: updateMonitor.status(),
-            ts: Date.now(),
-          } satisfies SnapshotResponse, req.headers.get("accept-encoding")),
+          json(packLead ? packLead.merge(body) : body, req.headers.get("accept-encoding")),
           await buildId(),
         );
       }
 
-      // ── Structural creates: new tab / new space (each opens a fresh shell pane) ──
-      if (pathname === "/api/tab" && req.method === "POST") {
-        const denied = guard(req, cfg, "write");
-        if (denied) return denied;
-        const rt = registry.get(sessionName);
-        if (!rt) return unknownSession();
-        return createTab(rt.herdr, rt.engine, req, audit, deviceAuth(req, cfg).device, rt.name);
-      }
-      if (pathname === "/api/workspace" && req.method === "POST") {
-        const denied = guard(req, cfg, "write");
-        if (denied) return denied;
-        const rt = registry.get(sessionName);
-        if (!rt) return unknownSession();
-        return createWorkspace(rt.herdr, req, audit, deviceAuth(req, cfg).device, rt.name);
-      }
-
-      // ── Tab actions: rename (set its label) / close (kill it + every pane in it) ──
-      const tabMatch = pathname.match(TAB_ACTION_ROUTE);
-      if (tabMatch && req.method === "POST") {
-        const denied = guard(req, cfg, "write");
-        if (denied) return denied;
-        const rt = registry.get(sessionName);
-        if (!rt) return unknownSession();
-        const tabId = decodeURIComponent(tabMatch[1]!);
-        const action = tabMatch[2];
-        const device = deviceAuth(req, cfg).device;
-        if (action === "close") return closeTab(rt.herdr, tabId, req, audit, device, rt.name);
-        return renameTab(rt.herdr, tabId, req, audit, device, rt.name);
-      }
-
-      // ── Per-pane read / send ─────────────────────────────────────────────
-      const paneMatch = pathname.match(PANE_ROUTE);
-      if (paneMatch) {
-        const paneId = decodeURIComponent(paneMatch[1]!);
-        const action = paneMatch[2];
-        // Reading a pane is allowed for any access-gated client; every action (reply/keys/upload/
-        // close) types into or restructures a terminal, so it additionally needs an authorised device.
-        // `history` is a READ despite being an action segment — it only ever reads a log off disk.
-        const isRead = !action || action === "history";
-        const denied = guard(req, cfg, isRead ? "read" : "write");
-        if (denied) return denied;
-        const rt = registry.get(sessionName);
-        if (!rt) return unknownSession();
-        const { herdr, name: session } = rt;
-        // You are in this pane: reading it, replying, sending keys, browsing its history. That is
-        // the whole definition of "seen" (.adr/0003), and this is the one place every such request
-        // passes through. It cannot false-positive from background polling — the dashboard loader
-        // only ever fetches /api/snapshot; paneLoader is the sole reader of pane text — nor from a
-        // cross-site request forged at a guessed pane id (see marksPaneSeen).
-        //
-        // Gated on the request actually being ROUTED below. PANE_ROUTE constrains `action` to the
-        // known set, so the only way to reach here unrouted is a method mismatch (a GET at /reply, a
-        // POST at /history) — which 405s. Without this a malformed request still marked the pane seen.
-        const routed = isRead ? req.method === "GET" : req.method === "POST";
-        if (routed && marksPaneSeen(req, action)) activity.noteSeen(session, paneId);
-        // Every action is a write; attribute it to the authorised device for the audit trail.
-        // `history` is a read, so it gets no device attribution (nothing is written to attribute).
-        const device = isRead ? null : deviceAuth(req, cfg).device;
-
-        if (!action && req.method === "GET") return readPane(herdr, cfg, paneId, url, req);
-        if (action === "history" && req.method === "GET")
-          return paneHistory(cfg, journals, transcripts, rt.engine, paneId, url, req);
-        if (action === "reply" && req.method === "POST") return replyPane(herdr, cfg, paneId, req, audit, device, session);
-        if (action === "keys" && req.method === "POST") return keysPane(herdr, cfg, paneId, req, audit, device, session);
-        if (action === "upload" && req.method === "POST") return uploadPane(cfg, paneId, req, audit, device, session);
-        if (action === "close" && req.method === "POST") return closePane(herdr, paneId, req, audit, device, session);
-        if (action === "rename" && req.method === "POST") return renamePane(herdr, paneId, req, audit, device, session);
-        return text("method not allowed", 405);
-      }
+      // ── Session-scoped routes: the pane family, tabs, workspaces ─────────
+      // The block itself lives above, shared with the pack surface (§5). What a browser supplies is
+      // its own gate (`guard`), its own device attribution, this collie's audit log, and the host
+      // gate — which is the one thing a pack caller never has, because a peer has no peers (§4).
+      const sessionRouted = await serveSessionRoute(req, url, {
+        resolve: target,
+        gate: (level) => guard(req, cfg, level, pairing),
+        device: () => whois(req).device,
+        audit,
+      });
+      if (sessionRouted) return sessionRouted;
 
       // ── Misc API ─────────────────────────────────────────────────────────
       if (pathname === "/api/config") {
@@ -299,34 +735,60 @@ export function startServer(opts: {
         // is no longer entirely Collie's: operatorCommands is operator-authored text, and any read
         // client sees it verbatim (`.env.example` says so where it is set).
         // It was also the one route that skipped checkAccess entirely, so COLLIE_PUBLIC_HOSTS
-        // didn't cover it and a rebound DNS name could read it. The client only ever calls this
-        // same-origin, and a refusal can't be mistaken for an outage: ConnectionBanner
+        // didn't cover it and a rebound DNS name could still read the build id. The client only ever
+        // calls this same-origin, and a refusal can't be mistaken for an outage: ConnectionBanner
         // short-circuits to AuthErrorBanner before its red-state probe runs. Noted in #32.
-        const denied = guard(req, cfg, "read");
+        const denied = guard(req, cfg, "read", pairing);
         if (denied) return denied;
         // Re-read per request behind an mtime check, like buildId() — editing commands.toml is live,
         // with no restart. The path is cfg's, never the request's.
         const mine = await operatorCommands();
         const myKeys = await operatorKeys();
-        return json({
-          push: push.enabled,
-          vapidPublicKey: push.publicKey,
-          build: await buildId(),
-          // Omitted entirely when there are none, so an operator who never wrote a commands.toml
-          // ships the same payload as before.
-          ...(mine.length > 0 ? { operatorCommands: mine } : {}),
-          // Same omit-when-empty rule: an operator with no keys.toml ships the payload they had.
-          ...(myKeys.length > 0 ? { operatorKeys: myKeys } : {}),
-        } satisfies BridgeConfig, req.headers.get("accept-encoding"));
+        // The PRIMARY session's adapter, because one collie drives one multiplexer: every session in
+        // the registry is built by the same factory off the same `cfg.mux`, so which runtime answers
+        // is not a choice. `?.` only because `get()` is total over a Map — the primary is created
+        // eagerly in the constructor and never disposed.
+        const activeMux = registry.get();
+        return json(
+          bridgeConfigBody({
+            push: push.enabled,
+            vapidPublicKey: push.publicKey,
+            build: await buildId(),
+            mode: pack.mode,
+            operatorCommands: mine,
+            operatorKeys: myKeys,
+            mux: activeMux?.herdr,
+          }),
+          req.headers.get("accept-encoding"),
+        );
+      }
+      if (pathname === MUX_LOGO_PATH && req.method === "GET") {
+        // Read-level, exactly like the `/api/config` block that publishes its URL — an image the
+        // header shows is part of the same answer, and gating it harder than the config that names
+        // it would only ever produce a broken image beside a rendered name. Both device gates stay
+        // where they are (writes), so a read-only device still sees the mark.
+        const denied = guard(req, cfg, "read", pairing);
+        if (denied) return denied;
+        // The PRIMARY session's adapter, for the reason `/api/config` gives: one collie drives one
+        // multiplexer, so which runtime answers is not a choice.
+        const logo = registry.get()?.herdr.logo;
+        // 404 rather than an empty 200, and rather than a stand-in: an adapter with no mark
+        // publishes no `logoUrl`, so nothing in a current client can even ask this. Reaching here
+        // means a stale page holding a URL this bridge no longer serves — and "there is no picture"
+        // is the true answer to that.
+        if (logo === undefined) return text("this multiplexer has no logo", 404);
+        return muxLogoResponse(logo, req.headers.get("if-none-match"));
       }
       if (pathname === "/api/subscribe" && req.method === "POST") {
         // Read-level: registering for push isn't terminal-driving, so a read-only device may still
         // subscribe to notifications.
-        const denied = guard(req, cfg, "read");
+        const denied = guard(req, cfg, "read", pairing);
         if (denied) return denied;
-        let body: unknown;
+        let body: JsonValue;
         try {
-          body = await req.json();
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `isPushSubscription`
+          // checks every field this route stores before a byte of it is persisted.
+          body = (await req.json()) as JsonValue;
         } catch {
           return text("bad subscription", 400);
         }
@@ -339,23 +801,30 @@ export function startServer(opts: {
       }
       if (pathname === "/api/notifications/snooze" && req.method === "POST") {
         // Managing your own notification quiet-hours isn't terminal-driving — read-level, like subscribe.
-        const denied = guard(req, cfg, "read");
+        const denied = guard(req, cfg, "read", pairing);
         if (denied) return denied;
-        let body: unknown;
+        let body: JsonValue;
         try {
-          body = await req.json();
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `snoozedUntil` is
+          // checked to be a number (or null) below before it is stored.
+          body = (await req.json()) as JsonValue;
         } catch {
           return text("bad request", 400);
         }
-        const until = (body as { snoozedUntil?: unknown }).snoozedUntil;
-        if (until !== null && typeof until !== "number") return text("bad snoozedUntil", 400);
-        await snooze.set(until);
+        const parsed = parseSnoozeRequest(body);
+        if (!parsed.ok) return text("bad snoozedUntil", 400);
+        await snooze.set(parsed.until);
         // Snoozing should also clear whatever's already on the lock screen — across every session,
         // since snooze is bridge-wide. Each session owns its own notification slot (tag).
         if (snooze.isMuted()) {
           for (const rt of registry.all()) {
             void push.send({ type: "clear", tag: herdTagFor(rt.isPrimary, rt.name) });
           }
+          // …and across every peer's slot. A snooze that only quiets the lead's own sessions is the
+          // bug the operator finds at 3am. Nothing is asked of the peer to make this work: the lead
+          // raised those alerts and owns the subscription, so an unreachable peer is irrelevant here
+          // — there is no policy to deliver and nothing to queue for reconnect (§5).
+          for (const tag of peerNotifier?.tags() ?? []) void push.send({ type: "clear", tag });
         }
         return json({ snoozedUntil: snooze.until() }, req.headers.get("accept-encoding"));
       }
@@ -363,16 +832,18 @@ export function startServer(opts: {
         // Which agent statuses push (bridge-wide). Read-level like snooze — managing your own
         // notification preferences isn't terminal-driving.
         if (req.method === "GET") {
-          const denied = guard(req, cfg, "read");
+          const denied = guard(req, cfg, "read", pairing);
           if (denied) return denied;
           return json(notifyPrefs.current(), req.headers.get("accept-encoding"));
         }
         if (req.method === "POST") {
-          const denied = guard(req, cfg, "read");
+          const denied = guard(req, cfg, "read", pairing);
           if (denied) return denied;
-          let body: unknown;
+          let body: JsonValue;
           try {
-            body = await req.json();
+            // SAFETY: `Request.json()` output IS a JsonValue by construction;
+            // `parseNotifyPrefsPatch` rejects anything that is not three optional booleans.
+            body = (await req.json()) as JsonValue;
           } catch {
             return text("bad request", 400);
           }
@@ -382,6 +853,8 @@ export function startServer(opts: {
           // Prefs may have just disabled a kind — retract any pending/outstanding alerts of it, in
           // every live session (prefs are bridge-wide; each session has its own coordinator).
           for (const rt of registry.all()) rt.notifications.applyPrefs();
+          // Same fan, one dimension out — a disabled kind must retract on every host, not just here.
+          peerNotifier?.applyPrefs();
           return json(updated, req.headers.get("accept-encoding"));
         }
         return text("method not allowed", 405);
@@ -390,7 +863,7 @@ export function startServer(opts: {
         // Force an immediate upstream check (the "check for updates" button), instead of waiting for
         // the periodic timer. Read-level — checking a version isn't terminal-driving — and idempotent
         // (the monitor de-dupes concurrent checks). Returns the fresh status the client revalidates on.
-        const denied = guard(req, cfg, "read");
+        const denied = guard(req, cfg, "read", pairing);
         if (denied) return denied;
         await updateMonitor.checkRelease();
         return json(updateMonitor.status(), req.headers.get("accept-encoding"));
@@ -400,6 +873,82 @@ export function startServer(opts: {
       }
 
 
+
+      // ── Device pairing (bridge/pairing.ts) ───────────────────────────────
+      if (pathname === "/api/pair" && req.method === "POST") {
+        if (!pairing) return text("pairing unavailable", 503);
+        // THE BOOTSTRAP, and the one write-shaped route that is deliberately not write-gated: a
+        // device that has never paired holds no token, so gating this on one would make pairing
+        // unreachable. It is not ungoverned — `checkAccess(…, "write")` still demands a same-origin
+        // `Origin` (so no cross-site page can drive it), and the credential it hands out is worthless
+        // without a code the operator read off their own terminal in the last ten minutes, behind a
+        // five-attempt counter. The header device gate is skipped for the same reason and with the
+        // same reasoning: it answers "is this device allowlisted", which is the question pairing
+        // exists to stop asking.
+        const gate = checkAccess(req, cfg, "write");
+        if (!gate.ok) return text(gate.reason, 403);
+        let body: JsonValue;
+        try {
+          // SAFETY: `Request.json()` output IS a JsonValue by construction; `parsePairRequest`
+          // re-checks every field of it before any of it is used.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+        }
+        const parsed = parsePairRequest(body);
+        if (!parsed) return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+        const claimed = await pairing.claim(parsed.code, parsed.label);
+        if (!claimed.ok) {
+          // Every failure is one status and one machine-readable reason; the client turns the reason
+          // into the sentence that says what to do next. No timing or count is leaked back — the
+          // attempts remaining are the operator's business, on the operator's terminal.
+          return jsonError(claimed.reason satisfies ClaimFailure, 400, req.headers.get("accept-encoding"));
+        }
+        audit.record({ action: "pair", device: parsed.label, detail: { label: parsed.label } });
+        // The ONLY time this token exists outside the requesting device. Nothing stores it here.
+        return json({ token: claimed.token, label: parsed.label }, req.headers.get("accept-encoding"));
+      }
+      if (pathname === "/api/devices" && req.method === "GET") {
+        if (!pairing) return text("pairing unavailable", 503);
+        // Read-level, so an unpaired device can still see whether pairing is on and which devices
+        // hold credentials. Labels are the operator's own names for their own phones; the token
+        // hashes never reach this shape (see toDeviceWire).
+        const denied = guard(req, cfg, "read", pairing);
+        if (denied) return denied;
+        const current = pairing.resolve(bearerToken(req.headers))?.label ?? null;
+        return json(
+          { enforced: pairing.enforced(), current, devices: toDeviceWire(pairing.registry(), current) },
+          req.headers.get("accept-encoding"),
+        );
+      }
+      if (pathname === "/api/devices/revoke" && req.method === "POST") {
+        if (!pairing) return text("pairing unavailable", 503);
+        // A write: revoking is exactly as consequential as typing into a terminal, so it needs a
+        // paired device (and the header gate, if configured). Revoking YOURSELF is allowed — that is
+        // how a device un-pairs — and it is the last device leaving that switches enforcement back
+        // off, which is the only way this feature can't strand an operator.
+        const denied = guard(req, cfg, "write", pairing);
+        if (denied) return denied;
+        let body: unknown;
+        try {
+          body = await req.json();
+        } catch {
+          return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+        }
+        // SAFETY: `body` is this handler's own `req.json()` output — a JsonValue by construction;
+        // `normalizeLabel` refuses anything that is not a usable string.
+        const label = normalizeLabel(asJsonRecord(body as JsonValue)?.label);
+        if (label === null) return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+        if (!(await pairing.revoke(label))) {
+          return jsonError("unknown device", 404, req.headers.get("accept-encoding"));
+        }
+        audit.record({ action: "device.revoke", device: whois(req).device, detail: { label } });
+        const current = pairing.resolve(bearerToken(req.headers))?.label ?? null;
+        return json(
+          { enforced: pairing.enforced(), current, devices: toDeviceWire(pairing.registry(), current) },
+          req.headers.get("accept-encoding"),
+        );
+      }
 
       // ── Reserved for a fronting proxy's sign-in page ─────────────────────
       // `/auth/` is the one path the service worker always passes to the network (web/src/lib/
@@ -469,7 +1018,7 @@ export function startupWarnings(cfg: Config): string[] {
 }
 
 async function readPane(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   cfg: Config,
   paneId: string,
   url: URL,
@@ -486,9 +1035,10 @@ async function readPane(
     // have probed, why this read leaves the operator's terminal alone: a `recent` read only harvests
     // an alt-screen pane — scrolling it up and back — in `text` format. `lines` here is whatever the
     // web app asked for (600 for the history view), well past any pane's height, so switching this
-    // to "text" would move someone's screen on every revalidate. See HERDR_API.md → `pane.read`.
-    const read = await herdr.readPane(paneId, "recent", lines, "ansi");
-    const data = paneReadResponse(paneId, read);
+    // to `strip` would move someone's screen on every revalidate — see the adapter's `readGrid`.
+    const read = await herdr.readGrid(paneId, { scope: "recent", lines, styling: "preserve" });
+    if (!read.ok) return text(`${herdr.mux} read failed: ${read.detail}`, 502);
+    const data = paneReadResponse(paneId, read.value);
     // ETag is derived from the serialised body — if content hasn't changed the client gets a 304
     // and skips the whole transfer (the big win on a cellular link).
     const bodyStr = JSON.stringify(data);
@@ -513,16 +1063,16 @@ async function readPane(
       build,
     );
   } catch (err) {
-    return text(`herdr read failed: ${(err as Error).message}`, 502);
+    return text(`${herdr.mux} read failed: ${errorText(err)}`, 502);
   }
 }
 
 /**
- * Map a Herdr pane read to the REST response body. Pure + exported so the `revision` passthrough
+ * Map a multiplexer's grid to the REST response body. Pure + exported so the `revision` passthrough
  * (the client's prompt-select race guard depends on it) is covered by the bridge unit tests without
- * standing up Bun.serve / the socket client.
+ * standing up Bun.serve / a socket.
  */
-export function paneReadResponse(paneId: string, read: PaneRead): PaneReadResponse {
+export function paneReadResponse(paneId: string, read: MuxGrid): PaneReadResponse {
   return { paneId, text: read.text, truncated: read.truncated, revision: read.revision };
 }
 
@@ -531,12 +1081,19 @@ export function paneReadResponse(paneId: string, read: PaneRead): PaneReadRespon
  * `before` is an opaque cursor (a turn's uuid) that only ever reaches an in-memory `findIndex`, so it
  * needs no validation beyond length — it never touches the filesystem.
  */
-export function historyParams(url: URL): { limit: number; before?: string } {
+/** One page request off the query string: a clamped size and an optional opaque cursor. */
+export type HistoryParams = { limit: number; before?: string };
+
+export function historyParams(url: URL): HistoryParams {
   const raw = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
   const limit =
     Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_HISTORY_LIMIT) : DEFAULT_HISTORY_LIMIT;
   const before = url.searchParams.get("before");
-  return { limit, ...(before && before.length <= 100 ? { before } : {}) };
+  const params: HistoryParams = { limit };
+  // Assigned, never conditionally spread: an absent/oversized cursor must leave the key OFF, which
+  // is what the store reads as "newest page".
+  if (before && before.length <= 100) params.before = before;
+  return params;
 }
 
 /**
@@ -577,14 +1134,14 @@ async function paneHistory(
     if (page === null) return unavailable("no-log");
     return json({ paneId, available: true, ...page } satisfies PaneHistoryResponse, accept);
   } catch (err) {
-    return text(`transcript read failed: ${(err as Error).message}`, 502);
+    return text(`transcript read failed: ${errorText(err)}`, 502);
   }
 }
 
-/** Just the two one-shot RPCs a reply needs — real HerdrClient in the bridge, fake in tests. */
+/** Just the two port calls a reply needs — the real adapter in the bridge, a fake in tests. */
 export interface ReplySender {
-  sendPaneText(paneId: string, text: string): Promise<void>;
-  sendPaneKeys(paneId: string, keys: string[]): Promise<void>;
+  typeText(paneId: string, text: string): Promise<MuxAck>;
+  sendKeys(paneId: string, keys: readonly string[]): Promise<MuxAck>;
 }
 
 /** Outcome of the two-step send. `textDelivered` is only meaningful on the failure branch. */
@@ -613,32 +1170,37 @@ export async function sendReplySteps(
   sleep: SleepFn = defaultSleep,
 ): Promise<ReplyOutcome> {
   let textDelivered = false;
+  // One shape for both ways a step can fail — a refusal the adapter returned and an exception it
+  // let escape — so the partial-delivery branch cannot drift between them.
+  const failed = (error: string): ReplyOutcome =>
+    textDelivered && submit
+      ? {
+          // Text is already in the pane — only the submit failed. Tell the operator to check/submit
+          // it by hand rather than resend, and flag textDelivered so a resend-on-error UI holds off.
+          ok: false,
+          textDelivered: true,
+          error: "typed into the pane but not submitted — check the pane before resending",
+        }
+      : { ok: false, textDelivered, error };
   try {
     if (txt) {
-      await client.sendPaneText(paneId, txt);
+      const typed = await client.typeText(paneId, txt);
+      if (!typed.ok) return failed(typed.detail);
       textDelivered = true;
     }
     if (submit) {
       if (txt) await sleep(REPLY_SETTLE_MS);
-      await client.sendPaneKeys(paneId, submitKeys);
+      const sent = await client.sendKeys(paneId, submitKeys);
+      if (!sent.ok) return failed(sent.detail);
     }
     return { ok: true, textDelivered };
   } catch (err) {
-    if (textDelivered && submit) {
-      // Text is already in the pane — only the submit failed. Tell the operator to check/submit it
-      // by hand rather than resend, and flag textDelivered so a resend-on-error UI can hold off.
-      return {
-        ok: false,
-        textDelivered: true,
-        error: "typed into the pane but not submitted — check the pane before resending",
-      };
-    }
-    return { ok: false, textDelivered, error: (err as Error).message };
+    return failed(errorText(err));
   }
 }
 
 export async function replyPane(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   cfg: Config,
   paneId: string,
   req: Request,
@@ -646,16 +1208,26 @@ export async function replyPane(
   device: string | null,
   session: string,
 ): Promise<Response> {
-  let body: { text?: string; submit?: boolean; expected_prompt?: unknown };
+  let body: JsonValue;
   try {
-    body = (await req.json()) as typeof body;
+    // SAFETY: `Request.json()` output IS a JsonValue by construction. Every field is checked below
+    // before it is used — which is the point: the shape this used to be *declared* as was the
+    // client's claim, never a fact.
+    body = (await req.json()) as JsonValue;
   } catch {
     return text("bad body", 400);
   }
-  const expected = expectedPrompt(body);
+  const fields = asJsonRecord(body) ?? {};
+  const expected = expectedPrompt(fields);
   if (!expected.ok) return text("bad expected_prompt", 400);
-  const txt = body.text ?? "";
-  const submit = body.submit ?? true;
+  // `text`/`submit` are CHECKED, not assumed. They used only to be declared string/boolean, so a
+  // body that lied handed a non-string to `pane.send_text` (herdr refused it one layer down) or
+  // made `submit ?? true` follow a truthiness path nobody wrote. A malformed write is refused here,
+  // with nothing typed and nothing submitted.
+  if (fields.text !== undefined && typeof fields.text !== "string") return text("bad text", 400);
+  if (fields.submit !== undefined && typeof fields.submit !== "boolean") return text("bad submit", 400);
+  const txt = fields.text ?? "";
+  const submit = fields.submit ?? true;
   const ae = req.headers.get("accept-encoding");
   const binding = expected.present
     ? await checkPromptBinding(herdr, cfg, paneId, expected.value)
@@ -677,19 +1249,21 @@ export async function replyPane(
     return promptBindingFailure(binding, ae);
   }
   const outcome = await sendReplySteps(herdr, paneId, txt, submit, cfg.submitKeys);
+  const replyDetail: AuditDetail = {
+    text: txt,
+    submit,
+    submitted: outcome.ok,
+    textDelivered: outcome.textDelivered,
+  };
+  // Assigned, never conditionally spread: an unbound reply records no `promptBinding` key.
+  if (binding) replyDetail.promptBinding = binding.audit;
   // Audit the attempt regardless of outcome — text may have landed even when the submit failed.
   audit.record({
     action: "reply",
     paneId,
     session,
     device,
-    detail: {
-      text: txt,
-      submit,
-      submitted: outcome.ok,
-      textDelivered: outcome.textDelivered,
-      ...(binding ? { promptBinding: binding.audit } : {}),
-    },
+    detail: replyDetail,
   });
   if (outcome.ok) return json({ ok: true } satisfies ActionResponse, ae);
   return json(
@@ -699,7 +1273,7 @@ export async function replyPane(
 }
 
 export async function keysPane(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   cfg: Config,
   paneId: string,
   req: Request,
@@ -707,15 +1281,19 @@ export async function keysPane(
   device: string | null,
   session: string,
 ): Promise<Response> {
-  let body: { keys?: unknown; expected_prompt?: unknown };
+  let body: JsonValue;
   try {
-    body = (await req.json()) as typeof body;
+    // SAFETY: `Request.json()` output IS a JsonValue by construction. Every field is checked below
+    // before it is used — which is the point: the shape this used to be *declared* as was the
+    // client's claim, never a fact.
+    body = (await req.json()) as JsonValue;
   } catch {
     return text("bad body", 400);
   }
-  const expected = expectedPrompt(body);
+  const fields = asJsonRecord(body) ?? {};
+  const expected = expectedPrompt(fields);
   if (!expected.ok) return text("bad expected_prompt", 400);
-  const keys = Array.isArray(body.keys) ? body.keys.filter((k): k is string => typeof k === "string") : [];
+  const keys = Array.isArray(fields.keys) ? fields.keys.filter((k): k is string => typeof k === "string") : [];
   if (keys.length === 0) return text("no keys", 400);
   const ae = req.headers.get("accept-encoding");
   const binding = expected.present
@@ -731,28 +1309,30 @@ export async function keysPane(
     });
     return promptBindingFailure(binding, ae);
   }
-  try {
-    await herdr.sendPaneKeys(paneId, keys);
+  const keysDetail: AuditDetail = { keys };
+  // Assigned, never conditionally spread: an unbound send records no `promptBinding` key.
+  if (binding) keysDetail.promptBinding = binding.audit;
+  const sent = await herdr.sendKeys(paneId, keys);
+  if (sent.ok) {
     audit.record({
       action: "keys",
       paneId,
       session,
       device,
-      detail: { keys, ...(binding ? { promptBinding: binding.audit } : {}) },
+      detail: keysDetail,
     });
     return json({ ok: true } satisfies ActionResponse, ae);
-  } catch (err) {
-    if (binding) {
-      audit.record({
-        action: "keys",
-        paneId,
-        session,
-        device,
-        detail: { keys, sent: false, promptBinding: binding.audit },
-      });
-    }
-    return json({ ok: false, error: (err as Error).message } satisfies ActionResponse, ae);
   }
+  if (binding) {
+    audit.record({
+      action: "keys",
+      paneId,
+      session,
+      device,
+      detail: { keys, sent: false, promptBinding: binding.audit },
+    });
+  }
+  return json({ ok: false, error: sent.detail } satisfies ActionResponse, ae);
 }
 
 type ExpectedPrompt =
@@ -760,11 +1340,11 @@ type ExpectedPrompt =
   | { ok: true; present: true; value: string }
   | { ok: false };
 
-function expectedPrompt(body: object): ExpectedPrompt {
+function expectedPrompt(body: JsonObject): ExpectedPrompt {
   if (!Object.prototype.hasOwnProperty.call(body, "expected_prompt")) {
     return { ok: true, present: false };
   }
-  const value = (body as { expected_prompt?: unknown }).expected_prompt;
+  const value = body.expected_prompt;
   if (typeof value !== "string" || value.length > MAX_EXPECTED_PROMPT_CHARS) {
     return { ok: false };
   }
@@ -789,17 +1369,34 @@ type PromptBindingCheck =
       };
     };
 
+/**
+ * The binding check's "the read didn't happen" answer, for both ways it can not happen — a refusal
+ * the adapter returned and an exception it let escape. One shape, one wording, one audit reason.
+ */
+function readFailed(
+  herdr: MuxAdapter,
+  expected: string,
+  detail: string,
+): Extract<PromptBindingCheck, { ok: false }> {
+  return {
+    ok: false,
+    error: `${herdr.mux} read failed: ${detail}`,
+    status: 502,
+    audit: { checked: true, passed: false, expected, reason: "read_failed" },
+  };
+}
+
 // There is deliberately no expected_blocked flag. agent_status is not carried by pane.read, only by
 // session.snapshot, so checking it would cost a second RPC before the write and widen the very
 // window this feature exists to shrink. The region check already subsumes it: if the exact prompt
 // text is still on screen, that prompt is still what the pane is showing.
 async function checkPromptBinding(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   cfg: Config,
   paneId: string,
   expected: string,
 ): Promise<PromptBindingCheck> {
-  let fresh: PaneRead;
+  let fresh: MuxGrid;
   try {
     const expectedRawLines = expected.split(/\r\n?|\n/).length;
     const bindingReadLines = Math.min(
@@ -809,18 +1406,19 @@ async function checkPromptBinding(
         expectedRawLines + DEFAULT_PROMPT_TAIL_LINES + PROMPT_BINDING_BLANK_LINE_HEADROOM,
       ),
     );
-    // Keep this coupled to readPane(): use its recent source and ANSI format so the bridge verifies
-    // the same kind of pane data the GET handler serves. The line count deliberately does not follow
-    // cfg.readLines alone because a small legal setting may not contain the expected region; include
-    // room for the accepted tail and for blank separator lines that normalization drops.
-    fresh = await herdr.readPane(paneId, "recent", bindingReadLines, "ansi");
+    // Keep this coupled to readPane(): use its recent scope and preserved styling so the bridge
+    // verifies the same kind of pane data the GET handler serves. The line count deliberately does
+    // not follow cfg.readLines alone because a small legal setting may not contain the expected
+    // region; include room for the accepted tail and for blank separator lines normalization drops.
+    const read = await herdr.readGrid(paneId, {
+      scope: "recent",
+      lines: bindingReadLines,
+      styling: "preserve",
+    });
+    if (!read.ok) return readFailed(herdr, expected, read.detail);
+    fresh = read.value;
   } catch (err) {
-    return {
-      ok: false,
-      error: `herdr read failed: ${(err as Error).message}`,
-      status: 502,
-      audit: { checked: true, passed: false, expected, reason: "read_failed" },
-    };
+    return readFailed(herdr, expected, errorText(err));
   }
 
   const result = verifyExpectedPrompt(fresh.text, expected);
@@ -847,12 +1445,11 @@ function promptBindingFailure(
   result: Extract<PromptBindingCheck, { ok: false }>,
   acceptEncoding: string | null,
 ): Response {
+  const failure: ActionResponse = { ok: false, error: result.error };
+  // Assigned, never conditionally spread: a refusal with no machine-readable code carries no key.
+  if (result.code) failure.code = result.code;
   return json(
-    {
-      ok: false,
-      error: result.error,
-      ...(result.code ? { code: result.code } : {}),
-    } satisfies ActionResponse,
+    failure,
     acceptEncoding,
     result.status,
   );
@@ -861,7 +1458,7 @@ function promptBindingFailure(
 // Close a pane ("kill the agent"). Structural op — strictly less powerful than the text/keys
 // injection the bridge already allows, so it stays within the existing remote-shell threat model.
 async function closePane(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   paneId: string,
   req: Request,
   audit: AuditLog,
@@ -869,13 +1466,10 @@ async function closePane(
   session: string,
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
-  try {
-    await herdr.closePane(paneId);
-    audit.record({ action: "pane.close", paneId, session, device, detail: {} });
-    return json({ ok: true } satisfies ActionResponse, ae);
-  } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies ActionResponse, ae);
-  }
+  const closed = await herdr.closePane(paneId);
+  if (!closed.ok) return json({ ok: false, error: closed.detail } satisfies ActionResponse, ae);
+  audit.record({ action: "pane.close", paneId, session, device, detail: {} });
+  return json({ ok: true } satisfies ActionResponse, ae);
 }
 
 // Set or clear a pane's label. Structural metadata op — strictly less powerful than the text/keys
@@ -883,7 +1477,7 @@ async function closePane(
 // The body's `label` must be a string or null; a blank string clears (so a user can wipe a label by
 // saving an empty field), which we send to Herdr as `label: null`.
 async function renamePane(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   paneId: string,
   req: Request,
   audit: AuditLog,
@@ -891,22 +1485,23 @@ async function renamePane(
   session: string,
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
-  let body: { label?: unknown };
+  let body: JsonValue;
   try {
-    body = (await req.json()) as typeof body;
+    // SAFETY: `Request.json()` output IS a JsonValue by construction. Every field is checked below
+    // before it is used — which is the point: the shape this used to be *declared* as was the
+    // client's claim, never a fact.
+    body = (await req.json()) as JsonValue;
   } catch {
     return text("bad body", 400);
   }
-  if (body.label !== null && typeof body.label !== "string") return text("bad label", 400);
-  const trimmed = typeof body.label === "string" ? body.label.trim() : "";
+  const fields = asJsonRecord(body) ?? {};
+  if (fields.label !== null && typeof fields.label !== "string") return text("bad label", 400);
+  const trimmed = typeof fields.label === "string" ? fields.label.trim() : "";
   const label = trimmed.length > 0 ? trimmed : null;
-  try {
-    await herdr.renamePane(paneId, label);
-    audit.record({ action: "pane.rename", paneId, session, device, detail: { label } });
-    return json({ ok: true } satisfies ActionResponse, ae);
-  } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies ActionResponse, ae);
-  }
+  const renamed = await herdr.renamePane(paneId, label);
+  if (!renamed.ok) return json({ ok: false, error: renamed.detail } satisfies ActionResponse, ae);
+  audit.record({ action: "pane.rename", paneId, session, device, detail: { label } });
+  return json({ ok: true } satisfies ActionResponse, ae);
 }
 
 /**
@@ -917,7 +1512,7 @@ async function renamePane(
  * Pure + exported so the rule is unit-testable without standing up Bun.serve.
  */
 export function normalizeTabLabel(
-  v: unknown,
+  v: JsonValue | undefined,
 ): { ok: true; label: string } | { ok: false; error: string } {
   if (typeof v !== "string") return { ok: false, error: "bad label" };
   const label = v.trim();
@@ -929,7 +1524,7 @@ export function normalizeTabLabel(
 // bridge already allows, so it stays within the existing remote-shell threat model. A tab has no
 // "clear" (see normalizeTabLabel): a blank label is a 400, not a reset to the tab number.
 async function renameTab(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   tabId: string,
   req: Request,
   audit: AuditLog,
@@ -937,21 +1532,21 @@ async function renameTab(
   session: string,
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
-  let body: { label?: unknown };
+  let body: JsonValue;
   try {
-    body = (await req.json()) as typeof body;
+    // SAFETY: `Request.json()` output IS a JsonValue by construction. Every field is checked below
+    // before it is used — which is the point: the shape this used to be *declared* as was the
+    // client's claim, never a fact.
+    body = (await req.json()) as JsonValue;
   } catch {
     return text("bad body", 400);
   }
-  const parsed = normalizeTabLabel(body.label);
+  const parsed = normalizeTabLabel(asJsonRecord(body)?.label);
   if (!parsed.ok) return text(parsed.error, 400);
-  try {
-    await herdr.renameTab(tabId, parsed.label);
-    audit.record({ action: "tab.rename", session, device, detail: { tabId, label: parsed.label } });
-    return json({ ok: true } satisfies ActionResponse, ae);
-  } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies ActionResponse, ae);
-  }
+  const renamed = await herdr.renameTab(tabId, parsed.label);
+  if (!renamed.ok) return json({ ok: false, error: renamed.detail } satisfies ActionResponse, ae);
+  audit.record({ action: "tab.rename", session, device, detail: { tabId, label: parsed.label } });
+  return json({ ok: true } satisfies ActionResponse, ae);
 }
 
 // Close a tab, killing every pane inside it (live-verified 2026-07-19: the tab's panes disappear with
@@ -959,7 +1554,7 @@ async function renameTab(
 // the bridge already allows via pane.close — so it stays within the existing remote-shell threat
 // model. No body: the tab id is in the path.
 async function closeTab(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   tabId: string,
   req: Request,
   audit: AuditLog,
@@ -967,96 +1562,111 @@ async function closeTab(
   session: string,
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
-  try {
-    await herdr.closeTab(tabId);
-    audit.record({ action: "tab.close", session, device, detail: { tabId } });
-    return json({ ok: true } satisfies ActionResponse, ae);
-  } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies ActionResponse, ae);
-  }
+  const closed = await herdr.closeTab(tabId);
+  if (!closed.ok) return json({ ok: false, error: closed.detail } satisfies ActionResponse, ae);
+  audit.record({ action: "tab.close", session, device, detail: { tabId } });
+  return json({ ok: true } satisfies ActionResponse, ae);
 }
 
 // Create a new tab in a workspace, opening a fresh shell pane (you then launch your own agent in
 // it). Structural — no more privilege than typing into an existing pane (you can already spawn a
 // shell that way). `cwd` omitted => inherits the workspace dir. session.* stays unexposed.
 async function createTab(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   engine: StateEngine,
   req: Request,
   audit: AuditLog,
   device: string | null,
   session: string,
 ): Promise<Response> {
-  let body: { workspaceId?: string; label?: string; cwd?: string };
+  let body: JsonValue;
   try {
-    body = (await req.json()) as typeof body;
+    // SAFETY: `Request.json()` output IS a JsonValue by construction. Every field is checked below
+    // before it is used — which is the point: the shape this used to be *declared* as was the
+    // client's claim, never a fact.
+    body = (await req.json()) as JsonValue;
   } catch {
     return text("bad body", 400);
   }
-  const workspaceId = body.workspaceId?.trim();
+  const fields = asJsonRecord(body) ?? {};
+  // Each field is CHECKED rather than declared: a non-string `workspaceId` used to reach `.trim()`
+  // and throw a TypeError out of the handler.
+  const workspaceId = typeof fields.workspaceId === "string" ? fields.workspaceId.trim() : undefined;
+  const tabLabel = typeof fields.label === "string" ? fields.label : undefined;
+  const cwd = typeof fields.cwd === "string" ? fields.cwd : undefined;
   const ae = req.headers.get("accept-encoding");
   if (!workspaceId) return json({ ok: false, error: "workspaceId required" } satisfies CreateResponse, ae);
-  try {
-    const created = await herdr.createTab(workspaceId, { label: body.label, cwd: body.cwd });
-    const label =
-      engine.current().workspaces.find((w) => w.workspaceId === created.workspaceId)?.label ??
-      created.workspaceId;
-    audit.record({
-      action: "tab.create",
+  const outcome = await herdr.createTab({ spaceId: workspaceId, label: tabLabel, cwd });
+  if (!outcome.ok) return json({ ok: false, error: outcome.detail } satisfies CreateResponse, ae);
+  const created = outcome.value;
+  // The adapter answers with the space id when the create call doesn't carry a label back; the
+  // snapshot we already hold knows the real one, and that lookup is cheaper than a round trip.
+  const workspaceLabel =
+    engine.current().workspaces.find((w) => w.workspaceId === created.spaceId)?.label ??
+    created.spaceLabel;
+  audit.record({
+    action: "tab.create",
+    paneId: created.paneId,
+    session,
+    device,
+    detail: { workspaceId, label: tabLabel, cwd },
+  });
+  return json({
+    ok: true,
+    pane: {
       paneId: created.paneId,
-      session,
-      device,
-      detail: { workspaceId, label: body.label, cwd: body.cwd },
-    });
-    return json({
-      ok: true,
-      pane: { ...created, workspaceLabel: label },
-    } satisfies CreateResponse, ae);
-  } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies CreateResponse, ae);
-  }
+      workspaceId: created.spaceId,
+      workspaceLabel,
+      tabId: created.tabId,
+      cwd: created.cwd,
+    },
+  } satisfies CreateResponse, ae);
 }
 
 // Create a new workspace ("space") with a fresh shell pane. `cwd` defaults to the user's home dir
 // when the client doesn't specify one (typing a path on a phone is painful) — it's a shell, so you
 // can cd from there. Same structural-only threat model as createTab.
 async function createWorkspace(
-  herdr: HerdrClient,
+  herdr: MuxAdapter,
   req: Request,
   audit: AuditLog,
   device: string | null,
   session: string,
 ): Promise<Response> {
-  let body: { cwd?: string; label?: string };
+  let body: JsonValue;
   try {
-    body = (await req.json()) as typeof body;
+    // SAFETY: `Request.json()` output IS a JsonValue by construction. Every field is checked below
+    // before it is used — which is the point: the shape this used to be *declared* as was the
+    // client's claim, never a fact.
+    body = (await req.json()) as JsonValue;
   } catch {
     return text("bad body", 400);
   }
-  const cwd = body.cwd?.trim() || homedir();
+  const fields = asJsonRecord(body) ?? {};
+  // Checked, not declared — see createTab.
+  const cwd = (typeof fields.cwd === "string" ? fields.cwd.trim() : "") || homedir();
+  const label = typeof fields.label === "string" ? fields.label : undefined;
   const ae = req.headers.get("accept-encoding");
-  try {
-    const created = await herdr.createWorkspace({ cwd, label: body.label });
-    audit.record({
-      action: "workspace.create",
+  const outcome = await herdr.createSpace({ cwd, label });
+  if (!outcome.ok) return json({ ok: false, error: outcome.detail } satisfies CreateResponse, ae);
+  const created = outcome.value;
+  audit.record({
+    action: "workspace.create",
+    paneId: created.paneId,
+    session,
+    device,
+    detail: { label, cwd },
+  });
+  return json({
+    ok: true,
+    pane: {
       paneId: created.paneId,
-      session,
-      device,
-      detail: { label: body.label, cwd },
-    });
-    return json({
-      ok: true,
-      pane: {
-        paneId: created.paneId,
-        workspaceId: created.workspaceId,
-        workspaceLabel: created.workspaceLabel ?? created.workspaceId,
-        tabId: created.tabId,
-        cwd: created.cwd,
-      },
-    } satisfies CreateResponse, ae);
-  } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies CreateResponse, ae);
-  }
+      workspaceId: created.spaceId,
+      workspaceLabel: created.spaceLabel,
+      tabId: created.tabId,
+      cwd: created.cwd,
+    },
+  } satisfies CreateResponse, ae);
 }
 
 // Save an uploaded image to a host file and return its absolute path. The client then references
@@ -1074,8 +1684,7 @@ async function uploadPane(
   // Reject an oversize upload by its declared Content-Length BEFORE buffering — req.formData()
   // reads the whole body into memory first, so a 100 MB "image" would be materialised just to fail
   // the size check below. Multipart adds a boundary + part headers, so allow a small slack.
-  const declared = Number(req.headers.get("content-length"));
-  if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES + MAX_UPLOAD_OVERHEAD) {
+  if (uploadTooLarge(req.headers.get("content-length"))) {
     return secure(
       new Response(
         JSON.stringify({
@@ -1096,7 +1705,7 @@ async function uploadPane(
   if (!(file instanceof File)) {
     return json({ ok: false, error: "no file" } satisfies UploadResponse, ae);
   }
-  const ext = IMAGE_EXT[file.type];
+  const ext = IMAGE_EXT.get(file.type);
   if (!ext) {
     return json({ ok: false, error: `unsupported type: ${file.type || "unknown"}` } satisfies UploadResponse, ae);
   }
@@ -1121,7 +1730,7 @@ async function uploadPane(
     });
     return json({ ok: true, path: fullPath } satisfies UploadResponse, ae);
   } catch (err) {
-    return json({ ok: false, error: (err as Error).message } satisfies UploadResponse, ae);
+    return json({ ok: false, error: errorText(err) } satisfies UploadResponse, ae);
   }
 }
 
@@ -1210,13 +1819,58 @@ export function isHostAllowed(host: string, cfg: Config): boolean {
  * Exported for tests: {@link deviceAuth} being correct in isolation proves nothing if this wiring
  * regresses, and the write/read asymmetry below is exactly what a device gate stands or falls on.
  */
-export function guard(req: Request, cfg: Config, level: "read" | "write"): Response | null {
+export function guard(
+  req: Request,
+  cfg: Config,
+  level: "read" | "write",
+  pairing?: PairingGate,
+): Response | null {
   const gate = checkAccess(req, cfg, level);
   if (!gate.ok) return text(gate.reason, 403);
-  if (level === "write" && !deviceAuth(req, cfg).authorized) {
-    return text("device not authorised", 403);
+  if (level !== "write") return null;
+  if (!deviceAuth(req, cfg).authorized) return text("device not authorised", 403);
+  // The second, independent write factor. Distinct refusal text on purpose: "not authorised" is the
+  // operator's proxy allowlist, "not paired" is this device's own missing credential, and the two
+  // are fixed in completely different places.
+  if (pairing !== undefined && pairing.enforced() && pairing.resolve(bearerToken(req.headers)) === null) {
+    return text("device not paired", 403);
   }
   return null;
+}
+
+/**
+ * The bridge's dependency on {@link PairingStore}, structurally: two synchronous questions asked on
+ * the request path. Named here rather than importing the class so the gate wiring below states
+ * exactly what it needs — and so a test can pass a two-line object.
+ */
+export interface PairingGate {
+  /** Whether a bearer token is required for writes (i.e. at least one device is paired). */
+  enforced(): boolean;
+  /** The device this token belongs to, or null. */
+  resolve(token: string | null): { label: string } | null;
+}
+
+/**
+ * Who this request is, across BOTH device gates — the value that lands in the audit log and in the
+ * snapshot's `device` field.
+ *
+ * A pairing label is preferred over the header name because it is the stronger claim: the label was
+ * chosen by someone holding a code the operator read off a terminal, whereas the header is whatever
+ * the proxy asserts. When pairing is off this returns exactly what {@link deviceAuth} always did, so
+ * a deployment that never pairs anything sees no change at all — including the `device` field's
+ * absence from the snapshot.
+ */
+export function requestDevice(req: Request, cfg: Config, pairing?: PairingGate): DeviceAuth {
+  const header = deviceAuth(req, cfg);
+  if (pairing === undefined || !pairing.enforced()) return header;
+  const paired = pairing.resolve(bearerToken(req.headers));
+  return {
+    enforced: true,
+    device: paired?.label ?? header.device,
+    // Both gates apply, so authorisation is their conjunction — an allowlisted header on an unpaired
+    // device is still read-only, and vice versa.
+    authorized: header.authorized && paired !== null,
+  };
 }
 
 /**
@@ -1263,7 +1917,7 @@ function secure(res: Response): Response {
   return res;
 }
 
-function json(data: unknown, acceptEncoding: string | null, status = 200): Response {
+function json<TBody>(data: TBody, acceptEncoding: string | null, status = 200): Response {
   const response = gzipJsonResponse(data, acceptEncoding);
   if (status === 200) return secure(response);
   return secure(new Response(response.body, { status, headers: response.headers }));
@@ -1283,8 +1937,72 @@ function jsonError(message: string, status: number, _acceptEncoding: string | nu
   );
 }
 
+/** The message of a thrown value, without assuming the `catch` handed us an Error. */
+function errorText<T>(err: T): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** The headers {@link serveStatic} composes. `.html` and `sw.js` each add one more. */
+type StaticHeaders = {
+  "content-type": string;
+  "cache-control": string;
+  "content-security-policy"?: string;
+  "service-worker-allowed"?: string;
+} & Record<string, string>;
+
 function text(body: string, status: number): Response {
   return secure(new Response(body, { status }));
+}
+
+/**
+ * Validate an untrusted `/api/pair` body. Both fields must be present strings; the label is bounded
+ * and flattened by {@link normalizeLabel} (it is echoed into the audit log and the UI), and the code
+ * is only length-bounded here — its actual verification is a constant-time hash compare, and telling
+ * a caller "that isn't even code-shaped" would be a free oracle. Pure + exported because the handler
+ * lives inside `Bun.serve`, which `bun test` cannot stand up (CLAUDE.md).
+ */
+/** The record inside a parsed JSON body, or null when the body isn't one (a scalar, an array). */
+function asJsonRecord(value: JsonValue | undefined): JsonObject | null {
+  if (value === null || value === undefined || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+
+/** A `/api/pair/claim` body, once it is one. */
+type PairRequest = { code: string; label: string };
+
+/**
+ * Validate an untrusted /api/notifications/snooze body's `snoozedUntil`.
+ *
+ * ABSENCE IS NOT `null`, and the difference is the whole contract: an explicit `null` CLEARS the
+ * snooze, while an omitted field is a malformed request (400) — collapsing the two would let an
+ * empty body silently unmute every session's notifications. A number is a deadline in epoch ms and
+ * is passed through unjudged; `Snooze.set` already treats a past one as "not muted".
+ *
+ * Pure + exported because the handler lives inside `Bun.serve`, which `bun test` cannot stand up
+ * (CLAUDE.md) — same reason as {@link parsePairRequest} and {@link parseNotifyPrefsPatch}.
+ */
+export function parseSnoozeRequest(v: JsonValue | undefined): SnoozeRequest {
+  const record = asJsonRecord(v);
+  // A body that is not an object at all has no field to read, so it lands on the same refusal an
+  // omitted field does (and never on a property access against `null`, which used to throw).
+  const until = record === null ? undefined : record.snoozedUntil;
+  if (until === null) return { ok: true, until: null };
+  if (typeof until !== "number") return { ok: false };
+  return { ok: true, until };
+}
+
+/** {@link parseSnoozeRequest}'s answer. `until: null` is the explicit clear. */
+export type SnoozeRequest = { ok: true; until: number | null } | { ok: false };
+
+export function parsePairRequest(v: JsonValue | undefined): PairRequest | null {
+  const o = asJsonRecord(v);
+  if (o === null) return null;
+  if (typeof o.code !== "string" || o.code.length === 0 || o.code.length > 64) return null;
+  const label = normalizeLabel(o.label);
+  if (label === null) return null;
+  return { code: o.code, label };
 }
 
 /**
@@ -1293,27 +2011,27 @@ function text(body: string, status: number): Response {
  * → 400). Unknown keys are ignored. An empty patch is valid (a no-op that echoes current prefs).
  * Pure + exported so the validation is unit-testable without Bun.serve.
  */
-export function parseNotifyPrefsPatch(v: unknown): Partial<NotifyPrefs> | null {
-  if (typeof v !== "object" || v === null) return null;
-  const o = v as Record<string, unknown>;
+export function parseNotifyPrefsPatch(v: JsonValue | undefined): Partial<NotifyPrefs> | null {
+  const o = asJsonRecord(v);
+  if (o === null) return null;
   const patch: Partial<NotifyPrefs> = {};
   for (const key of ["blocked", "done", "updates"] as const) {
     if (!(key in o)) continue;
-    if (typeof o[key] !== "boolean") return null;
-    patch[key] = o[key] as boolean;
+    const value = o[key];
+    if (typeof value !== "boolean") return null;
+    patch[key] = value;
   }
   return patch;
 }
 
 // Shape-check an untrusted /api/subscribe body before persisting it (a malformed sub would be
 // stored keyed on `undefined` and silently never fire).
-function isPushSubscription(v: unknown): v is PushSubscription {
-  if (typeof v !== "object" || v === null) return false;
-  const o = v as Record<string, unknown>;
-  const keys = o.keys as Record<string, unknown> | undefined;
+function isPushSubscription(v: JsonValue | undefined): v is JsonValue & PushSubscription {
+  const o = asJsonRecord(v);
+  if (o === null) return false;
+  const keys = asJsonRecord(o.keys);
   return (
     typeof o.endpoint === "string" &&
-    typeof keys === "object" &&
     keys !== null &&
     typeof keys.p256dh === "string" &&
     typeof keys.auth === "string"
@@ -1328,8 +2046,8 @@ function isPushSubscription(v: unknown): v is PushSubscription {
  * stored, and a client that got this field wrong would otherwise lose push entirely over a
  * housekeeping hint. The cap is only there so a junk field can't be persisted at length.
  */
-function supersededEndpoint(body: unknown): string | undefined {
-  const replaces = (body as { replaces?: unknown }).replaces;
+function supersededEndpoint(body: JsonValue | undefined): string | undefined {
+  const replaces = asJsonRecord(body)?.replaces;
   if (typeof replaces !== "string" || replaces === "" || replaces.length > 2048) return undefined;
   return replaces;
 }
@@ -1343,6 +2061,8 @@ async function buildId(): Promise<string> {
     const f = Bun.file(join(WEB_DIR, "build-info.json"));
     const mtime = f.lastModified;
     if (!buildCache || buildCache.mtime !== mtime) {
+      // SAFETY: `build-info.json` is written by this repo's own Vite build, next to the bundle it
+      // stamps; a missing/garbled file lands in the `catch` below and reads as "unknown".
       const data = (await f.json()) as { id?: string };
       buildCache = { id: data.id ?? "unknown", mtime };
     }
@@ -1481,8 +2201,8 @@ async function serveStatic(pathname: string): Promise<Response> {
   }
 
   const ext = extname(full);
-  const headers: Record<string, string> = {
-    "content-type": CONTENT_TYPES[ext] ?? "application/octet-stream",
+  const headers: StaticHeaders = {
+    "content-type": CONTENT_TYPES.get(ext) ?? "application/octet-stream",
     [BUILD_HEADER]: await buildId(), // which bundle the server is serving (vs the client's stamp)
     "cache-control": cacheControlFor(rel),
   };

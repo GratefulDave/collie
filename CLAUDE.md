@@ -6,7 +6,8 @@ talks to Herdr's Unix socket, letting you monitor and reply to agents from a pho
 plugin id is `herdr.collie` (manifest: `herdr-plugin.toml`). Orientation:
 [`README.md`](./README.md) · [`ARCHITECTURE.md`](./ARCHITECTURE.md) · verified API
 [`HERDR_API.md`](./HERDR_API.md) · decisions [`.adr/`](./.adr/) · adding a harness
-[`HARNESS_CONTRIBUTING.md`](./HARNESS_CONTRIBUTING.md).
+[`HARNESS_CONTRIBUTING.md`](./HARNESS_CONTRIBUTING.md) · adding a multiplexer
+[`MUX_CONTRIBUTING.md`](./MUX_CONTRIBUTING.md).
 
 ## Decision records — read before reopening a settled question
 
@@ -60,11 +61,12 @@ a fork PR does carry a release commit, cherry-pick the functional commits with `
 Doc-only changes (`*.md`) don't need a bump. This is enforced two ways, but **you are the first
 line — do it as part of the change, not after**:
 
-- `scripts/check-version.sh` runs inside `scripts/collie-ctl.sh build` (a release can't build while
-  versions disagree).
+- `scripts/check-version.sh` runs inside `collie build` (a release can't build while versions
+  disagree).
 - A **git pre-commit hook** (`scripts/git-hooks/pre-commit`, activate once with
   `scripts/install-hooks.sh`) blocks commits where functional code changed but the version didn't.
-  Escape hatch for a single commit: `SKIP_VERSION_CHECK=1 git commit …`.
+  Escape hatch for a single commit: `SKIP_VERSION_CHECK=1 git commit …` (every `SKIP_*` hatch is
+  listed under *Linting* below).
 
 **Tag the release when you push it.** Cutting a release means the three version files + the newest
 `CHANGELOG.md` heading agree on `x.y.z` (steps 1–3). When that release lands on `main` and you push,
@@ -77,11 +79,21 @@ a doc-only change and needs no version bump.)
 page and shows the command to run. Pushing a `v*` tag auto-creates that GitHub Release (with the
 commands) via `.github/workflows/release.yml`. **Always express user-facing update/restart
 instructions as Herdr plugin actions** — `herdr plugin action invoke update --plugin herdr.collie`
-(or `restart`) — never `collie-ctl.sh …` / `systemctl … collie`, which depend on the caller's cwd and
+(or `restart`) — never `bin/collie …` / `systemctl … collie`, which depend on the caller's cwd and
 the unit name; the Herdr action runs from anywhere.
 
 ## Build / run (operational facts that are easy to forget)
 
+- **Every verb is spelled `bin/collie <verb>`** and implemented once, in `cli/`.
+  `scripts/collie-ctl.sh <verb>` is a bootstrap shim that compiles the binary when the checkout has
+  none and `exec`s it — it implements nothing, and its path is frozen because Herdr <0.8.0 invokes
+  the action set cached at install time
+  ([ADR 0006](./.adr/0006-update-advances-the-checkout-herdr-installed.md)). Teach the binary; don't
+  add logic to the shim.
+- **`collie link` publishes `~/.local/bin/collie` as a SYMLINK to the checkout's binary** — never a
+  copy, never a wrapper script, and never as a side effect of `build`/`update`
+  ([ADR 0021](./.adr/0021-the-path-name-is-a-pointer-never-a-copy.md)). `unlink` removes that name
+  only when it points at this checkout.
 - **There are two checkout shapes, and `update` handles both.** `herdr plugin install` does not clone
   — it leaves a **detached, shallow** checkout, so `git pull` cannot run there; a linked clone sits on
   a branch. One predicate (`git symbolic-ref -q HEAD`) picks the strategy, and the same predicate
@@ -93,15 +105,20 @@ the unit name; the Herdr action runs from anywhere.
   a rebuild is **immediately live — no restart**.
 - **Backend changes** (`bridge/*.ts`): Bun does **not** hot-reload the service — you must
   `systemctl --user restart collie`. Forgetting this is the #1 "my change didn't take" trap.
-- `bun run build` (root) and `collie-ctl.sh build` **typecheck both sides first** (root tsc + web
-  tsc), then build web to `dist-staging` and swap it in atomically — a failed build never empties a
-  live `web/dist`. Bare `cd web && bun run build` still skips typechecking; don't ship from it.
+- `bun run build` (root) is now **one definition**: it runs `collie build`, which gates on
+  `scripts/check-version.sh`, installs both trees, **lints the full tree**, **typechecks both
+  sides** (root tsc + web tsc),
+  compiles `bin/collie`, builds web to `dist-staging`, and swaps both artifacts in **last** — a
+  failed build never empties a live `web/dist` and never replaces the running binary. The binary is
+  always renamed into place, never written through (the running service keeps its old inode until
+  it restarts). Bare `cd web && bun run build` skips all of that; don't ship from it.
 - **Tests:** frontend `cd web && bun run test` (Vitest + jsdom + Testing Library + MSW; no headless
   browser); backend `bun run test` at the root — Bun's own runner over every pure-logic module in
   `bridge/` (access checks, state engine, config, journal adapters, notifications, uploads, …) plus
-  `scripts/collie-ctl.test.sh`, which exercises the ctl lifecycle in a sandboxed HOME.
+  `scripts/collie-cli.test.sh`, which drives every verb of the compiled binary in a sandboxed HOME,
+  and `scripts/collie-ctl.test.sh`, which pins the shim's delegation and bootstrap.
   A **pre-push hook** (`scripts/git-hooks/pre-push`) runs **both** before
-  every push — override once with `SKIP_TESTS=1 git push`. The bits that genuinely need `Bun.serve` /
+  every push — override once with `SKIP_TESTS=1 git push` (see *Linting* → escape hatches). The bits that genuinely need `Bun.serve` /
   `Bun.connect` (HTTP handlers, the socket client) stay unit-untested — Vitest-on-Node can't run them,
   so keep new backend logic pure/injectable enough for `bun test`, or exercise it through `web/`.
 - Service: `systemd --user` unit `collie` on the deployment host; logs `journalctl --user -u collie -f`.
@@ -113,6 +130,47 @@ the unit name; the Herdr action runs from anywhere.
   enforces `verbatimModuleSyntax` + `erasableSyntaxOnly` (use `import type`, no parameter-property
   shorthand there). The **bridge** tsconfig does not enable those two — bridge code uses
   parameter-property shorthand by convention; keep each side consistent with itself.
+
+## Linting — one linter, one config
+
+- **oxlint is the linter and `bun run lint` is how you run it** — oxlint's own
+  correctness/suspicious/perf catalog plus all 15 rules of the vendored
+  [anti-slop](./tools/oxlint/README.md) plugin, at `error`. Don't add ESLint or biome
+  ([ADR 0019](./.adr/0019-oxlint-and-vendored-anti-slop-are-the-lint-gate.md)).
+- **One config, `.oxlintrc.json` at the root** — the editor, the PostToolUse hook, pre-commit,
+  `collie build` and CI all shell out to it with no flags of their own. `web/` has no lint script;
+  the root config already covers `web/src`. Only the **full-tree** runs (`collie build`, CI) define
+  "passing".
+- **A finding is fixed in the code, never suppressed and never cleared by downgrading a rule.**
+  There are zero `oxlint-disable` comments in the tree and that is the policy. A `// SAFETY:`
+  comment must state the invariant that makes the assertion sound — "safe, trust me" clears the
+  rule and fails review.
+- **Changing what's enforced goes through the rationale table in
+  [ADR 0019](./.adr/0019-oxlint-and-vendored-anti-slop-are-the-lint-gate.md)**, which also holds the
+  fix-shapes for the rules you'll trip most and the reasoning for the scoped `no-runtime-typeof`
+  parse-boundary overrides. Per-rule reasons live as comments at the rule in `.oxlintrc.json`.
+- **Don't edit `tools/oxlint/anti-slop/`** — it's a vendored copy, overwritten at the next
+  re-vendor. Re-pinning upstream is the maintainer's deliberate act, and the diff gets a human
+  read: vendored code is copied, not installed, so the 7-day dependency age gate never sees it.
+- **`overrides.files` globs match the full path** — a glob must start with `**/` or it silently
+  matches nothing. Verify any new one with a planted violation in-scope and a negative control out.
+
+### Escape hatches (all of them, in one place)
+
+Each guard has its own name on its own surface, so skipping one never disarms another. Use one for
+a single command; never export one.
+
+| variable | surface | skips |
+| --- | --- | --- |
+| `SKIP_VERSION_CHECK=1` | `git commit` (pre-commit hook) | the version-consistency + bump-on-change guard |
+| `SKIP_LINT_CHECK=1` | `git commit` (pre-commit hook) | oxlint over the staged files |
+| `SKIP_PACK_WIRE_CHECK=1` | `git commit` (pre-commit hook) | the pack-wire decision guard |
+| `SKIP_LINT=1` | `bun run build` / `collie build` | the full-tree lint step |
+| `SKIP_TYPECHECK=1` | `bun run build` / `collie build` | both typecheck steps |
+| `SKIP_TESTS=1` | `git push` (pre-push hook) | both test suites |
+
+The pre-commit hook's three guards are **independent** — `SKIP_VERSION_CHECK=1` does not disarm the
+lint guard or the pack-wire guard.
 
 ## Frontend data layer (React Router, not TanStack)
 
@@ -196,6 +254,9 @@ the unit name; the Herdr action runs from anywhere.
   by the row count. Size it up if a real statusline needs more rows; don't delete it, and don't credit
   it with protection it doesn't provide
   ([ADR 0004](./.adr/0004-the-statusline-run-is-bounded.md)). `chrome.test.ts` pins both halves.
+- **The Herdr socket is never dialled across a machine boundary, and no Herdr vocabulary crosses a
+  pack link** — the lead consumes a peer's Collie API, never its Herdr socket
+  ([ADR 0011](./.adr/0011-the-pack-protocol-is-the-mux-driver-seam.md)).
 
 ## The journal (scrollback the mirror can't give you)
 
@@ -211,11 +272,38 @@ grammar, the probe catches on-disk format drift.
 
 Loopback bind only · exactly one hardened front door — `tailscale serve` (never `funnel`) or a
 conforming reverse proxy per DEPLOYMENT.md Variant C (`COLLIE_SKIP_SERVE=1`) · same-origin gate ·
-optional identity/device gates · strict CSP. A socket call can type into a real terminal — treat the bridge as
-remote shell access.
+optional identity/device gates · strict CSP. A socket call can type into a real terminal — treat a
+collie as remote shell access.
 
-**Collie manages exactly one front door: `tailscale serve`** — `collie-ctl.sh` publishes it, records
-the mapping in `tailscale-managed-handler`, and only ever tears down a mapping matching that record.
+**Two device gates guard writes, independently, and compose by AND.** `COLLIE_DEVICE_HEADER` trusts
+a name a proxy injects; **pairing** (`bridge/pairing.ts`, `collie pair` / `collie devices`) requires a
+bearer credential the device holds, and is on exactly when the registry is non-empty. Reads stay
+ungated by both. Neither applies to `/pack/v1/*`, which has its own two factors. The reasoning sits in
+`bridge/pairing.ts`'s header; don't collapse the two gates into one.
+
+**Collie manages exactly one front door: `tailscale serve`** — the CLI (`cli/serve.ts`) publishes it,
+records the mapping in `tailscale-managed-handler`, and only ever tears down a mapping matching that
+record.
 Every other tunnel (NetBird, ZeroTier, Cloudflare Tunnel) is `COLLIE_SKIP_SERVE=1` + DEPLOYMENT.md
 Variant E: the operator owns the ingress, Collie publishes nothing. **Don't add a second managed front
 door** — [ADR 0001](./.adr/0001-one-managed-front-door.md).
+
+**The pack link (lead↔peer, `/pack/v1/*`) is specified in [`PACK_PROTOCOL.md`](./PACK_PROTOCOL.md)**
+— two factors gate it (pinned mutual TLS + pack secret), and a peer publishes no front door
+([ADR 0013](./.adr/0013-a-peer-listens-without-becoming-a-front-door.md)); the one exception is the
+**deputy's standby door** — bound, never published, armed by silence and spent by the operator's
+pairing credential ([ADR 0027](./.adr/0027-the-deputy-is-named-ahead-of-time.md) ·
+[ADR 0028](./.adr/0028-the-standby-door-is-a-second-listener.md)).
+
+**Touching the pack wire surface forces a protocol decision** — a commit staging one of the
+wire-shape files in `bridge/pack/` must also stage `PACK_PROTOCOL.md` (additive-optional, §7.1) or
+bump `PACK_PROTOCOL_VERSION` (not expressible that way). `scripts/check-pack-wire.sh` is guard C of
+the pre-commit hook; a pure refactor takes the `SKIP_PACK_WIRE_CHECK=1` hatch
+([ADR 0025](./.adr/0025-the-wire-guard-forces-a-decision-never-a-bump.md)).
+
+**Code reaches a peer over the operator's own SSH, never over the pack link** — `pack add` installs
+it and `pack update` levels it, both pushing the lead's own commit as a `git bundle`; the link
+carries runtime data and never becomes a distribution channel
+([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md)). How the operator reached a member is
+remembered locally in `pack-ops.json`, which is never a wire field and never merged into the trust
+store.

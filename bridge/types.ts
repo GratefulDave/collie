@@ -1,7 +1,8 @@
 // Domain model for the bridge. These are OUR types, decoupled from Herdr's wire shapes
-// (which live only in herdr-client.ts). The rest of the app talks in these terms.
+// (which live only in mux/herdr/client.ts). The rest of the app talks in these terms.
 
 import type { AgentSessionRef, TranscriptEntry } from "./journal/types.ts";
+import type { MuxCapability } from "./mux/capabilities.ts";
 
 // Re-exported so the wire surface has ONE import site: a consumer of PaneHistoryResponse gets the
 // entry shape from here too, without reaching into an adapter module.
@@ -68,6 +69,15 @@ export interface AgentView {
    */
   terminalTitle?: string;
   /**
+   * A finished English sentence about this pane, composed in the bridge and rendered as text the
+   * client does not interpret. Absent on almost every pane.
+   *
+   * PRESENTATION AND NOTHING ELSE. It never carries a harness name or a multiplexer name, it never
+   * implies the pane's `agent` or `status`, and no control may be armed, hidden or shown by it. The
+   * module that composes it sits beside the mux decorator and is the only thing that writes one.
+   */
+  hint?: string;
+  /**
    * Epoch ms of this agent's last observed status transition (bridge/activity.ts). The only thing
    * that can make a pane read as unseen. Absent until the ledger has an entry, and on the very
    * first poll after a fresh install.
@@ -97,6 +107,13 @@ export type PaneWire = Omit<AgentView, "agentSession"> & {
    *  has a journal adapter. Says nothing about whether the log is readable — a named session whose
    *  file is missing still answers `available:false` with reason `no-log`. */
   hasSession?: boolean;
+  /**
+   * Which member of the pack this pane lives on — the `?h=` value completing the `(host, session,
+   * paneId)` address (PACK_PROTOCOL.md §4). Present exactly when {@link SnapshotResponse.servers}
+   * is; absent on every solo snapshot (§11). Pane ids are only unique per machine, which is why a
+   * merged list must carry this and why the phone's per-pane cache keys on it.
+   */
+  host?: string;
 };
 
 /**
@@ -151,6 +168,15 @@ export interface SessionSummary {
   /** Agent panes currently working / blocked (0 when unreachable). */
   working: number;
   blocked: number;
+  /**
+   * Which member of the pack fronts this session — the `?h=` value (PACK_PROTOCOL.md §4).
+   *
+   * **Present exactly when {@link SnapshotResponse.servers} is**, and absent otherwise. A solo
+   * instance emits neither (§11: "no `host` field is added to sessions or panes"), so a session name
+   * on a solo snapshot means what it has always meant. The lead stamps this from the registry key it
+   * dialled; a peer never asserts its own (see `parsePeerSnapshot`).
+   */
+  host?: string;
 }
 
 /**
@@ -186,12 +212,50 @@ export interface SnapshotResponse {
    * single-session deployment lists just the primary, so the switcher UI can stay hidden.
    */
   sessions: SessionSummary[];
+  /**
+   * Every member of the pack, the lead's own entry included (PACK_PROTOCOL.md §9.2).
+   *
+   * **Optional-and-absent, following `update?` rather than the always-present `sessions`** — and the
+   * choice is forced, not stylistic (§11). An always-present field, even an empty array, changes
+   * every solo snapshot body and therefore every solo snapshot ETag exactly once: one forced refetch
+   * for every solo user, bought for a uniformity nothing needs. Absent means "no pack", which is
+   * precisely true. Present ⇒ `host` is stamped on every session and every pane; absent ⇒ on none.
+   */
+  servers?: ServerSummary[];
   /** Notification quiet-hours: the active snooze deadline (epoch ms) or null. */
   notifications?: { snoozedUntil: number | null };
   /** Update-availability signal. Optional — a stale bridge that predates the field simply omits it,
    *  which the client reads as "no info" (see bridge/update.ts). */
   update?: UpdateStatus;
   ts: number;
+}
+
+/**
+ * One member of the pack in the merged snapshot (PACK_PROTOCOL.md §9.2) — the row `pack status` and
+ * the phone's host list render.
+ *
+ * `reachable` is not an invention: {@link SessionSummary.reachable} already models an unreachable
+ * member as a *rendered state* with zeroed counts rather than a failed response. This is that
+ * precedent one level up — a down peer degrades its entry, never the response (§10.2).
+ */
+export interface ServerSummary {
+  /** Member id — the `?h=` value. The lead's own entry is present too. */
+  id: string;
+  /** Operator-chosen label. Today the member id itself, which is the `join` label slugified (§8.2). */
+  name: string;
+  isLead: boolean;
+  /** Whether the lead's last poll of this member succeeded. Always true for the lead's own entry. */
+  reachable: boolean;
+  /** Version negotiation state (§7). `incompatible` is retried on a slow backoff, not the cadence. */
+  protocol: "ok" | "incompatible" | "unknown";
+  /** The peer's refusal reason, verbatim, when incompatible. */
+  protocolDetail?: string;
+  /**
+   * Epoch ms, **stamped by the lead on receipt — never the peer's clock** (§10.2). The client
+   * derives "stale since …" from it (stale once older than 3 × pollMs or 15 s, whichever is first);
+   * `0` means this member has never answered.
+   */
+  lastSeenAt: number;
 }
 
 /**
@@ -286,6 +350,12 @@ export interface CreatedPane {
 export type CreateResponse = { ok: true; pane: CreatedPane } | { ok: false; error: string };
 
 /**
+ * Which role this collie plays in a pack (PACK_PROTOCOL.md §3). `solo` is a lead with zero peers —
+ * today's Collie, exactly — and is the only mode that needs no configuration whatsoever.
+ */
+export type PackMode = "solo" | "lead" | "peer";
+
+/**
  * One operator-declared slash command (a `[[commands]]` row in their `commands.toml`). A pane any of
  * these rows address shows them INSTEAD of the shipped Agent-commands catalog; a pane none of them
  * address keeps it (ADR 0018). This is the escape hatch for commands the shipped catalog cannot know
@@ -332,23 +402,85 @@ export interface OperatorKeyRow {
   danger: boolean;
 }
 
+/**
+ * What the phone is told about the multiplexer underneath — the config surface's half of M10/06.
+ *
+ * THE UI READS `capabilities`, NEVER `name`. `name` rides so the app can SAY which multiplexer it is
+ * (a support question, and the subject of a sentence like "zellij keeps no agent session log") and
+ * for nothing else: a component that branches on it has re-welded Collie to one multiplexer, which
+ * is the whole thing this milestone exists to undo. `scripts/check-mux-names.sh` enforces that.
+ *
+ * `capabilities` is TOTAL — every capability answered true or false, the same shape the adapter
+ * declares (bridge/mux/capabilities.ts). Total rather than a list of the supported ones so a client
+ * that knows a capability this bridge has never heard of can tell "absent" from "not answered": an
+ * unanswered capability reads as CAPABLE on the phone, because the alternative is a mid-upgrade
+ * Herdr operator watching controls vanish for the length of a page cache.
+ */
+export interface MuxConfig {
+  /** Registry name of the multiplexer. For display and support, never a branch. */
+  name: string;
+  /** Every capability, answered. Mirrors the adapter's own declaration. */
+  capabilities: Record<MuxCapability, boolean>;
+  /** Neutral key spellings (bridge/mux/keys.ts) this multiplexer refuses, canonicalised. */
+  unsupportedKeys: string[];
+  /**
+   * The adapter's own operator-facing reason, for the capabilities it does NOT have.
+   *
+   * Only the absent ones: a note explaining a capability the adapter HAS is developer
+   * documentation, and the phone has nothing to render it on. This is where an explanation's words
+   * come from — the adapter wrote them, they name the multiplexer, and they never blame Collie.
+   */
+  notes: Partial<Record<MuxCapability, string>>;
+  /**
+   * Where this multiplexer's mark is served — {@link MUX_LOGO_PATH}, or absent.
+   *
+   * A URL and not the SVG source: the bytes are cacheable, revalidated by ETag, and never touch the
+   * JSON every page load re-reads. Present ONLY when the active adapter supplied a logo
+   * (bridge/mux/types.ts `MuxAdapter.logo`) — absent means "this bridge has no picture for you",
+   * which the header answers by rendering exactly the text it always did.
+   */
+  logoUrl?: string;
+}
+
+/**
+ * The one path the mark is served from, spelled once.
+ *
+ * A CONSTANT rather than a literal at each end, because the bridge both routes it and publishes it
+ * in {@link MuxConfig.logoUrl}; two spellings of one path is one release away from a broken image.
+ * It is deliberately not per-multiplexer — a collie drives exactly one, so the path names the
+ * question ("this bridge's mux") and the answer changes with the bridge, never with the URL.
+ */
+export const MUX_LOGO_PATH = "/api/mux/logo.svg";
+
 /** GET /api/config — bridge capabilities and the build id (push setup + stale-cache detection). */
 export interface BridgeConfig {
   push: boolean;
   vapidPublicKey: string;
   /** Build id of the bundle the bridge is currently serving (for stale-cache detection). */
   build?: string;
+  /**
+   * This collie's pack mode, so `pack status` and the UI can render it without probing behaviour.
+   * **Omitted when the mode is `solo`** — absent means "no pack", which is precisely true, and keeps
+   * a solo `/api/config` body byte-identical to today's (the `servers` reasoning, PACK_PROTOCOL.md
+   * §11). Read it as `mode ?? "solo"`.
+   */
+  mode?: PackMode;
   /** The operator's own palette rows. Absent/empty when there is no `commands.toml`. */
   operatorCommands?: OperatorCommand[];
   /** The operator's own Keys-tray presets. Absent/empty when there is no `keys.toml`. */
   operatorKeys?: OperatorKeyRow[];
+  /**
+   * The multiplexer this collie drives, and what it can do. Absent only on a bridge older than
+   * M10/06 — which a client reads as "every capability present", i.e. exactly today's Herdr app.
+   */
+  mux?: MuxConfig;
 }
 
 /** Rank for triage ordering — lower sorts first ("NEEDS YOU" at the top). */
-export const STATUS_RANK: Record<AgentStatus, number> = {
+export const STATUS_RANK = {
   blocked: 0,
   working: 1,
   unknown: 2,
   idle: 3,
   done: 4,
-};
+} satisfies Record<AgentStatus, number>;

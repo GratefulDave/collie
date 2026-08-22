@@ -9,9 +9,12 @@ four shapes here are for everything else. Pick one.
 - [Variant C — reverse proxy as the only front door (no Tailscale)](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)
 - [Variant D — off-host identity proxy over the tailnet](#variant-d--off-host-identity-proxy-over-the-tailnet)
 - [Variant E — any other mesh or tunnel](#variant-e--any-other-mesh-or-tunnel-netbird-zerotier-cloudflare-tunnel)
+- [The standby door — a pack's failover path](#the-standby-door--a-packs-failover-path) (packs only)
 
 The security rules in [README → Security](./README.md#%EF%B8%8F-security--read-before-you-run-it)
-are not relaxed by any of them.
+are not relaxed by any of them. None of these is a prerequisite for authorising individual devices —
+[pairing](./README.md#pair-a-device--the-write-credential) does that with no proxy at all, and
+composes with every variant here.
 
 ## Variant B — identity-aware proxy + per-device authorisation
 
@@ -37,10 +40,10 @@ Your fronting proxy **must**:
    stable per-device id is up to you; Collie treats it as opaque.
 2. **Set (override) the device header** on *every* upstream request — never merely add it, so any
    client-supplied copy is discarded. This override is what makes the header trustworthy.
-3. **Proxy to the bridge on loopback** (`127.0.0.1:$COLLIE_PORT`). The loopback bind is the trust
-   anchor — nothing but the proxy can reach the bridge to set the header.
+3. **Proxy to Collie on loopback** (`127.0.0.1:$COLLIE_PORT`). The loopback bind is the trust
+   anchor — nothing but the proxy can reach Collie to set the header.
 4. **Satisfy the same-origin gate.** Collie accepts a request when the browser's `Origin` host
-   equals the `Host` the bridge receives. So either **forward the public `Host` unchanged**, or — if
+   equals the `Host` Collie receives. So either **forward the public `Host` unchanged**, or — if
    your proxy rewrites Host — list the exact public origin in `COLLIE_ALLOWED_ORIGINS`. Otherwise
    every API call 403s `cross-origin rejected` (the page loads but stays empty).
 
@@ -90,11 +93,11 @@ boundary.
 
 Two consequences worth knowing before you turn this on:
 
-- **The bridge's own loopback URL becomes read-only.** `http://127.0.0.1:$COLLIE_PORT` bypasses your
+- **Collie's own loopback URL becomes read-only.** `http://127.0.0.1:$COLLIE_PORT` bypasses your
   proxy, so the PWA loaded from it sends no device header and shows its read-only state. Drive the
   herd through the proxied URL instead.
-- **To drive a pane from the host by hand**, send an allowlisted id yourself, against the loopback
-  bridge rather than the public URL (the proxy's mandatory override in requirement 2 above would
+- **To drive a pane from the host by hand**, send an allowlisted id yourself, against loopback
+  rather than the public URL (the proxy's mandatory override in requirement 2 above would
   replace your header): `curl -H 'X-Device-Id: my-laptop' http://127.0.0.1:$COLLIE_PORT/api/...`
 
 Revoke a device by dropping its id from `COLLIE_DEVICE_ALLOWLIST` and restarting
@@ -103,8 +106,8 @@ Revoke a device by dropping its id from `COLLIE_DEVICE_ALLOWLIST` and restarting
 header. In that state nothing can drive a pane, including a hand-made `curl`; recovery is an `.env`
 edit plus a restart.
 
-This variant assumes the proxy is **on the same host**, reaching the bridge on loopback. If your
-proxy runs on a *different* node and its upstream is the bridge's own `tailscale serve` URL, the
+This variant assumes the proxy is **on the same host**, reaching Collie on loopback. If your
+proxy runs on a *different* node and its upstream is the host's own `tailscale serve` URL, the
 trust story changes — see [Variant D](#variant-d--off-host-identity-proxy-over-the-tailnet).
 
 ## Variant C — reverse proxy as the only front door (no Tailscale)
@@ -113,8 +116,8 @@ A reverse proxy (Caddy, Nginx, …) is the **sole ingress** — no Tailscale in 
 when the host isn't on a tailnet, or when you already run a TLS-terminating proxy with its own access
 control (SSO, mTLS, a VPN gateway) and want Collie behind it like any other upstream.
 
-Set `COLLIE_SKIP_SERVE=1` so `collie-ctl.sh start` builds, starts and supervises the bridge but
-**never touches `tailscale serve`** — the proxy owns ingress. The bridge still binds loopback only;
+Set `COLLIE_SKIP_SERVE=1` so `collie start` builds, starts and supervises Collie but
+**never touches `tailscale serve`** — the proxy owns ingress. Collie still binds loopback only;
 your proxy reaches it on `127.0.0.1:$COLLIE_PORT`.
 
 The **four proxy requirements from
@@ -140,18 +143,19 @@ COLLIE_PUBLIC_HOSTS=collie.example.com              # Host allowlist — blocks 
 COLLIE_ALLOWED_ORIGINS=https://collie.example.com   # exact public origin for the same-origin gate
 COLLIE_DEVICE_HEADER=X-Device-Id                    # the header your proxy injects…
 COLLIE_DEVICE_ALLOWLIST=my-phone,my-laptop          # …and the ids allowed to drive; others → read-only
-# COLLIE_PUBLIC_URL=https://collie.example.com      # optional — shown in the collie-ctl.sh status banner
+# COLLIE_PUBLIC_URL=https://collie.example.com      # optional — status banner, `collie qr`, and the
+                                                    # address a lead hands joining machines (pack)
 ```
 
 > ⚠️ **`COLLIE_TRUSTED_USER` does nothing here.** It gates on `Tailscale-User-Login`, which only
 > `tailscale serve` injects — with no Tailscale in the path there is no injector, so the check has
-> nothing to compare against and every request passes it. It fails *open*, not closed, and the bridge
+> nothing to compare against and every request passes it. It fails *open*, not closed, and Collie
 > logs a startup warning saying so. **Per-device auth (`COLLIE_DEVICE_HEADER`) is the write gate**,
 > and the **proxy must provide TLS and its own access control** — anyone who reaches the proxy gets
 > read access to every pane. Give the proxy the same respect you'd give the tailnet.
 
 > ⚠️ **Never blanket-cache, and never refuse the static bundle to a signed-out client.** Both are
-> the same fact: a service worker that goes stale or can't be fetched never self-heals. The bridge
+> the same fact: a service worker that goes stale or can't be fetched never self-heals. Collie
 > marks hashed assets (`/assets/*`) immutable and everything else — notably `/sw.js` and
 > `index.html` — `no-cache`; a proxy cache that ignores that holds installed PWAs on old code with
 > no way to notice (Caddy and stock Nginx `proxy_cache` honor origin headers by default, CDNs often
@@ -181,7 +185,7 @@ without touching the network, so a sign-in page anywhere Collie owns is invisibl
 and everything beneath it is the one prefix always passed through. (`/cdn-cgi/access/` is reserved
 too, so Cloudflare Access works untouched.) Collie's refusal banner links to `/auth/` on a 401/403,
 so a signed-out phone has a tappable way back in; a `?rd=`/`?next=` return-to parameter is fine, and
-if your flow lives somewhere you can't move, redirect `/auth/` to it. When the bridge answers there
+if your flow lives somewhere you can't move, redirect `/auth/` to it. When Collie answers there
 itself, nothing claimed the path — that placeholder is your signal that the proxy rule is missing.
 
 > **Devices locked out before 0.18.0 can't pick this up.** They can't fetch the new service worker,
@@ -208,8 +212,8 @@ Choose this when you already run a **central ingress node** for your tailnet —
 layer, one wildcard cert, a row of services behind it — and you want Collie to be another entry in
 that table rather than a second auth stack configured on the agent host.
 
-The proxy is on a *different machine*, so it can't reach the bridge on loopback. The agent host
-publishes the bridge **tailnet-only** with `tailscale serve --http`, and the proxy's upstream is that
+The proxy is on a *different machine*, so it can't reach Collie on loopback. The agent host
+publishes Collie **tailnet-only** with `tailscale serve --http`, and the proxy's upstream is that
 tailnet URL:
 
 ```
@@ -220,7 +224,7 @@ tailnet URL:
                         host.your-tailnet.ts.net:8787     tailscale serve --http, tailnet-only
                             │
                             ▼
-                        127.0.0.1:8787                    the bridge
+                        127.0.0.1:8787                    Collie
 ```
 
 Plain HTTP on the middle hop is fine *because it rides the tailnet* — TLS terminates at the proxy.
@@ -231,10 +235,10 @@ The **four proxy requirements from
 [Variant B](#variant-b--identity-aware-proxy--per-device-authorisation) apply**, except (3): proxy to
 the host's tailnet URL rather than `127.0.0.1`.
 
-> ⚠️ **A Tailscale ACL is mandatory in this variant.** The bridge's tailnet URL has to stay reachable
-> or the proxy couldn't reach it either, so there is a permanent second path to the bridge that skips
+> ⚠️ **A Tailscale ACL is mandatory in this variant.** Collie's tailnet URL has to stay reachable
+> or the proxy couldn't reach it either, so there is a permanent second path to Collie that skips
 > your forward-auth entirely — and **`tailscale serve` forwards a client-supplied device header
-> untouched** (verified: it arrives at the bridge unmodified). Your proxy's mandatory *override* only
+> untouched** (verified: it arrives at Collie unmodified). Your proxy's mandatory *override* only
 > protects the proxy path; on the direct path there is no override, so a tailnet peer who supplies an
 > allow-listed id gets full write access. Device ids are human-readable names, so treat them as
 > guessable, not secret. **Restrict who can reach the port at all.**
@@ -266,7 +270,7 @@ the host's tailnet URL rather than `127.0.0.1`.
 > ```yaml
 >   - action: accept
 >     src: ["my-phone", "my-laptop"]
->     dst: ["agent-host:1-8786", "agent-host:8788-65535"]   # everything EXCEPT the bridge
+>     dst: ["agent-host:1-8786", "agent-host:8788-65535"]   # everything EXCEPT Collie's port
 > ```
 >
 > Per-device auth is still required, and it does real work: since 0.15.0 a request arriving *without*
@@ -276,7 +280,7 @@ the host's tailnet URL rather than `127.0.0.1`.
 
 **Host and Origin are different values here** — the one place this trips people up. `tailscale serve`
 Host-routes on the host's own MagicDNS name, so the proxy generally must rewrite `Host` to the
-upstream (in Traefik, `pass_host_header: false`). The bridge then sees the *tailnet* Host while the
+upstream (in Traefik, `pass_host_header: false`). Collie then sees the *tailnet* Host while the
 browser's Origin is your *public* name, so the two settings take different values:
 
 ```bash
@@ -321,7 +325,7 @@ $ curl -s http://127.0.0.1:8787/api/snapshot | jq -c .device
 {"enforced":true,"device":null,"authorized":false}
 ```
 
-A header-less request must be read-only. **If it says `"authorized":true`, your bridge predates
+A header-less request must be read-only. **If it says `"authorized":true`, your collie predates
 0.15.0** — update before going further.
 
 > ⚠️ **Don't test reachability from the agent host.** A connection to your own tailnet IP is handled
@@ -333,7 +337,7 @@ A header-less request must be read-only. **If it says `"authorized":true`, your 
 ## Variant E — any other mesh or tunnel (NetBird, ZeroTier, Cloudflare Tunnel)
 
 Tailscale is the **default**, not a requirement. Collie's own Tailscale coupling is one header read
-and a convenience in `collie-ctl.sh`; the bridge itself is a loopback HTTP server that gates on
+and a convenience in the CLI; the bridge itself is a loopback HTTP server that gates on
 `Host`, `Origin`, and two optional headers. Anything that can reach `127.0.0.1:$COLLIE_PORT` can
 front it.
 
@@ -348,7 +352,7 @@ COLLIE_ALLOWED_ORIGINS=https://collie.example.com   # exact public origin for th
 
 Then point your tunnel at `127.0.0.1:$COLLIE_PORT` and start it however you start your other
 services. `netbird expose 8787`, a ZeroTier-routed reverse proxy and `cloudflared tunnel` all work
-this way. `collie-ctl.sh start` will build, launch and supervise the bridge and publish nothing;
+this way. `collie start` will build, launch and supervise Collie and publish nothing;
 `unserve` and `uninstall` likewise leave your tunnel alone, exactly as under
 [Variant C](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale).
 
@@ -360,7 +364,7 @@ Three things to get right, none of them Collie-specific:
    on every request, never merely added.
 2. **`COLLIE_TRUSTED_USER` does nothing here**, for the reason it does nothing behind a reverse proxy
    ([Variant C](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)): nothing injects
-   `Tailscale-User-Login`, so the check passes every request rather than blocking it, and the bridge
+   `Tailscale-User-Login`, so the check passes every request rather than blocking it, and Collie
    warns about that at startup. If your tunnel authenticates and injects a device identity, use
    `COLLIE_DEVICE_HEADER` + `COLLIE_DEVICE_ALLOWLIST` instead; if it authenticates but injects
    nothing, its own auth *is* the whole gate and anyone who passes it gets full Collie access.
@@ -368,6 +372,183 @@ Three things to get right, none of them Collie-specific:
    several tunnels hand out a fresh generated name per session. A name that changes gives you a new
    install each time and makes `COLLIE_PUBLIC_HOSTS` unpinnable.
 
-> ⚠️ **Anything that publishes to the open internet is a `funnel` by another name** — see the rule in
-> [README → Security](./README.md#%EF%B8%8F-security--read-before-you-run-it). Prefer a tunnel scoped
-> to your own devices over a public URL with a gate on it.
+> ⚠️ **Anything that publishes to the open internet is a `funnel` by another name.** The rule in
+> [README → Security](./README.md#%EF%B8%8F-security--read-before-you-run-it) isn't about Tailscale,
+> it's about reachability: this socket is a shell running as you. If your tunnel offers a public URL,
+> the auth in front of it is the only thing between a stranger and that shell, so treat a shared PIN
+> the way you'd treat a root password — and prefer a tunnel scoped to your own devices over a public
+> URL with a gate on it.
+
+## The standby door — a pack's failover path
+
+**Packs only, and opt-in.** If you lead a [pack](./PACK_PROTOCOL.md), you can name one peer the
+**deputy** and give it a page your phone can reach when the lead is gone. The deputy holds a
+lead-signed *warrant*; the page's one button spends it. Why it is a second listener rather than a
+route on the existing one, and why the button is gated the way it is, are
+[ADR 0028](./.adr/0028-the-standby-door-is-a-second-listener.md) and
+[ADR 0027](./.adr/0027-the-deputy-is-named-ahead-of-time.md); the contract is
+[`PACK_PROTOCOL.md` §18](./PACK_PROTOCOL.md).
+
+Set on the **deputy** (and on the lead, see the last row):
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `COLLIE_STANDBY_PORT` | *(unset)* | The port the standby door binds. **Unset means no door at all** — nothing is bound, nothing is served, and the deputy is a plain peer you can still recover from a keyboard with `collie promote`. Absent means closed. |
+| `COLLIE_STANDBY_HOST` | `127.0.0.1` | Where it binds. Loopback is right when the failover proxy is co-located; set the overlay address when it is not. |
+| `COLLIE_STANDBY_ARM_MS` | `max(30000, 2.5 × COLLIE_POLL_IDLE_MS)` | How long the lead must be silent before the door arms. The default is a **formula**, so relaxing `COLLIE_POLL_IDLE_MS` moves it with you. A value at or below the idle poll makes an idle pack arm itself nightly; Collie **warns** at boot and does not refuse. |
+
+**Set `COLLIE_STANDBY_PORT` on the lead too, at the same number.** A lead binds that port and answers
+only the health check — otherwise a deputy that takes over and later comes back up as the lead leaves
+your proxy health-checking a closed port and swinging the phone onto the machine that died.
+
+Collie **binds** this port and publishes nothing: no `tailscale serve`, never `funnel`, no ownership
+record. The ingress in front of it is yours, exactly as under
+[Variant C](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale) and
+[Variant E](#variant-e--any-other-mesh-or-tunnel-netbird-zerotier-cloudflare-tunnel).
+
+> ⚠️ **Pick a port `tailscale serve` has never served on that machine.** Observed live: a port that
+> was once in a serve mapping can stay black-holed for *direct* tailnet dials to that machine even
+> after the mapping is removed — tailscaled keeps intercepting it, and a `tailscaled` restart is what
+> clears it. Nothing in Collie can see that from the outside, and it looks exactly like a peer that
+> is up and unreachable. A port that was never served has none of this history.
+
+### The prerequisite: one hostname, two backends
+
+**The phone must reach the lead and the deputy on the same origin.** The pairing credential and the
+installed PWA are both per-origin, so a takeover page on a different hostname is a page your phone
+cannot authenticate to. A same-origin failover proxy is therefore an accepted prerequisite of the
+phone-first path — Collie does not grow a second credential to work around it, and `collie pack
+deputy` says so once when it sees no shared origin configured.
+
+A pack **without** such a proxy still gets everything else: the warrant, the deposition, the
+self-heal. Its recovery is `collie promote` at a keyboard
+([PACK_PROTOCOL §14.4](./PACK_PROTOCOL.md)), unchanged.
+
+```yaml
+# Traefik — generic shape, adapt to your ingress. Hostnames are placeholders.
+http:
+  routers:
+    collie:
+      rule: "Host(`collie.example.com`)"
+      service: collie-pack
+      tls: {}                      # your ingress terminates TLS; both backends speak plain HTTP
+
+  services:
+    collie-pack:
+      failover:
+        service: collie-lead       # primary
+        fallback: collie-deputy    # used only while the primary fails its health check
+
+    collie-lead:
+      loadBalancer:
+        servers:
+          - url: "http://lead.internal:8787"
+        healthCheck:
+          path: /standby/health    # the LEAD answers 200 here while it leads,
+          interval: 5s             # and NON-200 once it has been deposed
+          timeout: 2s
+
+    collie-deputy:
+      loadBalancer:
+        servers:
+          - url: "http://deputy.internal:8788"   # COLLIE_STANDBY_PORT
+        healthCheck:
+          path: /standby/health    # 503 while the lead is fresh — so the fallback
+          interval: 5s             # only comes up once the deputy has armed
+          timeout: 2s
+```
+
+`/standby/health` is one question — *should anything route here?* — and three kinds of machine answer
+it: a lead `200`, a deposed lead non-`200`, a deputy `503` until it arms and `200` after.
+
+> ⚠️ **The gap is real, and it is one tuning decision rather than two.** The proxy fails the lead over
+> after `interval × failures` (seconds here) while the deputy arms after `COLLIE_STANDBY_ARM_MS`
+> (30 s by default). In between, both backends are unhealthy and the phone gets a `503`. That is
+> honest — the lead really is down and the deputy really is not yet sure — so **tune the health check
+> to the arming threshold, not the reverse.**
+
+### Set it up once, while everything is healthy
+
+```bash
+# on the lead
+collie pair                      # the door needs a credential; an empty registry refuses to arm
+collie pack deputy nas           # mints the warrant, restarts this lead, pushes it to every peer,
+                                 # then restarts each peer over your own SSH (one prompt, whole batch)
+collie pack status               # confirm: deputy named, warrant generation, anchored on N/N peers
+```
+
+Then on the deputy, put `COLLIE_STANDBY_PORT=8788` (and `COLLIE_STANDBY_HOST` if the proxy is not
+co-located) in its env and restart it.
+
+**The restart of each peer is load-bearing, not tidiness.** A peer's pinned listener cannot adopt the
+deputy's certificate while it runs, so a warrant that has landed on disk is inert at the transport
+until that peer restarts. `collie pack status` names any peer left in that state
+(`warrant stored, anchor INACTIVE`) — fix it *before* the bad day, because a peer that never
+restarted cannot be taken over to.
+
+**Visit `https://collie.example.com/standby` once now.** While the lead is healthy the page is a
+statement of fact with no action on it, which is how you confirm the door works without spending
+anything.
+
+### ⚠️ The deputy must be supervised
+
+A takeover **commits its store and then exits**, deliberately: the operator asked from a phone, and a
+machine whose store says `lead` while its process still runs a peer's pinned listener is a machine
+nobody can reach. So it commits, says so, and exits about a second later (`performTakeover` in
+[`bridge/index.ts`](./bridge/index.ts) — the one place the bridge restarts itself, and the comment
+there says why).
+
+**It exits `75`, and the non-zero status is load-bearing.** `75` is `EX_TEMPFAIL` (`sysexits.h`):
+*temporary failure, the user is invited to retry* — which is exactly what this is. `Restart=always`
+and `Restart=on-failure` both revive a non-zero exit; **`Restart=on-failure` does NOT revive a clean
+`0`**, and a live drill found precisely that: a unit with the common `on-failure` policy took over,
+exited zero, and systemd correctly treated it as a service that had finished. The store said `lead`,
+the service said `inactive`, and the operator holding the phone had no shell. In `journalctl` a
+completed takeover therefore reads `status=75/n/a` — that is the takeover, not a crash.
+
+A supervised install — `systemd --user` with `Restart=always` **or** `Restart=on-failure`, or the
+Herdr plugin — comes straight back up as the new lead. An unsupervised one is left with a correct
+store and a stopped process. Put **both** the lead and the deputy under supervision.
+
+### The bad day — the runbook
+
+1. **The phone's Collie stops answering** — amber at 4 s, red at 15 s.
+2. **Pull to refresh, or reopen the app.** The proxy has failed the lead over, so the request lands on
+   the deputy.
+3. **`/standby` answers** with one sentence: *your lead `desk` has not called this machine for 47
+   seconds; this machine (`nas`) is the deputy.*
+4. **One button: take over.** No options, no roster editor — a page with choices on it is a page
+   nobody can use one-handed at 23:00.
+5. **The confirm sends the phone's pairing credential.** The deputy asks the lead first, then asks the
+   surviving peers what *they* last heard, and either refuses with the evidence — *peer `attic` says
+   the lead called it 2 s ago* — or commits. **A refusal here is the feature working**, not a failure:
+   it means you are the one who is cut off. On a two-machine pack there is nobody to ask, and the page
+   says so above the button.
+6. **The page reloads onto the real app**, now served by the new lead.
+
+**Afterwards, most of the cleanup does itself.** When the old machine comes back it finds the warrant,
+**deposes itself and heals to `peer`** on materials both machines already hold — no command, no token,
+nothing minted. It stops polling, fails its health check so the proxy stops routing to it, **takes its
+own `tailscale serve` mapping down** (only the one it recorded as its own — ADR 0001 is unchanged),
+and serves one page saying which state it is in. `collie pack status` on the new lead names what is
+genuinely left, and it is two decisions rather than two repairs:
+
+1. **Name a new deputy** — the takeover spent the warrant, so the pack has none.
+2. **Re-point the phone**, if you have no failover proxy.
+
+Two things about that comeback are by design and are not bugs:
+
+- **The old lead publishes as lead for about one sweep before it is deposed.** It boots into silence,
+  finds nothing to contradict its own store, and comes up leading — until the new lead's warrant
+  reaches it and it deposes itself. Measured at ~25 s in a live drill. Fail-open at boot is
+  deliberate ([`PACK_PROTOCOL.md` §8.4](./PACK_PROTOCOL.md)): a machine that refused to lead on
+  silence alone would strand a pack whose peers are simply offline.
+- **A member's address does not follow it into its new role.** The new lead adopts the roster it was
+  handed, and the old lead's row in it holds that machine's *front-door URL* — un-dialable now that
+  it is a peer with no front door. `collie pack status` says so under that member, and
+  `collie pack set-address <member> <host:port>` corrects it.
+
+> ⚠️ **Do not `collie pack rotate` until the old machine is back.** Rotation marks a member that
+> missed it `unenrolled`, and a deposed machine that heals into a rotated pack is stranded and needs a
+> re-join after all. The rule is not relaxed for this feature; `rotate` warns you by name. Wait for the
+> re-entry, *then* rotate.

@@ -24,7 +24,11 @@ export const PROXY_AUTH_PATH = "/auth/";
 /**
  * Navigation paths the SW passes straight to the network. `/api/` was always here (the API must
  * never be answered from a cache); `/auth` joins it, with or without the trailing slash, so a proxy
- * can serve its page at either.
+ * can serve its page at either; `/pack/v1/` joins it because a browser must never be able to cache
+ * a collie-to-collie response (PACK_PROTOCOL.md §5).
+ *
+ * This list is the SW's *only* caching decision that isn't the precache: sw.ts registers no runtime
+ * caching route, so denying a path here is denying it from the SW entirely.
  *
  * These are matched against `pathname + search`, NOT pathname alone — verified in the vendored
  * workbox-routing/NavigationRoute.js (`_match` builds `url.pathname + url.search` and tests the
@@ -42,6 +46,25 @@ export const NAVIGATION_NETWORK_ONLY = [
   // Proxies whose prefix IS movable (oauth2-proxy's `--proxy-prefix`, Authelia) are documented in
   // the README instead of listed here — this list stays for paths nobody can move.
   /^\/cdn-cgi\//,
+  // The pack surface (PACK_PROTOCOL.md §5). A browser NEVER issues a `/pack/v1/*` request — it is
+  // collie-to-collie, admitted only by the two pack factors — so a browser must never be able to
+  // cache one either. Denylisted for the same reason `/api/` is, and then some: these responses
+  // carry another machine's panes, and the precached app shell is not a plausible answer to any of
+  // them. Query-tolerant (`[/?]`) like `/auth` because workbox matches pathname+search.
+  //
+  // Scoped to `v1` rather than all of `/pack/`: the protocol reserves the versioned prefix, and a
+  // future `/pack/v2/` arrives with a bridge that can add its own line here.
+  /^\/pack\/v1(?:[/?]|$)/,
+  // The standby door (PACK_PROTOCOL.md §18.15, RFC §6.2). In the same-origin failover deployment the
+  // phone's FIRST hit on the bad day is an installed service worker minted from the LEAD's origin —
+  // so without this line the takeover page is answered from the precache with the app shell of the
+  // very collie that just died, and the door is unreachable by the one device that needs it. This is
+  // not hygiene; it is the difference between reaching the door and staring at a cached UI.
+  //
+  // The whole `/standby` namespace, query-tolerant like the two above: `/standby/health` is a proxy's
+  // health check, `/standby` is the page, `/standby/takeover` is the confirm, and Collie will never
+  // route a UI page under that prefix.
+  /^\/standby(?:[/?]|$)/,
 ] as const;
 
 /**

@@ -1,15 +1,16 @@
 import { Outlet, useLoaderData, useParams, useRouteError, useRouteLoaderData } from "react-router";
 
-import { usePolling } from "@/hooks/use-polling";
+import { intervalFor, usePolling } from "@/hooks/use-polling";
 import { usePollBusy } from "@/hooks/use-poll-busy";
 import { useAgentTransitions } from "@/hooks/use-transitions";
 import { usePushSetup } from "@/hooks/use-push";
 import { useConnectionLost } from "@/hooks/use-connection-lost";
 import { UpdateAvailableBanner } from "@/components/update-available-banner";
 import { ConnectionBanner } from "@/components/connection-banner";
+import { PackProvider } from "@/components/pack-provider";
 import { DogGallop } from "@/components/dog-gallop";
 import { homePath } from "@/lib/nav";
-import { SESSION_PARAM, normalizeSession } from "@/lib/session";
+import { scopeFromUrl } from "@/lib/session";
 import { PANE_ROUTE_ID, type HomeData, type PaneData } from "@/lib/loaders";
 
 /**
@@ -36,8 +37,9 @@ export function shownLastSeenAt(home: HomeData, pane: PaneData | undefined): num
 // routes (home + pane detail) via the router's loader data. Mounted only while unlocked (the
 // idle-lock in App swaps the whole RouterProvider out), so polling pauses when the app is locked.
 export function RootLayout() {
-  // SAFETY: this component IS the element of the route whose `loader` is rootLoader (router.tsx pairs
-  // the two), and it renders only after that loader settles — so useLoaderData returns its HomeData.
+  // SAFETY: this component IS the root route's element, and `rootLoader` — the loader `router.tsx`
+  // pairs with it — returns `HomeData`. React Router types `useLoaderData()` as `unknown` in data
+  // mode; the element does not mount until its own loader has resolved.
   const data = useLoaderData() as HomeData;
   // useParams accumulates params from matched child routes, so `paneId` is set when the
   // `/pane/:paneId` child is active. useAgentTransitions uses it to suppress a notification for the
@@ -61,23 +63,33 @@ export function RootLayout() {
   // active route fills the rest (each route root is `min-h-0 flex-1`). This is what keeps a banner
   // from covering the route's sticky header — it reserves real space instead of overlaying.
   return (
-    <div className="flex h-[100dvh] flex-col">
-      {/* API-observed self-update: mounted unconditionally so its controller runs (and can
-          auto-update) for the app's lifetime; renders the slim "tap to update" row only when a fresh
-          build is confirmed but auto-update is held off (unsent work) or already spent. */}
-      <UpdateAvailableBanner />
-      {/* The app's ONE connection surface: a thin, animated bar that stays hidden while healthy, fades
-          in amber "reconnecting…" only after ≥4s of sustained trouble (the flicker fix), escalates to a
-          red "not connected" cause + Retry/Reload at ≥15s, and flashes green on recovery. Reads the
-          same shared-clock signals as the header dog, so the two always agree. */}
-      <ConnectionBanner
-        bridge={data.bridge}
-        error={data.error}
-        authError={data.authError}
-        lastSeenAt={shownLastSeenAt(data, pane)}
-      />
-      <Outlet />
-    </div>
+    // The pack roster is published here, at the data root, so every surface below — including sheets
+    // portalled out to document.body — can answer "which machine?" without a prop chain. With no pack
+    // the provider publishes the solo value and nothing downstream renders any host chrome.
+    //
+    // `ts` and the poll cadence ride along for tier-2 (lead↔peer) health: §10.2 presents a member
+    // stale once the lead's last receipt from it is older than `3 × pollMs` (capped at 15s), and
+    // `intervalFor` is the same pure resolver `usePolling` above is running on — read here rather
+    // than re-derived, so the tolerance can never be computed against a cadence we aren't using.
+    <PackProvider servers={data.servers} ts={data.ts} pollMs={intervalFor(data, paneId)}>
+      <div className="flex h-[100dvh] flex-col">
+        {/* API-observed self-update: mounted unconditionally so its controller runs (and can
+            auto-update) for the app's lifetime; renders the slim "tap to update" row only when a fresh
+            build is confirmed but auto-update is held off (unsent work) or already spent. */}
+        <UpdateAvailableBanner />
+        {/* The app's ONE connection surface: a thin, animated bar that stays hidden while healthy, fades
+            in amber "reconnecting…" only after ≥4s of sustained trouble (the flicker fix), escalates to a
+            red "not connected" cause + Retry/Reload at ≥15s, and flashes green on recovery. Reads the
+            same shared-clock signals as the header dog, so the two always agree. */}
+        <ConnectionBanner
+          bridge={data.bridge}
+          error={data.error}
+          authError={data.authError}
+          lastSeenAt={shownLastSeenAt(data, pane)}
+        />
+        <Outlet />
+      </div>
+    </PackProvider>
   );
 }
 
@@ -133,12 +145,9 @@ export function RootError() {
       <button
         type="button"
         onClick={() => {
-          // Reload home, but stay in the session you were in (read from the live URL, since the
-          // router context may be the throwing one). Primary → plain "/".
-          const session = normalizeSession(
-            new URLSearchParams(window.location.search).get(SESSION_PARAM),
-          );
-          window.location.assign(homePath(session));
+          // Reload home, but stay on the machine and in the session you were in (read from the
+          // live URL, since the router context may be the throwing one). Lead + primary → "/".
+          window.location.assign(homePath(scopeFromUrl(window.location.href)));
         }}
         className="text-sm underline underline-offset-4"
       >

@@ -6,6 +6,382 @@ All notable changes to Collie are recorded here. The format follows
 `version` in `herdr-plugin.toml`, `package.json`, and `web/package.json` (enforced by
 `scripts/check-version.sh`). See [`CLAUDE.md`](./CLAUDE.md) → *Versioning* for the bump policy.
 
+## [1.0.0-beta.14] - 2026-08-20
+
+**The deputy and the takeover** — a pack can now name a standby peer ahead of time and let the
+operator promote it, by hand, when the lead goes dark. ADRs
+[0026](./.adr/0026-the-operator-is-the-quorum.md), [0027](./.adr/0027-the-deputy-is-named-ahead-of-time.md)
+and [0028](./.adr/0028-the-standby-door-is-a-second-listener.md); full protocol in
+[`PACK_PROTOCOL.md`](./PACK_PROTOCOL.md) §18; runbook in [`DEPLOYMENT.md`](./DEPLOYMENT.md).
+
+### Added
+
+- **ADR 0026 accepted — the operator is the quorum** — no automatic election, promotion is always a deliberate tap (a286fa3)
+- **The warrant** — signed, generational proof the lead grants one peer standing to take over; minted, refreshed each healthy sweep, superseded, expired (`bridge/pack/warrant.ts`) (b0af1e5)
+- **The peer learns its lead** — a warranted peer's trust store widens to two anchors (its lead's, and the deputy's own), `409 lead_conflict` names a conflicting lead by generation, a booting lead probes its roster once before publishing (the boot gate), and a deposed lead self-heals into a peer rather than crash-looping (6a57783)
+- `collie pack deputy <member>` / `--revoke` — mints the warrant, pushes it to every peer, then arms them by restarting each over the operator's own SSH under ONE consent for the batch; a peer with no SSH record is reported `warrant stored, anchor INACTIVE — restart <member>`, never skipped; a re-run re-syncs rather than re-minting (9da3064)
+- **The standby door and the takeover** — a second listener (`COLLIE_STANDBY_PORT`) armed only when a verified warrant names this machine and the lead has gone silent past its threshold; the operator's one tap asks the lead, asks the peers, and takes the crown (RFC §6/§7) (69b1480)
+- ADRs 0027/0028, the deputy runbook, and the death-of-a-lead story in `PACK_PROTOCOL.md` (6582395)
+- `pack status` renders the whole arming state: the deputy line on a lead, per-member stored/anchored columns, `lead last called me …` and the stored warrant on a peer, a loud DEPOSED banner naming the new lead, and `pack deputy` refuses a lead with no paired device rather than minting a door nobody can open (c131c56)
+- `collie pack set-address <member> <host:port>` — repairs a peer's row after a takeover leaves it undialable; a healed peer now tears down its own `tailscale serve` mapping instead of leaving the old front door black-holed (12994fc)
+
+### Fixed
+
+- **A two-anchored peer resolves its caller by signature, never by the TLS boolean** — with two anchors, an unsigned dial from the deputy resolved as the lead; every lead-to-member dial now carries a signed, receiver-bound attestation, and the deputy's own route reach stays at zero until spec 4 opts it in (7ec47b1)
+- **The deputy's push was refused as a stamp replay** — the sweep and the verb signed warrant pushes with the same key and raced the replay floor; the push now carries its own signature, and a refused store can no longer be recorded as an anchor (4119a83)
+- **Four bugs from a live drill (bluefin ↔ minibuch)** — a takeover now exits `EX_TEMPFAIL` (75) so `Restart=on-failure` revives the machine instead of stranding it; the takeover spends the designation and stamps it, so the new lead no longer reports the deposed member as its own deputy; a deputy's anchored state is now derived by matching the warrant's named member, not by presence of a certificate alone, so a witness and a deputy stop reading as the same role; the pairing-device sync is now reported and re-pushed on divergence instead of being lost on restart (348a5fe)
+- **The lead accused an armed deputy of being un-armed** — the lead inferred anchoring solely from whether its own `pack deputy` restarted that machine, so a restart done any other way read as `anchor INACTIVE — restart <member>`; the peer now reports `warrantActiveGeneration` on `hello`/`snapshot`, the lead prefers that report over its `pack-ops.json` record and writes a confirmation back, and a `pack deputy` re-run against an already-armed pack asks nothing (d1fb381)
+- **A device revoked on the lead stayed valid at the deputy's standby door** — the pairing sync was refused outright on a label clash, freezing the deputy's copy for ever, so a revoked credential could still spend a takeover; the sync now always lands (its target is a separate hashes-only file, never the deputy's own registry), the clash is reported on `hello`/`snapshot` as a finding while the takeover keeps refusing it, and a `lastSeenAt` stamp can no longer write a revoked device back (3b8e9cf)
+
+## [1.0.0-beta.13] - 2026-08-20
+
+### Added
+
+- Pre-commit pack-wire guard — a wire-shape change must stage `PACK_PROTOCOL.md` or bump `PACK_PROTOCOL_VERSION` ([ADR 0025](./.adr/0025-the-wire-guard-forces-a-decision-never-a-bump.md), bee6e02)
+- Pack diagrams — topology, one poll sweep, and "When the lead dies" in `PACK_PROTOCOL.md` (1ce9e32)
+
+## [1.0.0-beta.12] - 2026-08-20
+
+### Added
+
+- The header's "Collie on tmux" line carries the multiplexer's own mark — adapter-supplied SVG served sandboxed at `/api/mux/logo.svg`, rendered as an `<img>` so adapter markup never becomes document markup (797b955)
+
+## [1.0.0-beta.11] - 2026-08-20
+
+### Added
+
+- **Agent beacons (M11)** — on tmux/zellij, agents identify themselves through their own hooks; a beacon is a hint, never a control channel ([ADR 0024](./.adr/0024-a-beacon-is-a-hint-never-a-control-channel.md), 6585658)
+- `collie beacon emit` + `collie hooks install|uninstall|status claude` — the Claude emitter (exit 0 unconditionally, silent, env-gated) and the guarded settings installer: marker merge, symlink refusal, one-time backup, self-heal (af4d5ea)
+- `withAgentBeacons` — a decorated tmux/zellij pane carries its agent's name, status (`waiting` surfaces as blocked) and session ref; capabilities lift when hooks are installed, scope checks keep a second server's `%7` out (1e17dd3)
+- Pane history on tmux/zellij rides the beacon's session ref through the unmodified journal; `journal-probe.ts` gains a read-only beacon section (4ba5f54)
+- `collie doctor` gains `beacon-hooks-claude` + `beacons` (warn, never error), and a pane whose foreground command looks like a harness carries one hint sentence — never an identity (7465efa)
+
+## [1.0.0-beta.10] - 2026-08-20
+
+### Added
+
+- The brand header says which multiplexer this collie drives — "Collie on tmux" — from the config's display name, never a name branch (4fc2a73)
+- **Peer panes are gzipped on the lead→phone hop again** — as a stream transform over the peer's identity bytes, ETag untouched, `vary` merged; restores the ~20x cellular saving the beta.9 honesty fix gave up ([ADR 0023](./.adr/0023-compression-is-hop-local-on-the-pack-link.md), 44d8de3)
+
+### Fixed
+
+- **The "unreachable" banner flapped on a healthy watched peer** — the phone's staleness tolerance was measured against a receipt only the lead's 12 s idle sweep refreshed; every landed proxied call now stamps the receipt (successes only, monotone), and the UI splits the facts: staleness is a receipt age, "unreachable" and refusal claims gate on `writable` alone, across banner, host chip and switcher (c97e434)
+
+## [1.0.0-beta.9] - 2026-08-20
+
+### Fixed
+
+- **Peer panes rendered "(no recent output)" in the app** — the lead re-emitted the peer's `Content-Encoding: gzip` over a body Bun had already decompressed, so the browser failed every peer body read (curl ignored the header, which is why shell checks stayed green); the peer hop is now explicitly identity and the header left the proxied list, with a harness test pinning "the headers describe the bytes" (bc718fb)
+
+## [1.0.0-beta.8] - 2026-08-20
+
+### Fixed
+
+- **A cold pack link now bootstraps on a relayed path** — the first data request per link dials on the patient budget (one credit, spent at issue), so a DERP-relayed TLS handshake no longer aborts at the strict per-poll budget and strands the link cold forever; warm requests stay strict ([PACK_PROTOCOL.md §10.5](./PACK_PROTOCOL.md), 8360d08)
+- `collie doctor` / `pack status` / `reconnect` send one real snapshot after `hello` and name an answered-but-starved link instead of reporting green (8360d08)
+- The `COLLIE_PACK_TIMEOUT_MS` clamp warns at boot, naming the `COLLIE_POLL_MS` value that would honour the requested budget (8360d08)
+
+## [1.0.0-beta.7] - 2026-08-20
+
+### Added
+
+- **The mux contract** — one Collie-owned port for everything a multiplexer must answer (`bridge/mux/`), capabilities declared per adapter and never inferred from a name, the evidence matrix in [`MUX_CONTRACT.md`](./MUX_CONTRACT.md) ([ADR 0022](./.adr/0022-the-mux-seam-is-a-port-collie-owns.md), c516cfd)
+- **A conformance suite every mux adapter must pass** — 7 read-only + 10 world checks run against every registered adapter by iterating the registry; live layer in `scripts/mux-probe.ts`; contributor doc [`MUX_CONTRIBUTING.md`](./MUX_CONTRIBUTING.md) (b184767)
+- **The tmux adapter** — `COLLIE_MUX=tmux` lists, reads (colour preserved) and types into a tmux server; session→space, window→tab; events via read-only control mode with a bounded census backstop (74bb86c)
+- **The zellij adapter** — `COLLIE_MUX=zellij` drives one zellij session; content streams over `zellij subscribe`, topology polls a bounded 3s→12s census; scrollback via `dump-screen --full`, never called history (8bf0951)
+- **The UI reads capabilities, never a multiplexer name** — the active adapter's declaration rides `GET /api/config`; absent capabilities hide the meaningless and explain the expected in the adapter's own words; `scripts/check-mux-names.sh` keeps mux-name literals out of `web/src` (e9f7c83)
+
+### Changed
+
+- **Herdr is now the reference mux adapter** behind the port — every bridge consumer depends on `MuxAdapter`, construction goes through the registry with Herdr the default, no operator-visible change (1ef399c)
+
+## [1.0.0-beta.6] - 2026-08-19
+
+### Added
+
+- **A routine `update` now stays inside its installed major and follows release tags** — a managed checkout resolves the newest `vX.Y.Z` inside its major and detaches onto it; a linked clone keeps its ff-only pull, gated by a pre-flight read of the manifest. Crossing a major needs `update --major`, also wired as the `update-major` plugin action, because a Herdr action has no TTY to prompt on ([ADR 0020](./.adr/0020-a-major-upgrade-is-consented-by-flag.md), fcb48a9)
+- The update banner distinguishes a routine release from a pending major, ranked below it so the operator takes what a plain tap can actually deliver first (76b2813)
+- **`collie link` / `collie unlink` publish the binary on PATH as a symlink, never a copy** — the pointer is never stale because it is never refreshed, and `link`/`unlink` only ever touch a name Collie itself published; `doctor` gains a `path-link` line ([ADR 0021](./.adr/0021-the-path-name-is-a-pointer-never-a-copy.md), 3287194)
+
+### Fixed
+
+- **The linked-clone major gate judged the wrong commit** — it read the manifest at the remote's default branch while `--ff-only` advances the current branch from its own upstream, so a clone on a maintenance branch judged a major it would never actually pull; it now fetches the configured refspec and reads the manifest at `@{u}` (f8ad03d)
+
+## [1.0.0-beta.5] - 2026-08-18
+
+Adds a lint gate; changes no operator workflow. Reasoning:
+[ADR 0019](./.adr/0019-oxlint-and-vendored-anti-slop-are-the-lint-gate.md).
+
+### Added
+
+- **oxlint + the vendored [anti-slop](./tools/oxlint/README.md) plugin are the lint gate** — one root `.oxlintrc.json`, all 15 anti-slop rules plus oxlint's correctness/suspicious/perf catalog at `error`, run with `bun run lint` (92b8fff)
+- The gate runs on five surfaces: the editor (`.vscode/`), the agent edit loop (`.claude/hooks/lint-edited-file.sh`, PostToolUse), pre-commit over staged files (`SKIP_LINT_CHECK=1`), `collie build` full-tree (`SKIP_LINT=1`), and CI before typecheck/test — every one shelling out to the same config with no flags of its own (ae0e1d0, 5299ece, 864a90c, 0f05edf)
+- `.adr/0019` records the decision, the one triage pass's rule-by-rule rationale table, and the fix-shapes for the rules you'll trip most; CLAUDE.md gains the rule and lists every `SKIP_*` escape hatch in one place
+- The pre-commit hook's version and lint guards are independently skippable — `SKIP_VERSION_CHECK=1` used to exit 0 out of the whole hook (ae0e1d0)
+
+### Changed
+
+- **TypeScript 7.0.2 on both sides** — zero new diagnostics, no source or tsconfig edits; typecheck drops to ~0.3s root / ~0.6s web. TS7 ships no `tsserver` bin, only `tsc` (3935eaa)
+- **2,851 lint findings paid down to zero by fixing code** — no suppressions, no rule downgrades outside the one triage pass. Boundaries now parse instead of assert: new `bridge/json.ts` / `web/src/lib/json.ts` (`JsonValue`), `web/src/lib/env.ts` (capability probes), `web/src/test/stub.ts` (1373a02..a3159fd)
+
+### Fixed
+
+- **A journal line that is literally `null` threw a `TypeError` out of all four parsers** instead of being skipped like any other unusable line (242e49d)
+- **Three bridge write routes answered on a body they only declared** — a non-string `text` reached `pane.send_text`, `submit: 0` meant "type but don't send", and a non-string `workspaceId` threw a `TypeError` out of the handler; each is a 400 now (b19fc35)
+- **An unrecognised pairing refusal rendered a blank card** — the failure name was asserted into a union whose exhaustive switch then returned `undefined`; it falls back to the bridge's own copy (a6a91bb)
+
+## [1.0.0-beta.4] - 2026-08-18
+
+### Fixed
+
+- **The audit log is size-capped** — a pack refusal is audited before any factor authenticates, so a caller who can reach the listener could grow it without bound; the appender now rotates to `audit.log.1` at 5 MiB, keeping one generation, and a failed rotation still appends (3e1c286)
+
+## [1.0.0-beta.3] - 2026-08-18
+
+Merges `main` 0.31.0 + 0.31.1 into v1 (entries below). v1-specific on top of them:
+
+### Added
+
+- **`push-keys` is a `bin/collie` verb** (`cli/push-keys.ts`, also spelled `collie push keys`) rather than shell in the bootstrap shim — main implemented it in `collie-ctl.sh` because it has no `cli/`; on v1 every verb is implemented once in `cli/` and the shim only delegates (ADR 0006). Behaviour is main's, unchanged: `--force`, subject-only update, symlink refusal, no placeholder subject, mode 600, `wx` temp file
+- **`collie push list|forget`** — the orphaned subscriptions already on disk get a surface: one line per row (service host, first-subscribed day, user agent, enough endpoint to retype) and `forget <substring>` / `--all` to drop them; neither goes through `init()`, so both answer with no VAPID keys configured (b62e7e7)
+- `scripts/collie-cli.test.sh` drives `push-keys` through the compiled binary — resolved `.env`, mode, the refusal to replace live keys, the subject-only update, `--force`, and the symlinked-`.env` refusal
+
+### Changed
+
+- `AuditLog`'s options object carries v1's pack `defaults` alongside main's `content`, so scoped pack logs and `COLLIE_AUDIT_CONTENT` redaction compose; every call site passes `{ now }` instead of a positional clock
+- `/api/config` reports `operatorCommands` through `bridgeConfigBody()`, so the pack `mode` key and the operator's palette rows share one omit-when-empty body
+- Drafts' two tiers key off the `(host, session, paneId)` scope, so the memory tier cannot disagree with disk about which pane is which
+
+### Fixed
+
+- **Re-adding an enrolled peer restarts it there** — `pack add` on a member whose checkout is behind replaced the build and then reported the process it had superseded; a run that changed something on the far machine now runs that machine's own `collie restart` and states what the member reports over the pack link afterwards (4574af5)
+
+## [1.0.0-beta.2] - 2026-08-15
+
+### Added
+
+- **`collie pack update <member>… | --all`** — level peers to the lead's build from the lead: read-only probe of every target, ONE consent question for the whole batch, then per member push the commit, restart, and verify the new version over the pack link; a failure is recorded and the run continues, ending in a table and a non-zero exit. A bare `pack update` is a usage error listing members and versions, a member with no ssh record is skipped with its remedy, a dirty remote checkout is refused, and there is no `--yes` (c5a1815)
+- The update rides the operator's own SSH and never the pack wire — over-the-wire updating would add the inbound admission surface ADR 0013 rejects and make a compromised lead a human-free code-execution credential on every peer (ADR 0016, 770140c)
+- **`pack-ops.json`** beside the trust store — member id → the ssh host, remote checkout and port the operator last used, so `pack update` need not be retaught what `pack add` already knew; operator-local convenience data, never a wire field and never a trust-store field, fails closed on a partial read (3d7f645). `pack add` banks the route on a finished run and `pack remove` forgets it (ffde078)
+
+### Changed
+
+- Version-skew warnings in `pack status` and `collie doctor` name `collie pack update <member>` with the member ids already in it, instead of "update the older machine"; `PACK_PROTOCOL.md` §7.1's remedy sentence and the README follow (770140c)
+- `cli/remote.ts`'s legs are three emit-free step runners plus the failure-family helpers, so a second verb can drive them — `pack add` prints exactly what it printed before, in the same order (ffde078)
+
+## [1.0.0-beta.1] - 2026-08-15
+
+### Added
+
+- **`COLLIE_PUBLIC_URL` is the front-door address source** — set the real ingress once and every `pack invite` / `pack add` derives it, instead of handing joiners a derived tailnet name a one-way ACL makes undialable; origin only, a bad value warns and falls through, the peer's `pack-listener` address is untouched (cdeab7e)
+- **`doctor`, `status`, `pack status` and `pack add` render with ink on a TTY** — findings table, boxed banner, roster coloured by reachability, a spinner per `pack add` leg; every verb keeps its plain branch, selected by `isTTY && !CI && !--plain` (24dc52f, 62e2ba5, 7c9958b)
+- `collie promote` prints the demoted lead's repair steps and lists every remaining member for re-join — the peer sweep could never land through a peer that pins only its current lead (c9a7373, b02d4a8)
+- README: the 0.x → 1.0 migration path — one action, one must-do, a rehearsed way back (893c511)
+
+### Changed
+
+- **Commander owns parsing and dispatch**, built from the existing `COMMANDS` table so the usage line cannot drift from the verb list; it never exits or prints on its own — usage errors stay in this CLI's words and the pack exit codes survive (309c15e)
+- Herdr action titles say "Collie", not "web bridge" — titles only; action ids and command strings stay frozen (ADR 0006, ADR 0012) (9a2015a)
+
+### Fixed
+
+- **A non-minimal DER serial made 1 certificate mint in 512 unparseable** — the cert minted and fingerprinted but could never be re-parsed, so every pin re-derived from its PEM failed: in a pack that is a member that cannot be pinned, verified or served. Any member enrolled by an affected run must be re-enrolled (`collie pack remove` + a fresh join); `derInteger` now emits the shortest form and the rule is pinned deterministically (4037601)
+- **`COLLIE_INSTANCE` discovers its own conventional config dir and refuses another instance's** — a second instance's pack verb silently read the default instance's trust store and minted a fresh identity into the live one; an injected `HERDR_PLUGIN_CONFIG_DIR` still wins (73a2853)
+- `collie join`'s enrollment dial gets a 15s budget — an unreachable lead used to hang on the OS's TCP patience (5+ minutes observed); the peer's UNREACHABLE branch now names `--address` as the escape hatch (1177b57)
+- `pack add`'s git-bundle legs: `create` bundles HEAD rather than a bare sha it refuses, and `verify` runs in a scratch repo under `$WORK` (27ee624, 80b996f)
+- The `status` banner probes the bridge's actual bind instead of assuming loopback (2941300)
+- `collie build` runs on a bare checkout again — commander is lazy-loaded (fa6ecfa); `pack add` renders plain where ink would not fit (18a7b98) and surfaces the install leg's own error line (683ce68)
+- The lead's own roster entry is a machine label, not the pack name (43173a2); the standalone machine chip above the composer input is gone (4efb152)
+- A composer test's stall no longer outlives its test and lands in the next one (df879dd)
+
+## [1.0.0-alpha.16] - 2026-08-13
+
+### Added
+
+- **Device pairing** — `collie pair` mints a one-time code, the phone spends it in Settings for a bearer token, and from then on every write needs it; enforced exactly while at least one device is paired, so an install that pairs nothing is unchanged (1b4d502)
+- `collie devices list` / `collie devices revoke <label>` — revocation lands on the running service without a restart (1b4d502)
+- `POST /api/pair`, `GET /api/devices`, `POST /api/devices/revoke`, and a paired-devices section in Settings (1b4d502)
+
+### Changed
+
+- A write refused for want of pairing answers `403 device not paired`, distinct from the header gate's `device not authorised`; the two gates stay independent and compose by AND (1b4d502)
+- Audit lines and the snapshot's `device` field prefer the pairing label over the proxy-asserted header name (1b4d502)
+
+## [1.0.0-alpha.15] - 2026-08-12
+
+### Fixed
+
+- A hand-typed `collie join` on a default-configured peer no longer records a portless callback address the lead would dial forever at :443 — a derived pack-listener address now always carries this instance's own port; lead/front-door addresses and explicit `--address` values are untouched, and records minted before the fix are repaired with `collie reconnect` (3459297)
+
+### Changed
+
+- Docs retire "bridge" as vocabulary for the instance — "a collie" is the participant, "bridge" stays the component (ADR 0012's landing rule) (2122f08)
+
+## [1.0.0-alpha.14] - 2026-08-12
+
+### Added
+
+- **`collie pack add <ssh-host>`** — probe, install, configure, enroll a peer over one multiplexed SSH connection (ADR 0015): pushes the lead's own commit as a `git bundle`, writes the peer's bind from a value read off that machine, and pipes the invite token over stdin only; the last line reports whether the member is non-provisional after first contact (42114c0)
+
+## [1.0.0-alpha.13] - 2026-08-12
+
+### Added
+
+- **`collie doctor`** — one read-only pass over the traps that fail silently: bind/ACL/front-door/web-dist/herdr-socket/clock locally, drift/rotation/reachability/version-skew in a pack; every finding names the fixing verb, warnings exit 0, `--json` for scripts (27e756b)
+- A member probe's success now carries the far side's HTTP `Date` (transport metadata, not a wire field) — doctor's clock check reads it against §8.6's ±5m signature window (1dc6c72)
+
+## [1.0.0-alpha.12] - 2026-08-12
+
+### Added
+
+- **Version-skew policy (§7.1, closes §17's last open item)** — `hello`'s response carries the answering build's version (optional, additive; absent = pre-amendment, rendered honestly); `pack status` shows each member's version and warns on skew naming both versions and the remedy; the protocol integer alone refuses — build skew never does (0119635, 453a323)
+- `bridge/version.ts` — one version resolver shared by CLI and bridge (bare string on the wire, printed form for humans), threaded into the pack router once at boot (453a323)
+
+### Changed
+
+- Docs teach `bin/collie <verb>` as the operator spelling; `collie-ctl.sh` survives as the bootstrap shim it now is, explained once (c08f8f9)
+- ADR 0015 — `pack add` will push the lead's own commit over the operator's SSH (own transport, git bundle, no new wire surface); spec groundwork, no behavior yet (d4a1ad4)
+
+## [1.0.0-alpha.11] - 2026-08-11
+
+### Added
+
+- `collie qr` — the QR verb is now in the binary, with the tailnet-ACL probe it needs; `collie-ctl.sh qr` keeps working via delegation (15c559e)
+
+### Changed
+
+- **M6/01** — `scripts/collie-ctl.sh` is now a 106-line bootstrap shim: it resolves Bun, builds `bin/collie` from source when absent, and execs it — the CLI is the single implementation of every lifecycle verb. Manifest command strings, action ids and every `collie-ctl.sh <verb>` spelling are byte-identical (frozen per ADR 0006), so nothing operator-facing changes; the script's ignorance of `COLLIE_INSTANCE` goes away with the duplicated logic (9bb86b8, 8268659)
+- The shim no longer sources `.env` for Bun resolution — a `BUN_INSTALL` set only there must move to the environment; the CLI still reads `.env` for everything else (9bb86b8)
+
+## [1.0.0-alpha.10] - 2026-08-11
+
+### Security
+
+- **F2 closed** — the lead demotes only against a live operator approval minted on itself: `collie pack approve-promote <member>` (ten minutes, single-use, `--cancel`, restarts the bridge so the running process holds it); an unapproved `POST /pack/v1/lead` gets an honest 403 (`handover_not_approved`), byte-identical whoever is approved, and the demotion additionally requires the claim's fingerprint to match the pinned member's so consent binds the certificate, not just the id (a5f043c)
+- **F2** — `collie promote` now surfaces the lead's refusal verbatim and exits without suggesting `--force`; a refusal is proof the lead is reachable, and `--force` stays reserved for a machine known gone (a5f043c)
+- **F2 spec** — ADR 0014 + `PACK_PROTOCOL.md` §14 rewrite (promotion is a confirm on the receiver); the peer-side signed handover is relocated to §16 reserved — a peer pins exactly its lead, so the branch it would guard is transport-unreachable in v1 (6d770f1)
+
+### Added
+
+- `pendingHandover` trust-store field (optional, absent = no live approval, fail-closed; `TRUST_STORE_VERSION` stays 1) and a `pack status` line showing a live approval and its remaining window (f232b1f, a5f043c)
+
+## [1.0.0-alpha.9] - 2026-08-10
+
+### Security
+
+- **F5** — `collie join` refuses an `http://` lead address unless `--insecure` is passed: over a plaintext hop the token and pack secret cross in the clear, and an on-path attacker who reads the token can self-enroll its own certificate before the honest joiner (the lead admits on the token alone). **Breaking:** an http:// join that used to work now needs `--insecure` to own the trusted-hop assumption (13a4198)
+- **F5** — `PACK_PROTOCOL.md` §8.2/§8.5 corrected: F1's fingerprint pin authenticates the lead to the joiner but does not defend the lead against a token-thief on a plaintext hop (13a4198)
+
+### Added
+
+- `pack status` flags a never-contacted (provisional) member — an enrolled member the lead has never once reached looks exactly like a half-finished join; it says so and points at `pack remove`, cleared on first successful contact (1f43c4c)
+
+### Changed
+
+- `pack rotate` warns it has no grace window — a peer offline at rotation misses the pickup and drops to an `unenrolled` tombstone that must re-join; `pack rotate` is the leaked-secret remedy, at that cost (13a4198)
+
+## [1.0.0-alpha.8] - 2026-08-08
+
+### Security
+
+- **F2** — `PACK_PROTOCOL.md` §8.5 threat model corrected: a compromised peer can issue a consent-free `POST /pack/v1/lead` self-claim that denies the pack and, after the old lead's next restart, drives the *former lead's* terminals — beyond the "its own machine's terminals" the doc claimed; containment (per-member pinning) and the deferred mitigation (promote-as-confirm) stated honestly; no behavior change (6ba66a3)
+- **F2** — added a `bun test` canary (`bridge/pack/harness.test.ts`) that asserts Bun 1.3.14 still cannot read a presented client certificate per request and that `server.reload({tls})` cannot re-pin live — it fails loudly when either premise breaks, cueing dismantling of `transportPinned` / signing.ts / §8.6 (6ba66a3)
+- **F2** — cross-referenced the "roster of one → boolean attestation" assumption from ADR 0012 into `transport.ts`/§8.6, and noted two inert v2 hazards in comments: the signed string binds neither receiver nor pack id (signing.ts), and the signedAt admission-read vs floor-commit TOCTOU (router.ts) (6ba66a3)
+
+## [1.0.0-alpha.7] - 2026-08-08
+
+### Fixed
+
+- **F3** — `PACK_PROTOCOL.md` §3 no longer claims a peer binds "loopback plus exactly the join address, no `0.0.0.0`" (never implemented, not expressible — `Bun.serve` takes one hostname): the pack listener binds `COLLIE_HOST` and the operator owns that bind; a peer on a wildcard bind (`0.0.0.0`/`::`/empty) now emits a loud startup warning, and `collie pack status` shows the resolved bind — the two-factor gate is unchanged, only who may attempt it (ADR 0013 amended) (813c09d)
+
+## [1.0.0-alpha.6] - 2026-08-08
+
+### Security
+
+- **F1** — the enrollment invite now carries the lead's certificate fingerprint (`<token>.<lead-fingerprint>`); `join` sends only the token on the wire but refuses a lead whose certificate does not match the invited fingerprint, and fails closed on an old-format token — closing the MITM/relay on the enrollment path where nothing authenticated the lead to the joiner (3ab1998)
+
+## [1.0.0-alpha.5] - 2026-08-08
+
+### Security
+
+- **F4** — an unauthenticated `POST /pack/v1/enroll` no longer rewrites the trust store (private key + pack secret) or appends a spend audit line when the token spends nothing; a no-op `consumeInvite` now returns `null`, while an expiry sweep still persists, and both refuse identically (2dc6995)
+
+## [1.0.0-alpha.4] - 2026-08-07
+
+> v1 integration line. M5 complete: the phone knows about servers. First real pack live (bluefin lead + minibuch peer).
+
+### Added
+
+- **Prerelease bar** — ALPHA/BETA/RC badge on the header, auto from the build version, sky-toned (82657ac, 35a5fbb)
+- **COLLIE_INSTANCE side-by-side knob** + enrollment/demotion staleness surfaced in pack status (e5b0e6b)
+- **Host dimension in the web app** — ?h= addressing, (host,session,paneId) cache keys, widened draft keys (8883491)
+- **Server view** — switcher, host chips on rows/pane/Send, packed dashboard, honest staleness (df82da4)
+- **Two-tier connection health** — per-host live/stale/unknown against the lead's clock; stale panes keep last-good mirror, writes gate with the host named (72991c0)
+- **Host-scoped notification taps + /pack/v1 SW denylist**; unreachable servers navigate to last-good instead of disabled rows (97de117)
+
+### Fixed
+
+- cli/pack.test.ts flake: test harness raced a real pack timeout against synchronous fakes (72991c0)
+
+### Known gaps (bridge follow-ups tracked)
+
+- Peer listener binds COLLIE_HOST only (ADR 0013 loopback+join-address bind unimplemented; workaround: COLLIE_HOST=<tailnet IP>)
+- A join exiting unreachable can half-enroll (spent token + ghost member on the lead); scheme-less lead addresses fail to dial
+
+## [1.0.0-alpha.3] - 2026-08-07
+
+> v1 integration line. M4 complete: the pack federation engine, end to end.
+
+### Added
+
+- **Instance modes + pack config** — solo/lead/peer derived from enrollment alone; conflict fails toward peer (adf0b8c)
+- **Trust store, enrollment, two-factor admission** — hashed spend-once invites, uniform 401, version negotiation behind the gate (79a8552)
+- **Lead-side peer client + registry** — verdict classification, clamped timeout budget, last-good state that never vanishes (d00d9cd)
+- **Merged snapshot + peer sweep on the existing poll** — host-tagged sessions, no second timer, host addressing mounted (67a0682, 58a5c7d)
+- **Byte-for-byte per-pane proxy + forwarded writes** — ETag/304 fidelity, refuse-before-attempt, unknown-outcome discipline, dual-sided audit (eb7c51c)
+- **Push convergence** — the lead notifies for the whole pack; peers mute, alerts resume on leave (d953dc9)
+- **Pack operator verbs** — invite/join/leave/status/rotate/remove/promote/reconnect with role checks and stdin-only secrets (e5d28fd)
+- **Real mTLS pinning + signed membership + two-instance e2e harness** — in-repo certificate minting, handshake-enforced pins, ECDSA-signed membership routes, 32 live assertions (409a410)
+
+### Known gaps (tracked for the next spec)
+
+- The lead needs a restart after its first enrollment before it starts merging; promote does not restart the demoted machine (409a410)
+
+## [1.0.0-alpha.2] - 2026-08-07
+
+> v1 integration line. M3 complete: the `collie` CLI fully absorbs `collie-ctl.sh`.
+
+### Added
+
+- **`collie` CLI skeleton** — compiled binary (`bun run build:cli`), verb table, env-stripped context/tool resolution; compile-safe root anchoring replaces `import.meta.dir` (66baccc)
+- **Native lifecycle verbs** — start/stop/restart/status/url/logs, `_exec-bridge` as the unit's ExecStart, COLLIE_SUPERVISOR test seam (c3b819d)
+- **Native front door + uninstall** — serve/unserve with the managed-handler ownership record (ADR 0001), uninstall (13399b9)
+- **Native build/update/push-test** — dual atomic swap (binary + dist), ADR 0006 two-shape update re-execing the fetched source, in-process push-test (0a898d1)
+
+### Changed
+
+- Root `bun run build` now runs the version gate; `collie-ctl.sh` remains intact as fallback (shim-vs-delete deferred to M6) (0a898d1)
+
+## [1.0.0-alpha.1] - 2026-08-07
+
+> **`1.0.0-alpha.x` is the v1 integration line, not a shipping release.** `0.24.2` remains the
+> released line for operators; nothing here changes a running deployment's behaviour.
+
+### Added
+
+- **Pack federation protocol contract** — `PACK_PROTOCOL.md` (wire contract, trust model, solo
+  zero-tax §11) plus ADRs 0011–0013 (9bd9301)
+- **Solo zero-tax characterization baseline** — `bridge/solo-baseline.test.ts` + committed goldens
+  pin today's snapshot bytes, ETag, routes, config/env keys, `<stateDir>` file set, notification tags
+  and audit lines before any federation code exists (407aada)
+- **Client half of the baseline** — `web/src/lib/solo-baseline.test.ts` pins the mirrored wire types (407aada)
+  and that a solo client emits no host param
+
+### Fixed
+
+- **`PACK_PROTOCOL.md` §11's files-written row omitted `update-state.json`** — the baseline found it;
+  the row now lists the real set
+
 ## [0.32.0] - 2026-08-19
 
 ### Added
@@ -508,6 +884,8 @@ argued about again.
 ## [0.9.1] - 2026-07-09
 
 ### Security
+
+- Unauthenticated `POST /pack/v1/enroll` no longer rewrites the trust store or appends an audit line on a no-op spend — write-amplification against the key/secret file (F4) (2dc6995)
 - Removed one-tap yes/no reply buttons from push notifications — they POSTed to the terminal without opening the app, i.e. approving blind. Notifications now only deep-link to the pane (cb26ee0)
 
 ## [0.9.0] - 2026-07-07
@@ -565,6 +943,8 @@ argued about again.
   is a no-op, so no notes UI is shown).
 
 ### Security
+
+- Unauthenticated `POST /pack/v1/enroll` no longer rewrites the trust store or appends an audit line on a no-op spend — write-amplification against the key/secret file (F4) (2dc6995)
 - **Preview-note tap guard hardened to region-signature parity.** The preview dialog's race guard now
   carries a pointer- and note-independent **core signature** (the subject/question/stepper above the
   options joined with the option rows' left column, `❯` normalised) — matching the 0.4.0 `signature`
@@ -635,6 +1015,8 @@ argued about again.
   the raw mirror (drive it with the keys pad, or via the new escape hatch) rather than mis-sending.
 
 ### Security
+
+- Unauthenticated `POST /pack/v1/enroll` no longer rewrites the trust store or appends an audit line on a no-op spend — write-amplification against the key/secret file (F4) (2dc6995)
 - **Prompt/wizard taps are guarded against same-shaped successor dialogs.** The tap race guard now
   compares a byte-signature of the whole dialog region — including the subject above the options (the
   diff/command being approved), not just the question and option labels. So a tap on a frozen mirror

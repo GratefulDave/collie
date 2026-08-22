@@ -20,9 +20,11 @@
 import { fetchPane, sendReply } from "./api";
 import { parseAnsi } from "./ansi";
 import { splitLines } from "./blocks";
+import { graphemeSegmenter } from "./env";
 import { adapterFor, type HarnessAdapter } from "./harness";
 import { POLL_ATTEMPTS, POLL_DELAY_MS, defaultSleep, type Sleep } from "./harness/guard";
 import { detectNoEchoPrompt } from "./no-echo";
+import type { Scope } from "./scope";
 
 export type ReplyOutcome =
   /** Text was verified in the input box and the submit key went through. */
@@ -62,10 +64,7 @@ const FOLD_SEAM = " ";
  *  precision, never the app. The `null` branches below fall back to per-code-point counting, which
  *  is exactly what this check did before clusters were understood at all — a match that stops mid
  *  cluster slips through there, as it always did. */
-const GRAPHEMES =
-  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
-    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
-    : null;
+const GRAPHEMES = graphemeSegmenter();
 
 /** A cluster nobody can see: whitespace, or formatting controls that render as nothing at all
  *  (LRM/RLM, zero-width space, soft hyphen). A cluster that merely CONTAINS one still counts — the
@@ -175,8 +174,8 @@ export interface GuardedReplyArgs {
   text: string;
   /** The pane's agent — picks the adapter whose `extractInputDraft` can read the input box. */
   agent: string | undefined | null;
-  /** The session the pane lives in (undefined = primary) — scopes every call. */
-  session?: string;
+  /** Which machine + which named session the pane lives in — scopes every call. */
+  scope?: Scope;
   /** Lines to request per verification read (undefined = the bridge's default tail, which is where
    *  the input box always is). */
   requestedLines?: number;
@@ -277,7 +276,7 @@ export async function sendGuardedReply(args: GuardedReplyArgs): Promise<ReplyOut
 
   let typed;
   try {
-    typed = await sendReply(args.paneId, args.text, false, args.session);
+    typed = await sendReply(args.paneId, args.text, false, args.scope);
   } catch (e) {
     return { status: "error", error: message(e) };
   }
@@ -296,7 +295,7 @@ export async function sendGuardedReply(args: GuardedReplyArgs): Promise<ReplyOut
     if (attempt > 0) await sleep(POLL_DELAY_MS);
     let draft: string | null = null;
     try {
-      const fresh = await fetchPane(args.paneId, args.requestedLines, args.session);
+      const fresh = await fetchPane(args.paneId, args.requestedLines, args.scope);
       const lines = splitLines(parseAnsi(fresh.text));
       // Only a screen the adapter does NOT recognise as its composer can be a raw password prompt.
       // Without that gate a match on the tail is dangerous rather than merely wrong: the notice this
@@ -375,6 +374,9 @@ interface Preflight {
   runPreType: (() => Promise<ReplyOutcome | null>) | null;
 }
 
+/** A preflight that read nothing: no pre-type sweep may run, and `refuse` says whether to send. */
+const blind = (refuse: ReplyOutcome | null): Preflight => ({ refuse, runPreType: null });
+
 /**
  * One live read, and everything the rest of the send is allowed to do with it.
  *
@@ -386,8 +388,6 @@ interface Preflight {
  * once sent they have already landed in whatever owns the keyboard.
  */
 async function preflight(adapter: HarnessAdapter, args: GuardedReplyArgs): Promise<Preflight> {
-  const blind = (refuse: ReplyOutcome | null): Preflight => ({ refuse, runPreType: null });
-
   // Nothing here can read this harness's input box, so there is no evidence to be had — and no
   // refusal to make either. Same behaviour as before an adapter grows a `composerReady`, minus the
   // sweep, which had no business going out unverified.
@@ -396,7 +396,7 @@ async function preflight(adapter: HarnessAdapter, args: GuardedReplyArgs): Promi
   const composerReady = adapter.composerReady.bind(adapter);
   let probe;
   try {
-    probe = await fetchPane(args.paneId, args.requestedLines, args.session);
+    probe = await fetchPane(args.paneId, args.requestedLines, args.scope);
   } catch {
     return blind(null); // transient read failure
   }
@@ -438,7 +438,7 @@ async function preflight(adapter: HarnessAdapter, args: GuardedReplyArgs): Promi
       // otherwise this ordering, which exists to stop keys reaching a dialog, would hand the dialog
       // the reply instead. Still fail-open on a throw: the submit key is guarded downstream.
       try {
-        const fresh = await fetchPane(args.paneId, args.requestedLines, args.session);
+        const fresh = await fetchPane(args.paneId, args.requestedLines, args.scope);
         if (composerReady(splitLines(parseAnsi(fresh.text)))) return null;
       } catch {
         return null;
@@ -460,7 +460,7 @@ async function oneShot(args: GuardedReplyArgs): Promise<ReplyOutcome> {
   // `adapterFor(agent)?.extractInputDraft`, so a pane with no adapter has no draft to sweep and the
   // composer's callback was already a no-op here.
   try {
-    const res = await sendReply(args.paneId, args.text, true, args.session);
+    const res = await sendReply(args.paneId, args.text, true, args.scope);
     return res.ok ? { status: "sent" } : { status: "error", error: res.error };
   } catch (e) {
     return { status: "error", error: message(e) };
@@ -474,7 +474,7 @@ async function oneShot(args: GuardedReplyArgs): Promise<ReplyOutcome> {
  */
 async function submitOnly(args: GuardedReplyArgs): Promise<ReplyOutcome> {
   try {
-    const res = await sendReply(args.paneId, "", true, args.session);
+    const res = await sendReply(args.paneId, "", true, args.scope);
     if (res.ok) return { status: "sent" };
     // The text is verifiably sitting in the input box and only the submit key failed — same shape as
     // the bridge's own partial-failure case. Tell the caller not to resend.
@@ -488,6 +488,6 @@ async function submitOnly(args: GuardedReplyArgs): Promise<ReplyOutcome> {
   }
 }
 
-function message(e: unknown): string {
+function message<TThrown>(e: TThrown): string {
   return e instanceof Error ? e.message : String(e);
 }

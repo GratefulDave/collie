@@ -28,7 +28,8 @@ const forkIn = {
 const config = (operatorCommands?: BridgeConfig["operatorCommands"]): BridgeConfig => ({
   push: false,
   vapidPublicKey: "",
-  ...(operatorCommands ? { operatorCommands } : {}),
+  // Optional on BridgeConfig: an absent key and an explicit `undefined` read the same downstream.
+  operatorCommands,
 });
 
 beforeEach(() => asked.mockReset());

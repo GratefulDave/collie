@@ -22,9 +22,13 @@ import { FindBar } from "@/components/find-bar";
 import { Composer, type ComposerHandle } from "@/components/composer";
 import { ThreadSidebar } from "@/components/agent-sidebar";
 import { AgentIcon } from "@/components/agent-icon";
+import { HostChip } from "@/components/host-chip";
 import { TabStrip } from "@/components/tab-strip";
 import { PaneStrip } from "@/components/pane-strip";
 import { ReadOnlyBanner } from "@/components/read-only-banner";
+import { HostStaleBanner } from "@/components/host-stale-banner";
+import { useHostHealth } from "@/components/pack-provider";
+import { writeRefusal } from "@/lib/host-health";
 import { StatusArea } from "@/components/status-area";
 import { ShellBadge, StatusBadge } from "@/components/status-badge";
 import { submitPromptFeedback, submitPromptOption } from "@/lib/prompt-action";
@@ -37,8 +41,10 @@ import type { PreviewBlockAction } from "@/components/preview-select-block";
 import type { MenuBlockAction } from "@/components/menu-block";
 import { canGrowRequestedLines, growRequestedLines } from "@/lib/loaders";
 import { shortCwd } from "@/lib/format";
+import { useMuxCapability } from "@/lib/mux-capability";
 import { historyPath, spacePath } from "@/lib/nav";
 import { isReadOnly } from "@/lib/types";
+import { usePairing } from "@/lib/pairing";
 import type { AgentView, BridgeStatus, DeviceAuth, TabView } from "@/lib/types";
 import type {
   MenuModel,
@@ -47,11 +53,12 @@ import type {
   PromptModel,
   WizardModel,
 } from "@/lib/blocks";
+import type { Scope } from "@/lib/scope";
 
 interface AgentChatProps {
   paneId: string;
-  /** The session this pane lives in (undefined = primary) — scopes every read/write + the safety chip. */
-  session?: string;
+  /** Which machine + which named session this pane lives in — scopes every read/write + the safety chip. */
+  scope?: Scope;
   agent: AgentView | undefined;
   agents: AgentView[];
   shellPanes: AgentView[];
@@ -91,7 +98,7 @@ type Drawer = "switcher" | null;
 // only to re-follow the tail after a send, focus on a mirror tap, and open find (which freezes the tail).
 export function AgentChat({
   paneId,
-  session,
+  scope,
   agent,
   agents,
   shellPanes,
@@ -120,9 +127,38 @@ export function AgentChat({
   // so a mis-detected/mis-rendered dialog can always be driven by hand with the keys pad.
   const grammarsOn = !prefs.rawTerminal;
   const isShell = agent?.kind === "shell";
-  // This device isn't allowlisted to type into agents: the backend rejects every write, so the
-  // composer drops to read-only (and shows a banner). The mirror still polls (reading is fine).
-  const readOnly = isReadOnly(device);
+  // This device may not type into agents: the backend rejects every write, so the composer drops to
+  // read-only (and shows a banner). The mirror still polls (reading is fine). Either write gate puts
+  // us here — the proxy-asserted allowlist, or a missing/rejected pairing credential — and the
+  // ReadOnlyBanner names which.
+  const { refused: notPaired } = usePairing();
+  const readOnly = isReadOnly(device) || notPaired;
+  // TIER 2: is the machine THIS pane lives on still answering the lead? Read off the pane's own host
+  // — never the ambient scope — because the pane row is what carries the truth about where it lives;
+  // `scope.host` is the fallback for a pane the snapshot has already dropped (an absent `?h=` is the
+  // lead, which `useHostHealth` resolves through the roster).
+  //
+  // Two separate answers, deliberately: `hostHealth` drives PRESENTATION (the mirror below is
+  // last-good, and says so), while `hostBlock` — the §10.3 refusal — drives WRITES. They differ by
+  // §10.2's tolerance, so a single missed sweep never flashes a banner, but a member the lead
+  // currently believes unreachable is refused the instant it says so. Neither one touches the global
+  // clock: the lead answered, so this poll was live, and the ConnectionBanner stays silent.
+  const hostHealth = useHostHealth(agent?.host ?? scope?.host);
+  const hostBlock = writeRefusal(hostHealth);
+  /**
+   * The ONE reason this pane currently refuses a write, or undefined when it accepts them. Every
+   * write handler below starts with it, so there is a single place that decides both which gates
+   * exist and in what order they speak — the device gate first (it is about YOU and holds on every
+   * machine), then the host gate (it is about ONE machine and clears on the next poll).
+   *
+   * Deliberately a function of both gates rather than two checks per handler: five handlers × two
+   * gates is exactly the shape where the sixth handler gets written with one of them missing, and a
+   * missing host gate here means keys typed at a terminal the lead can't reach.
+   */
+  const refuseWrite = useCallback(
+    (): string | undefined => (readOnly ? "Read-only — device not authorised" : hostBlock),
+    [readOnly, hostBlock],
+  );
 
   // Drawers/sheets are mutually exclusive — at most one open. A single value makes that invariant
   // unrepresentable to violate.
@@ -248,11 +284,22 @@ export function AgentChat({
   // `moreScrollback`: Herdr says this pane can still yield lines beyond the window we've asked for,
   // AND we're under the cap Herdr's own read clamp imposes. `readableLines` is undefined on an older
   // bridge/Herdr; treat that as "no idea" and stay hidden rather than offer a tap that fetches nothing.
-  const historyAvailable = Boolean(agent?.hasSession);
+  // A THIRD state joins those two on a multiplexer that keeps no agent session log at all
+  // (M10/06). It is not the same fact as `hasSession`: that one says "this pane never named a
+  // session", which is a per-pane answer an operator can act on by starting an agent; this one says
+  // "nothing here will ever name one", which is a property of the multiplexer and needs saying out
+  // loud. Hiding it is what leaves someone wondering whether Collie is broken.
+  const sessionLog = useMuxCapability("agentSessionRef");
+  const historyAvailable = Boolean(agent?.hasSession) && sessionLog.capable;
+  // Scrollback has its own capability, and it is a genuinely different one: a multiplexer can keep
+  // screen history while knowing nothing about agents. Hidden rather than explained when absent —
+  // "there is nothing older to load" is not a fact anyone comes looking for.
+  const scrollback = useMuxCapability("gridScrollback");
   const moreScrollback =
+    scrollback.capable &&
     agent?.readableLines !== undefined &&
     requestedLines < agent.readableLines &&
-    canGrowRequestedLines(paneId, session);
+    canGrowRequestedLines(paneId, scope);
 
   // Load older scrollback: raise the per-pane requested line count and refetch. The enlarged buffer
   // prepends older lines at the top, so we adopt it into the frozen display and re-anchor the scroll
@@ -262,12 +309,12 @@ export function AgentChat({
   const adoptTarget = useRef<number | null>(null); // the requestedLines a pending grow is waiting on
   const pendingRestore = useRef(false); // re-anchor scroll after the enlarged display paints
   function loadOlder() {
-    if (loadingOlder || !canGrowRequestedLines(paneId, session)) return;
+    if (loadingOlder || !canGrowRequestedLines(paneId, scope)) return;
     const el = listRef.current?.getScrollElement();
     olderAnchor.current = el ? { height: el.scrollHeight, top: el.scrollTop } : null;
     setLoadingOlder(true);
     setFollowing(false); // stay put in history rather than snapping to the tail
-    adoptTarget.current = growRequestedLines(paneId, session);
+    adoptTarget.current = growRequestedLines(paneId, scope);
     revalidator.revalidate();
   }
   // Adopt the enlarged buffer into the frozen display once the *grown* fetch lands — keyed on the
@@ -320,13 +367,14 @@ export function AgentChat({
   // result is visible. The composer stays live for the free-text rows we don't render as buttons.
   const handlePromptAction = useCallback(
     async (action: PromptBlockAction, prompt: PromptModel) => {
-      if (readOnly) {
-        setStatus("Read-only — device not authorised", "error");
+      const refusal = refuseWrite();
+      if (refusal) {
+        setStatus(refusal, "error");
         return false;
       }
       const base = {
         paneId,
-        session,
+        scope,
         requestedLines,
         detectedRevision: shown.revision,
         agent: agent?.agent,
@@ -354,7 +402,7 @@ export function AgentChat({
       // what someone just thumb-typed. Option taps ignore it.
       return result.status === "sent";
     },
-    [readOnly, paneId, session, requestedLines, shown.revision, agent?.agent, revalidator],
+    [refuseWrite, paneId, scope, requestedLines, shown.revision, agent?.agent, revalidator],
   );
 
   // Tap a wizard control (an option digit, step navigation, or the review step's submit/cancel).
@@ -365,13 +413,14 @@ export function AgentChat({
   // adapter now and still never lifts this kind; it is Tier 1 and emits raw only.
   const handleWizardAction = useCallback(
     async (keys: string[], wizard: WizardModel) => {
-      if (readOnly) {
-        setStatus("Read-only — device not authorised", "error");
+      const refusal = refuseWrite();
+      if (refusal) {
+        setStatus(refusal, "error");
         return;
       }
       const result = await submitWizardKeys({
         paneId,
-        session,
+        scope,
         requestedLines,
         detectedRevision: shown.revision,
         agent: agent?.agent,
@@ -390,7 +439,7 @@ export function AgentChat({
         setStatus(result.error || "Send failed", "error");
       }
     },
-    [readOnly, paneId, session, requestedLines, shown.revision, agent?.agent, revalidator],
+    [refuseWrite, paneId, scope, requestedLines, shown.revision, agent?.agent, revalidator],
   );
 
   // Tap a preview-dialog control (an option, the note add/edit/remove, or the wizard step nav).
@@ -401,13 +450,14 @@ export function AgentChat({
   // lifts this kind, so this handler cannot fire for another agent.
   const handlePreviewAction = useCallback(
     async (action: PreviewBlockAction, preview: PreviewSelectModel) => {
-      if (readOnly) {
-        setStatus("Read-only — device not authorised", "error");
+      const refusal = refuseWrite();
+      if (refusal) {
+        setStatus(refusal, "error");
         return;
       }
       const base = {
         paneId,
-        session,
+        scope,
         requestedLines,
         detectedRevision: shown.revision,
         agent: agent?.agent,
@@ -435,7 +485,7 @@ export function AgentChat({
         revalidator.revalidate();
       }
     },
-    [readOnly, paneId, session, requestedLines, shown.revision, agent?.agent, revalidator],
+    [refuseWrite, paneId, scope, requestedLines, shown.revision, agent?.agent, revalidator],
   );
 
   // Tap a multi-select control (toggle a checkbox, Submit, the "Chat about this" escape, or the
@@ -445,13 +495,14 @@ export function AgentChat({
   // one that emits `multi-select`, so this handler cannot fire for another agent.
   const handleMultiSelectAction = useCallback(
     async (action: MultiSelectIntent, multi: MultiSelectModel) => {
-      if (readOnly) {
-        setStatus("Read-only — device not authorised", "error");
+      const refusal = refuseWrite();
+      if (refusal) {
+        setStatus(refusal, "error");
         return;
       }
       const result = await submitMultiSelectIntent({
         paneId,
-        session,
+        scope,
         requestedLines,
         detectedRevision: shown.revision,
         agent: agent?.agent,
@@ -470,7 +521,7 @@ export function AgentChat({
         setStatus(result.error || "Send failed", "error");
       }
     },
-    [readOnly, paneId, session, requestedLines, shown.revision, agent?.agent, revalidator],
+    [refuseWrite, paneId, scope, requestedLines, shown.revision, agent?.agent, revalidator],
   );
 
   // Tap a generic-menu control (a footer-named key like Enter/s/Esc, or an arrow). Same guard-first
@@ -480,13 +531,14 @@ export function AgentChat({
   // (harness/omp/index.ts), so this handler cannot fire for another agent.
   const handleMenuAction = useCallback(
     async (action: MenuBlockAction, menu: MenuModel) => {
-      if (readOnly) {
-        setStatus("Read-only — device not authorised", "error");
+      const refusal = refuseWrite();
+      if (refusal) {
+        setStatus(refusal, "error");
         return;
       }
       const result = await submitMenuKeys({
         paneId,
-        session,
+        scope,
         requestedLines,
         detectedRevision: shown.revision,
         agent: agent?.agent,
@@ -506,7 +558,7 @@ export function AgentChat({
         setStatus(result.error || "Send failed", "error");
       }
     },
-    [readOnly, paneId, session, requestedLines, shown.revision, agent?.agent, revalidator],
+    [refuseWrite, paneId, scope, requestedLines, shown.revision, agent?.agent, revalidator],
   );
 
   // NOTE: the composer is deliberately NOT auto-focused on open/switch — that would pop the Android
@@ -531,7 +583,7 @@ export function AgentChat({
   // back up out of the pane, so it slides backward.
   function openSpace(workspaceId: string) {
     closeDrawer();
-    navigate(spacePath(workspaceId, session));
+    navigate(spacePath(workspaceId, scope));
   }
 
   // Tapping the terminal mirror focuses the composer so you can start typing right away. Three bails:
@@ -550,6 +602,9 @@ export function AgentChat({
   //    collapsing the selection and popping the keyboard.
   function focusFromMirror(e: ReactMouseEvent<HTMLDivElement>) {
     if (!prefs.tapToFocus) return;
+    // SAFETY: a React mouse event's `target` is the DOM node the tap landed on — an Element by
+    // construction for a click inside this div. React types it as the generic `EventTarget`, which
+    // has no `closest`; the optional call below still covers a target that somehow isn't one.
     const target = e.target as Element | null;
     // The `a` is what keeps a tap on an autolinked URL (components/ansi-output) from popping the
     // keyboard on top of the page it just opened. Don't trim it out of this selector.
@@ -613,10 +668,10 @@ export function AgentChat({
                   <Search className="size-4" />
                 </button>
               )}
-              {agent.hasSession && (
+              {historyAvailable && (
                 <button
                   type="button"
-                  onClick={() => navigate(historyPath(paneId, session))}
+                  onClick={() => navigate(historyPath(paneId, scope))}
                   aria-label="Conversation history"
                   className="-mr-1 flex size-8 items-center justify-center rounded-lg text-muted-foreground transition-colors active:bg-muted/60"
                 >
@@ -655,10 +710,15 @@ export function AgentChat({
               {/* A user-set pane label leads when present (the identifier they chose), then Claude's
                   own /rename session name, otherwise the default space › tab. The cwd subline keeps
                   context either way. */}
-              <div className="truncate font-semibold leading-tight">
-                {agent.paneLabel ??
-                  agent.sessionName ??
-                  `${agent.workspaceLabel}${tabLabel ? ` › ${tabLabel}` : ""}`}
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className="truncate font-semibold leading-tight">
+                  {agent.paneLabel ??
+                    agent.sessionName ??
+                    `${agent.workspaceLabel}${tabLabel ? ` › ${tabLabel}` : ""}`}
+                </span>
+                {/* Where space is tight the breadcrumb truncates the NAME (it already does) — never
+                    the host, which is `shrink-0` and therefore the last thing to go. */}
+                <HostChip host={agent.host} />
               </div>
               <div className="truncate font-mono text-xs leading-tight text-muted-foreground">
                 {shortCwd(agent.cwd)}
@@ -683,18 +743,25 @@ export function AgentChat({
         {/* Read-only notice when this device isn't allowlisted (the composer below is disabled too). */}
         <ReadOnlyBanner device={device} />
 
+        {/* The pane's MACHINE is not answering the lead — the mirror below is last-good and the
+            composer is locked. Its tier-1 twin (the app-wide ConnectionBanner) lives up in
+            RootLayout; this one is scoped to the pane because the phone's link is fine. Renders
+            nothing on a solo install, or while the host is live. */}
+        <HostStaleBanner health={hostHealth} />
+
         {/* In-pane tab bar: the current space's tabs above the mirror — switch tab without leaving the
             pane, or create one with +. No "All" here (you're always in a specific tab). */}
         {agent && (
           <TabStrip
             workspaceId={agent.workspaceId}
+            host={agent.host}
             tabs={tabs}
             agents={agents}
             selected={agent.tabId}
             onSelect={(id) => id && goToTab(id)}
             onNewTab={newTab}
             allowAll={false}
-            session={session}
+            scope={scope}
             readOnly={readOnly}
             onRenamed={() => revalidator.revalidate()}
             // Closing the tab this pane lives in kills the pane too — leave for Home the same way a
@@ -709,10 +776,10 @@ export function AgentChat({
           <PaneStrip
             panes={[...agents, ...shellPanes]
               .filter((p) => p.workspaceId === agent.workspaceId && p.tabId === agent.tabId)
-              .sort((a, b) => a.paneId.localeCompare(b.paneId))}
+              .toSorted((a, b) => a.paneId.localeCompare(b.paneId))}
             currentPaneId={paneId}
             onSelect={switchTo}
-            session={session}
+            scope={scope}
             readOnly={readOnly}
             onRenamed={() => revalidator.revalidate()}
             // Mirror closePane's success branch: closing the open pane returns Home, else revalidate.
@@ -729,7 +796,16 @@ export function AgentChat({
             straight into terminal output — the chrome and the mirror read as one surface. Drawing it
             here rather than as a border-b on PaneStrip covers the case where that strip is absent
             (a tab holding a single pane), which is the common one. */}
-        <div className="min-h-0 min-w-0 flex-1 border-t border-border/40" onClick={focusFromMirror}>
+        {/* `role="presentation"` because that is what this element is: a layout wrapper with no
+            semantics of its own. Its click handler adds nothing a keyboard user needs — focusing the
+            composer is what a keyboard user already has (the textarea is the next tabbable thing),
+            and `focusFromMirror` deliberately declines a tap that landed on a control or a text
+            selection. It is a touch convenience layered over an already-reachable action. */}
+        <div
+          role="presentation"
+          className="min-h-0 min-w-0 flex-1 border-t border-border/40"
+          onClick={focusFromMirror}
+        >
           <ChatMessageList
             ref={listRef}
             dep={display}
@@ -756,7 +832,7 @@ export function AgentChat({
                 {historyAvailable ? (
                   <button
                     type="button"
-                    onClick={() => navigate(historyPath(paneId, session))}
+                    onClick={() => navigate(historyPath(paneId, scope))}
                     className="mb-2 flex w-full items-center justify-center gap-1.5 rounded-md py-2 text-xs font-medium text-muted-foreground transition-colors active:bg-muted/50"
                   >
                     <ScrollText className="size-3.5" />
@@ -777,6 +853,21 @@ export function AgentChat({
                     {loadingOlder ? "Loading…" : "Load older"}
                   </button>
                 ) : null}
+                {/* EXPLAIN, don't hide (M10/06): on a multiplexer that keeps no agent session log,
+                    "Show entire history" is not merely unavailable — it can never appear, and a
+                    button that is simply absent reads as a bug. One muted line, in the ADAPTER's
+                    own words (it names the multiplexer; Collie is not at fault and does not say it
+                    is), at the exact place the missing button would have been.
+
+                    It renders under "Load older" rather than instead of it: screen scrollback and
+                    an agent's transcript are different capabilities, and a multiplexer can perfectly
+                    well have the first while lacking the second. Nothing renders on Herdr, which
+                    declares the capability — this whole branch is dead code there. */}
+                {!sessionLog.capable && sessionLog.note !== "" && (
+                  <p className="mb-2 px-2 py-1 text-center text-xs leading-snug text-muted-foreground">
+                    {sessionLog.note}
+                  </p>
+                )}
                 <AnsiOutput
                   text={display}
                   wrap={prefs.wrap}
@@ -865,11 +956,15 @@ export function AgentChat({
           <Composer
             ref={composerRef}
             paneId={paneId}
-            session={session}
+            scope={scope}
             agent={agent?.agent}
             isShell={isShell}
             gone={gone}
             readOnly={readOnly}
+            // §10.3's pre-flight refusal, as a disabled state AND as the placeholder copy: the
+            // composer must not invite a reply it already knows the lead will refuse, and "which
+            // machine am I typing into" has to be answerable without tapping Send to find out.
+            hostBlock={hostBlock}
             dialogPresent={dialogPresent}
             text={text}
             terminalDraft={terminalDraft}

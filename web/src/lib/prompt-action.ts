@@ -28,6 +28,7 @@ import {
 } from "./dialog-guard";
 import { promptsSameIdentity } from "./harness/prompt-model";
 import { sanitizeTypedText, type ActionResult, type Sleep } from "./harness/guard";
+import type { Scope } from "./scope";
 
 /** The prompt-select identity comparators, part of the neutral contract (harness/prompt-model.ts).
  *  Re-exported under their original names so existing call sites and tests keep one import site. */
@@ -55,8 +56,8 @@ interface GuardArgs {
   /** The `revision` the rendered menu was detected against. */
   detectedRevision: number;
   prompt: PromptModel;
-  /** The session the pane lives in (undefined = primary) — scopes the read + keystroke. */
-  session?: string;
+  /** Which machine + which named session the pane lives in — scopes the read + keystroke. */
+  scope?: Scope;
   /** The pane's agent — which adapter re-derives the fresh screen. No adapter = the guard refuses. */
   agent?: string;
   /** Test seam for the verification polls' pacing. */
@@ -135,7 +136,7 @@ export async function submitPromptFeedback(
   }
 
   try {
-    const typed = await sendReply(args.paneId, text, false, args.session);
+    const typed = await sendReply(args.paneId, text, false, args.scope);
     if (!typed.ok) return { status: "error", error: typed.error };
     // Wait for our words to render, then match them EXACTLY. The row re-flows rather than windowing,
     // and the grammar rejoins its wrapped lines, so the whole value is readable — there is no reason to

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { AuditContent } from "./audit.ts";
 import type { DialMode } from "./dial.ts";
 import type { JournalRoots } from "./journal/registry.ts";
+import { DEFAULT_MUX, muxEndpointVar } from "./mux/registry.ts";
 
 // All bridge configuration, resolved once at startup. Env-driven so the systemd unit and the
 // plugin launcher can configure it without code changes. Defaults are safe for a single-user,
@@ -57,11 +58,6 @@ function envRoots(name: string, fallback: string): string[] {
 }
 
 /**
- * Read a boolean env var. Empty/unset → `fallback`. `off`/`0`/`false`/`no` → false; `on`/`1`/`true`/
- * `yes` → true (case-insensitive); anything else falls back with a warning. Used for feature toggles
- * that default on, where a typo silently flipping the feature would be surprising.
- */
-/**
  * Read an env var constrained to a fixed set of string values, falling back (with a warning) on
  * anything not in `allowed`. Empty/unset → `fallback`. Case-insensitive.
  */
@@ -75,8 +71,20 @@ function envEnum<T extends string>(name: string, allowed: readonly T[], fallback
   return fallback;
 }
 
-function envBool(name: string, fallback: boolean): boolean {
-  const raw = process.env[name];
+/**
+ * Read a boolean env var. Empty/unset → `fallback`. `off`/`0`/`false`/`no` → false; `on`/`1`/`true`/
+ * `yes` → true (case-insensitive); anything else falls back with a warning.
+ *
+ * Exported so mode-scoped config (`bridge/pack/config.ts`) parses its env in exactly this style
+ * rather than growing a second, subtly different reader. The env source is a parameter so a caller
+ * can drive it purely; it defaults to `process.env`, which is how everything in this file reads.
+ */
+export function envBool(
+  name: string,
+  fallback: boolean,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
   const v = raw.trim().toLowerCase();
   if (["off", "0", "false", "no"].includes(v)) return false;
@@ -86,6 +94,33 @@ function envBool(name: string, fallback: boolean): boolean {
 }
 
 export interface Config {
+  /**
+   * Which multiplexer this collie drives — a name in `bridge/mux/registry.ts`. `herdr` by default,
+   * so an existing deployment that sets nothing behaves exactly as it always has. Set via
+   * `COLLIE_MUX`; an unknown name refuses to start with the valid ones in the message (`createMux`).
+   */
+  mux: string;
+  /**
+   * Where that multiplexer lives, in the ADAPTER's own terms — opaque here, exactly as a
+   * `MuxTarget`'s endpoint is. Herdr reads {@link socketPath}; every other adapter reads its own
+   * `COLLIE_MUX_ENDPOINT_<NAME>` (`muxEndpointVar`), and an empty value means "the adapter's default":
+   * for tmux, tmux's own default server. Documented per adapter, never guessed here.
+   */
+  muxEndpoint: string;
+  /**
+   * Absolute path to the `tmux` binary, when the operator has one somewhere unusual. Empty (the
+   * default) probes a short list of fixed paths — never `PATH`, which a systemd unit and a Herdr
+   * plugin action do not share with the operator's shell (`bridge/mux/tmux/exec.ts`). Set via
+   * `COLLIE_TMUX_BIN`. Inert unless {@link mux} is `tmux`.
+   */
+  tmuxBin: string;
+  /**
+   * Absolute path to the `zellij` binary, when the operator has one somewhere unusual. Empty (the
+   * default) probes fixed paths — `~/.local/bin` first, because that is where zellij's own installer
+   * puts it — and never `PATH` (`bridge/mux/zellij/exec.ts`). Set via `COLLIE_ZELLIJ_BIN`. Inert
+   * unless {@link mux} is `zellij`.
+   */
+  zellijBin: string;
   /** Path to Herdr's control socket. A non-Herdr-launched daemon must discover this itself. */
   socketPath: string;
   /**
@@ -213,6 +248,24 @@ export interface Config {
 }
 
 /**
+ * The loopback port the bridge binds. Exported because the CLI writes it into the generated service
+ * unit and into `status` — one source of truth, so a default changed here can't leave the unit and
+ * the process disagreeing about where Collie is.
+ */
+export const DEFAULT_PORT = 8787;
+
+/**
+ * The address the bridge actually binds: an absent `COLLIE_HOST` resolves to loopback, anything set
+ * is used verbatim (empty string included — that's the wildcard-bind case `bindIsWildcard` names).
+ * Pure and exported for the same reason as {@link resolveStateDir}: `cli/doctor.ts`'s bind check and
+ * the `collie start`/`status` banner's readiness probe (`cli/lifecycle.ts`) both need the bridge's
+ * real bind from their own merged `.env`, not a re-derived guess that could drift from this one.
+ */
+export function resolveBridgeHost(env: Record<string, string | undefined> = process.env): string {
+  return env.COLLIE_HOST ?? "127.0.0.1";
+}
+
+/**
  * herdr's default socket location: `~/.config/herdr/herdr.sock` on Unix, `%APPDATA%\herdr\herdr.sock`
  * on Windows (the Windows beta keeps its config root under AppData\Roaming). Pure so both branches
  * are unit-testable on any platform.
@@ -229,11 +282,43 @@ export function defaultSocketPath(
   return join(home, ".config", "herdr", "herdr.sock");
 }
 
+/**
+ * Where runtime state lives: uploads, `audit.log`, `push-subscriptions.json`, `snooze.json` — and the
+ * pack trust store. Herdr's injected dir wins, then the explicit override, then the user state dir.
+ *
+ * Pure and exported because the CLI resolves the same directory from its own `.env`-merged
+ * environment (`cli/context.ts`): the pack verbs write the trust store the bridge reads, so the two
+ * must land on the same path or an enrollment would be invisible to the running service. It names no
+ * key `loadConfig` did not already name — the solo baseline's env-key list is unchanged by it.
+ */
+export function resolveStateDir(
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  return env.HERDR_PLUGIN_STATE_DIR ?? env.COLLIE_STATE_DIR ?? join(home, ".local", "state", "collie");
+}
+
+/**
+ * The operator's config dir — where their `.env` lives, their `commands.toml` beside it, and the
+ * `tailscale serve` ownership record beside that.
+ *
+ * Resolved exactly the way scripts/collie-ctl.sh resolves it MINUS the `herdr` shell-out: the
+ * launcher passes HERDR_PLUGIN_CONFIG_DIR into the unit (and the launchd plist) precisely so this
+ * process never has to ask the CLI, and the two entry points must not disagree about which dir that
+ * is. ~/.config/collie is the same last-resort default the shim ends on.
+ *
+ * Exported for the front-door teardown (`bridge/front-door.ts`), which must find the record file the
+ * CLI wrote. It names no key `loadConfig` did not already name.
+ */
+export function resolveConfigDir(
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): string {
+  return env.HERDR_PLUGIN_CONFIG_DIR ?? join(home, ".config", "collie");
+}
+
 export function loadConfig(): Config {
-  const stateDir =
-    process.env.HERDR_PLUGIN_STATE_DIR ??
-    process.env.COLLIE_STATE_DIR ??
-    join(homedir(), ".local", "state", "collie");
+  const stateDir = resolveStateDir();
 
   const submitKeys = envList("COLLIE_SUBMIT_KEYS");
 
@@ -242,13 +327,22 @@ export function loadConfig(): Config {
   // launcher passes HERDR_PLUGIN_CONFIG_DIR into the unit (and the launchd plist) precisely so this
   // process never has to ask the CLI, and the two entry points must not disagree about which dir
   // that is. ~/.config/collie is the same last-resort default the shim ends on.
-  const configDir = process.env.HERDR_PLUGIN_CONFIG_DIR ?? join(homedir(), ".config", "collie");
+  const configDir = resolveConfigDir();
+
+  const mux = (process.env.COLLIE_MUX ?? "").trim() || DEFAULT_MUX;
+  const socketPath = process.env.HERDR_SOCKET_PATH ?? defaultSocketPath();
 
   return {
-    socketPath: process.env.HERDR_SOCKET_PATH ?? defaultSocketPath(),
+    mux,
+    // Herdr's endpoint IS its socket path, so the default adapter keeps reading exactly the setting
+    // it always read and nothing about an existing deployment moves.
+    muxEndpoint: mux === DEFAULT_MUX ? socketPath : (process.env[muxEndpointVar(mux)] ?? "").trim(),
+    tmuxBin: (process.env.COLLIE_TMUX_BIN ?? "").trim(),
+    zellijBin: (process.env.COLLIE_ZELLIJ_BIN ?? "").trim(),
+    socketPath,
     dialMode: envEnum("COLLIE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto"),
-    port: envInt("COLLIE_PORT", 8787, { min: 1, max: 65535 }),
-    host: process.env.COLLIE_HOST ?? "127.0.0.1",
+    port: envInt("COLLIE_PORT", DEFAULT_PORT, { min: 1, max: 65535 }),
+    host: resolveBridgeHost(),
     unixSocket: (process.env.COLLIE_UNIX_SOCKET ?? "").trim(),
     pollMs: envInt("COLLIE_POLL_MS", 1500, { min: 250 }),
     pollIdleMs: envInt("COLLIE_POLL_IDLE_MS", 12_000, { min: 1000 }),

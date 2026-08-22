@@ -58,6 +58,11 @@ Nothing here restates what lives elsewhere; the point is the *reasoning*, once.
 A superseded ADR is never deleted or edited into agreement with the present. Mark it
 `Superseded by NNNN` and write the new one — the wrong turn is the useful part.
 
+A decision that is still correct but whose **scope** later changes is *amended*, not superseded: the
+new ADR says what it amends, the old one gains an `Amended in scope by NNNN` pointer at the top, and
+**nothing in its body is rewritten**. If you find yourself editing the argument rather than adding
+the pointer, it was a supersede.
+
 ## Index
 
 | # | Decision | Status |
@@ -72,12 +77,25 @@ A superseded ADR is never deleted or edited into agreement with the present. Mar
 | [0008](./0008-collie-does-not-run-a-terminal-emulator.md) | Collie does not run a terminal emulator | Accepted |
 | [0009](./0009-a-generic-menu-is-driven-by-the-keys-it-names.md) | A generic menu is driven by the keys it names, never by digits | Accepted |
 | [0010](./0010-long-sends-are-verified-via-the-paste-placeholder.md) | Long sends are verified via the paste placeholder, not by chunking them | Accepted |
+| [0011](./0011-the-pack-protocol-is-the-mux-driver-seam.md) | The pack protocol is the mux-driver seam, and peers are full collies | Accepted |
+| [0012](./0012-every-machine-runs-a-collie-and-the-pack-has-a-lead.md) | Every machine runs a collie; the pack has a lead | Accepted |
+| [0013](./0013-a-peer-listens-without-becoming-a-front-door.md) | A peer listens without becoming a front door (amends 0001) | Accepted |
+| [0014](./0014-promote-is-a-confirm-on-the-lead.md) | Promotion is a confirm on the receiver, not a command from the claimant | Accepted |
+| [0015](./0015-pack-add-pushes-over-the-operators-ssh.md) | `pack add` pushes the lead's own commit over the operator's SSH | Accepted |
+| [0016](./0016-updates-ride-the-operators-ssh.md) | Updates ride the operator's SSH, never the pack wire | Accepted |
 | [0017](./0017-recognising-a-password-prompt-changes-what-collie-says.md) | Recognising a password prompt changes what Collie says, never what it sends | Accepted |
 | [0018](./0018-operator-command-rows-replace-the-catalog.md) | The operator's command rows replace the catalog, never merge into it | Accepted |
+| [0019](./0019-oxlint-and-vendored-anti-slop-are-the-lint-gate.md) | oxlint + vendored anti-slop is the lint gate; one linter; TypeScript 7 | Accepted |
 | [0020](./0020-a-major-upgrade-is-consented-by-flag.md) | A major upgrade is consented by flag; routine update follows tags within the major | Accepted |
+| [0021](./0021-the-path-name-is-a-pointer-never-a-copy.md) | The name on PATH is a pointer, never a copy | Accepted |
+| [0022](./0022-the-mux-seam-is-a-port-collie-owns.md) | The multiplexer is a port Collie owns, not a relocated Herdr client | Accepted |
+| [0023](./0023-compression-is-hop-local-on-the-pack-link.md) | Compression is hop-local on the pack link; the ETag names the identity bytes | Accepted |
+| [0024](./0024-a-beacon-is-a-hint-never-a-control-channel.md) | A beacon is a hint, never a control channel | Accepted |
+| [0025](./0025-the-wire-guard-forces-a-decision-never-a-bump.md) | The pack-wire guard forces a decision, never a bump | Accepted |
+| [0026](./0026-the-operator-is-the-quorum.md) | The operator is the quorum | Accepted |
+| [0027](./0027-the-deputy-is-named-ahead-of-time.md) | The deputy is named ahead of time, and takes over on the operator's word | Accepted |
+| [0028](./0028-the-standby-door-is-a-second-listener.md) | The standby door is a second listener that arms on silence (amends 0013) | Accepted |
 
-**0011–0016 and 0019 are not missing** — they are the pack/federation and lint-gate decisions,
-accepted on the `v1`
-integration branch and arriving here when it merges. Numbers are claimed across *both* branches, so
-the next ADR written on `main` continues from the highest number in use anywhere, not from the highest
-one in this table.
+Numbers are claimed across **both** branches: 0011–0016 were accepted here on `v1` while `main` was
+still at 0010, so a new ADR continues from the highest number in use anywhere, not the highest one on
+the branch you happen to be on.

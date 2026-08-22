@@ -25,6 +25,7 @@
 // Every entry carries the wall-clock of the fetch that produced it, because a stale render must be
 // able to say WHEN — "Disconnected — last seen 14:32" is honest, an undated old screen is not.
 
+import { paneScopeKey, type Scope, scopeKey } from "@/lib/scope";
 import type { SnapshotResponse } from "@/lib/types";
 
 const SNAPSHOT_PREFIX = "collie:last-snapshot:";
@@ -54,15 +55,15 @@ function storage(): Storage | null {
   }
 }
 
-function snapshotKey(session: string | undefined): string {
-  return `${SNAPSHOT_PREFIX}${session ?? ""}`;
+function snapshotKey(scope: Scope | undefined): string {
+  return `${SNAPSHOT_PREFIX}${scopeKey(scope)}`;
 }
 
-// A space, not NUL: the same (session, paneId) pairing the loaders key their module caches with,
-// spelled for a store whose keys are visible in devtools. Session names can't contain a space
-// (lib/session.ts normalises them), so the pair stays unambiguous.
-function paneKey(session: string | undefined, paneId: string): string {
-  return `${PANE_PREFIX}${session ?? ""} ${paneId}`;
+// The same (host, session, paneId) triple the loaders key their module caches with, built by the one
+// helper that owns that spelling (lib/scope.ts) — so this store and the module cache can never
+// disagree about which pane on which machine an entry belongs to.
+function paneKey(scope: Scope | undefined, paneId: string): string {
+  return `${PANE_PREFIX}${paneScopeKey(scope, paneId)}`;
 }
 
 // Writes are best-effort. Storage can be full (quota), disabled, or in private-mode weirdness — none
@@ -175,8 +176,7 @@ function prunePanes(): void {
   try {
     const keys = paneKeys(store);
     if (keys.length <= PANE_MAX) return;
-    keys.sort((a, b) => b.at - a.at);
-    for (const { key } of keys.slice(PANE_MAX)) store.removeItem(key);
+    for (const { key } of keys.toSorted((a, b) => b.at - a.at).slice(PANE_MAX)) store.removeItem(key);
   } catch {
     // As above — a store we can't enumerate simply doesn't get pruned.
   }
@@ -184,40 +184,40 @@ function prunePanes(): void {
 
 /** Write through the snapshot a successful `/api/snapshot` just returned. */
 export function saveLastSnapshot(
-  session: string | undefined,
+  scope: Scope | undefined,
   snap: SnapshotResponse,
   at: number = Date.now(),
 ): void {
-  write(snapshotKey(session), JSON.stringify({ at, value: snap }));
+  write(snapshotKey(scope), JSON.stringify({ at, value: snap }));
 }
 
-/** The last snapshot this tab saw for a session, with the time it was fetched. */
-export function loadLastSnapshot(session: string | undefined): Cached<SnapshotResponse> | null {
-  return decodeSnapshot(readRaw(snapshotKey(session)));
+/** The last snapshot this tab saw for a scope, with the time it was fetched. */
+export function loadLastSnapshot(scope: Scope | undefined): Cached<SnapshotResponse> | null {
+  return decodeSnapshot(readRaw(snapshotKey(scope)));
 }
 
 /** Write through the mirror a successful `/api/pane/:id` just returned. */
 export function saveLastPaneText(
-  session: string | undefined,
+  scope: Scope | undefined,
   paneId: string,
   text: string,
   at: number = Date.now(),
 ): void {
-  write(paneKey(session, paneId), encodePane(at, text));
+  write(paneKey(scope, paneId), encodePane(at, text));
   prunePanes();
 }
 
 /** The last mirror this tab saw for a pane, with the time it was fetched. */
 export function loadLastPaneText(
-  session: string | undefined,
+  scope: Scope | undefined,
   paneId: string,
 ): Cached<string> | null {
-  return decodePane(readRaw(paneKey(session, paneId)));
+  return decodePane(readRaw(paneKey(scope, paneId)));
 }
 
 /** Forget a pane's mirror — the ADR 0017 path, and the only reason to delete a single entry. */
-export function dropLastPaneText(session: string | undefined, paneId: string): void {
-  remove(paneKey(session, paneId));
+export function dropLastPaneText(scope: Scope | undefined, paneId: string): void {
+  remove(paneKey(scope, paneId));
 }
 
 /** Test helper — empty the whole cache between cases. */

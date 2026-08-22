@@ -17,15 +17,19 @@ import { DisplayPrefsContent } from "@/components/display-prefs";
 import { SectionLabel } from "@/components/ui/section-label";
 import * as api from "@/lib/api";
 import { commandsFor } from "@/lib/agent-commands";
+import { useMuxCapability, useMuxUnsupportedKeys } from "@/lib/mux-capability";
 import { useOperatorCommands, useOperatorKeys } from "@/lib/operator-config";
 import { ctrlPresetsFor } from "@/lib/operator-keys";
 import { isDestructiveInput } from "@/lib/destructive";
+import { HostChip } from "@/components/host-chip";
+import { useAmbientHost, useHostLabel } from "@/components/pack-provider";
 import { clearDraft, fitsDraftStore, loadDraft, saveDraft } from "@/lib/drafts";
 import { useHoldReload } from "@/lib/reload-guard";
 import { isSelfEcho, normalizeDraft } from "@/hooks/use-terminal-draft";
 import { adapterFor } from "@/lib/harness";
 import { sendGuardedReply } from "@/lib/reply-action";
 import { TerminalDraftPreview } from "@/components/terminal-draft-preview";
+import { scopeKey, type Scope } from "@/lib/scope";
 import { DirectTypingStrip } from "@/components/direct-typing-strip";
 import { NoEchoNotice } from "@/components/no-echo-notice";
 
@@ -36,8 +40,8 @@ export interface ComposerHandle {
 
 interface ComposerProps {
   paneId: string;
-  /** The session the pane lives in (undefined = primary) — scopes every write to the right Herdr. */
-  session?: string;
+  /** Which machine + which named session the pane lives in — scopes every write to the right Herdr. */
+  scope?: Scope;
   /** The pane's agent name — drives the slash-command palette and the reply-vs-shell placeholder. */
   agent: string | undefined | null;
   /** True for a bare shell pane (tweaks the placeholder copy). */
@@ -46,6 +50,16 @@ interface ComposerProps {
   gone: boolean;
   /** This device isn't authorised to type — locks the composer with a distinct placeholder. */
   readOnly: boolean;
+  /**
+   * The pane's MACHINE is not reachable from the lead, so a write would be refused before it left
+   * the lead (PACK_PROTOCOL.md §10.3) — the refusal text, naming the host, or undefined when writes
+   * may proceed. Always undefined on a solo install, so nothing here changes for one machine.
+   *
+   * Locks the composer exactly as `readOnly` does. It is NOT folded into `readOnly` by the caller
+   * because the two say different things and the operator's next move differs: one is "this device
+   * will never be allowed to type", the other is "this machine is quiet, wait for the next poll".
+   */
+  hostBlock?: string;
   /** A dialog (prompt/wizard/preview/multi-select) is on screen, so the TUI's keyboard belongs to it.
    * Free-text sending is refused while true — see send(). Answer it with its own buttons instead. */
   dialogPresent: boolean;
@@ -111,17 +125,24 @@ const KEY_REVALIDATE_MS = 300;
 // viewport with a tall tray. One wrapper so Keys and Quick can't drift apart.
 function ComposerDock({
   title,
+  host,
   onClose,
   children,
 }: {
   title: string;
+  /** The machine a key sent from this dock lands on. Renders nothing on a single-host install. */
+  host?: string;
   onClose: () => void;
   children: ReactNode;
 }) {
   return (
     <div className="-mx-3 mb-2 flex flex-col border-t border-border bg-background">
       <div className="flex items-center justify-between px-3 pt-2">
-        <SectionLabel>{title}</SectionLabel>
+        <div className="flex min-w-0 items-center gap-2">
+          <SectionLabel>{title}</SectionLabel>
+          {/* A key press from the Keys dock IS a write into a terminal — the dock names which one. */}
+          <HostChip host={host} variant="target" />
+        </div>
         <Button
           variant="ghost"
           size="icon"
@@ -138,12 +159,31 @@ function ComposerDock({
 }
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
-  { paneId, session, agent, isShell, gone, readOnly, dialogPresent, text, terminalDraft, rawTerminalDraft, prefs, setWrap, stepFontSize, setRawTerminal, setTapToFocus, onSent },
+  { paneId, scope, agent, isShell, gone, readOnly, hostBlock, dialogPresent, text, terminalDraft, rawTerminalDraft, prefs, setWrap, stepFontSize, setRawTerminal, setTapToFocus, onSent },
   ref,
 ) {
   const revalidator = useRevalidator();
-  // Every write affordance is off when the pane is gone OR this device is read-only.
-  const locked = gone || readOnly;
+  // Every write affordance is off when the pane is gone, this device is read-only, OR the pane's
+  // machine is unreachable from the lead. All three are "the write cannot land"; only the copy below
+  // differs, because only the copy tells you what to do about it.
+  // …plus a fourth: the multiplexer underneath cannot type into a pane at all (M10/06). It is a
+  // FOURTH reason, ANDed in rather than folded into any of the three, because capability gating
+  // composes with the app's locks and never substitutes for one — a pane that is gone stays gone
+  // however capable the multiplexer is, and vice versa.
+  //
+  // Two capabilities, one lock: a reply is `typeText` then `sendKeys` (bridge/mux/capabilities.ts),
+  // and half a reply is not a feature. `typeText`'s reason is preferred when both are missing —
+  // it is the half that fails first.
+  const canType = useMuxCapability("typeText");
+  const canSendKeys = useMuxCapability("sendKeys");
+  const missingSend = !canType.capable ? canType : !canSendKeys.capable ? canSendKeys : null;
+  const locked = gone || readOnly || hostBlock !== undefined || missingSend !== null;
+  // The machine every write on this row lands on. The pane view addresses one host (the pane's own,
+  // carried in `?h=` since the row was opened), so the ambient scope IS the target here. Undefined on
+  // a solo install, which renders no chip and leaves every confirm string unchanged.
+  const writeHost = useAmbientHost(scope?.host);
+  // Its display name, or undefined when there is no pack — the copy-level half of the hide rule.
+  const writeHostLabel = useHostLabel(scope?.host);
   // …and a ref alongside it, for the ONE caller that reads it after an await. `send()` checks
   // `locked` once, up front, but its pre-clear sweep goes out on the far side of the pre-flight's
   // pane read; a re-render that locks the composer in that window must be able to stop the most
@@ -155,7 +195,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // The phone-owned draft, restored from (and written through to) the per-pane draft store — the
   // pane view is keyed by paneId, so without this, stepping over to another tab mid-reply ate the
   // message. Lazy initialiser so the restore happens on the mount, before first paint.
-  const [input, setInput] = useState(() => loadDraft(session, paneId) ?? "");
+  const [input, setInput] = useState(() => loadDraft(scope, paneId) ?? "");
   // Mirror of `input` for the write-through path: updateInput needs the previous value to apply a
   // functional update AND to persist the result, without either reading stale state or doing the
   // save inside a (double-invoked) state updater.
@@ -165,7 +205,10 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // the component must not depend on that: if it is ever rendered with a changed paneId/session in
   // place, the effect below saves the outgoing pane's draft and loads the incoming one, so pane A's
   // text can never surface in pane B.
-  const draftPaneRef = useRef({ session, paneId });
+  // Compared by VALUE (its cache key), never by object identity: a scope is a value passed as an
+  // object, and an identity compare here would re-run the save/restore below on every poll.
+  const scopeId = scopeKey(scope);
+  const draftPaneRef = useRef({ scope, scopeId, paneId });
 
   /**
    * Set the draft AND persist it. Every write to `input` goes through here — an empty value removes
@@ -184,24 +227,30 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
    * The in-memory draft is untouched: a false positive costs one draft its ability to survive the OS
    * killing the PWA, which is a cheap price for never storing a real one.
    */
-  function updateInput(next: string | ((prev: string) => string)) {
-    const value = typeof next === "function" ? next(inputValueRef.current) : next;
+  function updateInput(value: string) {
     inputValueRef.current = value;
     setInput(value);
     if (noEchoRef.current !== null) return;
-    saveDraft(session, paneId, value);
+    saveDraft(scope, paneId, value);
+  }
+
+  /** {@link updateInput} for the appenders, which need the current value to build the next one.
+   *  Split from it rather than overloaded on the argument: the two callers are different shapes,
+   *  and the ref — not React state — is what carries "the current value" here. */
+  function updateInputFrom(next: (prev: string) => string) {
+    updateInput(next(inputValueRef.current));
   }
 
   useEffect(() => {
     const prev = draftPaneRef.current;
-    if (prev.paneId === paneId && prev.session === session) return;
-    if (noEchoRef.current === null) saveDraft(prev.session, prev.paneId, inputValueRef.current);
-    draftPaneRef.current = { session, paneId };
-    const restored = loadDraft(session, paneId) ?? "";
+    if (prev.paneId === paneId && prev.scopeId === scopeId) return;
+    if (noEchoRef.current === null) saveDraft(prev.scope, prev.paneId, inputValueRef.current);
+    draftPaneRef.current = { scope, scopeId, paneId };
+    const restored = loadDraft(scope, paneId) ?? "";
     inputValueRef.current = restored;
     setInput(restored);
-    noticeNoEcho(null); // it described the pane we just left
-  }, [session, paneId]);
+    noticeNoEchoRef.current(null); // it described the pane we just left
+  }, [scope, scopeId, paneId]);
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   // Pending-send preview: set on a successful send, cleared when the mirror catches up (next text
@@ -281,13 +330,20 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   function noticeNoEcho(next: { prompt: string; typed: boolean } | null) {
     noEchoRef.current = next;
     setNoEcho(next);
-    if (next !== null) clearDraft(session, paneId);
+    if (next !== null) clearDraft(scope, paneId);
   }
+
+  // The pane-change effect below is a LIFECYCLE handler, not a reactive computation: it must fire
+  // when the addressed pane changes and on nothing else. `noticeNoEcho` is re-created every render,
+  // so naming it as a dependency would re-run the effect on every render instead. A latest-value
+  // ref says that outright and still calls the current closure.
+  const noticeNoEchoRef = useRef(noticeNoEcho);
+  noticeNoEchoRef.current = noticeNoEcho;
 
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const direct = useDirectTyping({
-    paneKey: `${session ?? ""}\0${paneId}`,
+    paneKey: `${scopeId}\0${paneId}`,
     inputRef,
     // The ref, not `input`: the password-prompt handoff clears the draft and arms in one tick.
     replyDraft: () => inputValueRef.current,
@@ -418,7 +474,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (effectiveRaw === null) return;
     const draft = effectiveRaw;
     direct.deactivateSilently();
-    updateInput((prev) => (prev.trim() ? `${prev.trimEnd()}\n${draft}` : draft));
+    updateInputFrom((prev) => (prev.trim() ? `${prev.trimEnd()}\n${draft}` : draft));
     setHandledKey(normalizeDraft(draft));
     setPreviewLatched(false);
     focusInputEnd();
@@ -430,6 +486,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   const commands = commandsFor(agent, operatorCommands);
   // The Keys tray's preset row, resolved the same way from the same one-shot read of /api/config.
   const keyPresets = ctrlPresetsFor(agent, useOperatorKeys());
+  // Empty on every adapter that refuses nothing, and empty for Herdr's six as far as this tray is
+  // concerned — it offers none of the paging/edit keys Herdr rejects, so nothing greys out there.
+  const unsupportedKeys = useMuxUnsupportedKeys();
 
   function focusInputImmediately() {
     const el = inputRef.current;
@@ -466,7 +525,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         paneId,
         text: t,
         agent,
-        session,
+        scope,
         force,
         // Clear a stranded draft on the terminal's "❯" line before pane.send_text appends at cursor —
         // ctrl+k kills cursor→end, Backspace sweep kills the head (preview-action.ts pattern). Skip
@@ -513,7 +572,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           const clearRes = await api.sendKeys(
             paneId,
             ["ctrl+k", ...Array(clearCount).fill("Backspace")],
-            session,
+            scope,
             promptRegion ?? undefined,
           );
           if (!clearRes.ok) {
@@ -616,7 +675,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     }
     const reason = isDestructiveInput(input);
     if (reason && !sendConfirm.confirm("send")) {
-      setStatus(`Destructive: ${reason} — tap Send again to confirm`, "info");
+      // On a pack the confirm names the machine as well as the pattern: "rm -r" is a different
+      // sentence depending on whose disk it runs on, and this line is the last thing read before the
+      // second tap. Solo copy is unchanged, byte for byte.
+      const where = writeHostLabel ? ` on ${writeHostLabel}` : "";
+      setStatus(`Destructive: ${reason}${where} — tap Send again to confirm`, "info");
       return;
     }
     sendConfirm.reset();
@@ -655,7 +718,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   async function pressKeys(k: string[]): Promise<boolean> {
     if (locked) return false;
     try {
-      const res = await api.sendKeys(paneId, k, session);
+      const res = await api.sendKeys(paneId, k, scope);
       if (!res.ok) {
         setStatus(res.error ?? "Key send failed", "error");
         return false;
@@ -672,7 +735,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // typed (with a separating space) rather than clobbering it; an empty draft just gets set.
   function insertCommand(value: string) {
     direct.deactivateSilently();
-    updateInput((prev) => (prev.trim() ? `${prev.trimEnd()} ${value}` : value));
+    updateInputFrom((prev) => (prev.trim() ? `${prev.trimEnd()} ${value}` : value));
     focusInputEnd();
   }
 
@@ -682,11 +745,11 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     if (locked) return;
     setUploading(true);
     try {
-      const res = await api.uploadImage(paneId, file, session);
+      const res = await api.uploadImage(paneId, file, scope);
       if (res.ok) {
         const path = res.path;
         direct.deactivateSilently();
-        updateInput((prev) => (prev.trim() ? `${prev.trimEnd()} ${path}` : path));
+        updateInputFrom((prev) => (prev.trim() ? `${prev.trimEnd()} ${path}` : path));
         focusInputEnd();
         setStatus("Image added — path in message", "success");
       } else {
@@ -751,8 +814,12 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             one-tap reply grids; Display mounts the labelled mirror prefs. Agent stays a covering
             BottomSheet below (it's a palette, not a pad). */}
         {drawer === "keys" && (
-          <ComposerDock title="Keys" onClose={closeDrawer}>
+          <ComposerDock title="Keys" host={writeHost} onClose={closeDrawer}>
             <NavTray
+              // The chords THIS multiplexer refuses (M10/06). A key is not a capability: the Keys
+              // door is `sendKeys` (the lock above), and this is the list of holes behind it, so a
+              // refused chord greys its own button instead of being discovered by a failed send.
+              unsupportedKeys={unsupportedKeys}
               onSend={pressKeys}
               presets={keyPresets}
               onQueueChange={setQueuedKeys}
@@ -966,11 +1033,19 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                 ? "Pane is gone"
                 : readOnly
                   ? "Read-only — device not authorised"
-                  : direct.active
-                    ? "Type into the terminal…"
-                    : isShell
-                      ? "Type a shell command…"
-                      : "Type a reply…"
+                  : // Names the machine, because on a pack "why can't I type?" has two possible
+                    // answers and only one of them is about this device.
+                    hostBlock
+                    ? hostBlock
+                    : // The multiplexer cannot type here at all — its own words where it gave any, so
+                      // the placeholder says what is true of THIS terminal rather than blaming the app.
+                      missingSend !== null
+                      ? missingSend.note || "This terminal can't be typed into from here"
+                    : direct.active
+                      ? "Type into the terminal…"
+                      : isShell
+                        ? "Type a shell command…"
+                        : "Type a reply…"
             }
             autoCorrect={direct.active ? "off" : undefined}
             spellCheck={direct.active ? false : undefined}

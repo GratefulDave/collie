@@ -2,9 +2,11 @@ import { useState } from "react";
 import { FolderPlus, LayoutGrid, Search } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { useMuxCapability } from "@/lib/mux-capability";
 import { SectionHeader } from "@/components/section-header";
 import { StatusDot } from "@/components/status-badge";
 import { filterSpaces, sortSpacesByRecency, spaceLastSeenMap, spaceTriageMap } from "@/lib/spaces";
+import { spaceKey } from "@/lib/hosts";
 import { TRIAGE_STATUS } from "@/lib/triage";
 import { timeAgo } from "@/lib/format";
 import { STATUS_LABEL } from "@/lib/types";
@@ -17,6 +19,12 @@ interface SpaceOverviewProps {
   shellPanes?: AgentView[];
   onOpen: (workspaceId: string) => void;
   onNewSpace: () => void;
+  /**
+   * The machine these workspaces belong to — the lead, since the merged snapshot deliberately does
+   * not union peer workspaces. Undefined on a solo install. Without it, a peer's `w1` would pour its
+   * triage dot and its last-seen time into the lead's `w1` row (lib/spaces.ts).
+   */
+  host?: string;
   /** Fold state, owned by the dashboard so it can be persisted. */
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -25,18 +33,25 @@ interface SpaceOverviewProps {
 // The dashboard's navigator, and the LAST section on the page: everything you might act on comes
 // first. It folds to a single line — with 45 spaces that's the difference between a dashboard and a
 // scroll — and expands to a recency-ordered, filterable list.
+// A module-level empty list, not a `= []` default in the parameter list: a fresh array literal on
+// every render is a new reference, which defeats memoisation downstream for no benefit here.
+const NO_PANES: AgentView[] = [];
+
 export function SpaceOverview({
   workspaces,
   agents,
-  shellPanes = [],
+  shellPanes = NO_PANES,
   onOpen,
   onNewSpace,
+  host,
   open,
   onOpenChange,
 }: SpaceOverviewProps) {
   // Ephemeral view state, like SpaceRoute's tab selection — a filter you typed yesterday should not
   // greet you today with most of your spaces missing.
   const [query, setQuery] = useState("");
+  // Whether this multiplexer can open a new space at all. See the two decision sites below.
+  const newSpace = useMuxCapability("createSpace");
 
   const panes = [...agents, ...shellPanes];
   // One pass over the panes, then map lookups — this component re-renders on every poll.
@@ -45,7 +60,7 @@ export function SpaceOverview({
   // chip can never mean different things by the same colour (lib/spaces.ts).
   const worstBySpace = spaceTriageMap(agents);
   const blockedSpaces = [...worstBySpace.values()].filter((b) => b === "needs").length;
-  const visible = filterSpaces(sortSpacesByRecency(workspaces, panes, lastSeen), query);
+  const visible = filterSpaces(sortSpacesByRecency(workspaces, panes, lastSeen, host), query);
 
   return (
     <section className="flex flex-col gap-2 px-3 py-4">
@@ -69,20 +84,34 @@ export function SpaceOverview({
                 {blockedSpaces}
               </span>
             )}
-            <button
-              type="button"
-              onClick={onNewSpace}
-              aria-label="New space"
-              className="flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95"
-            >
-              <FolderPlus className="size-4" />
-            </button>
+            {/* HIDDEN, and explained one line further down (M10/06). An icon has nowhere to put a
+                sentence, and a "+" that always refuses is worse than no "+" at all — the pane sheet
+                makes the same argument about greying out a control that cannot work. But an
+                operator looking at a list of spaces WILL go looking for how to add one, so the
+                reason cannot simply vanish with the button: it moves into the body, where there is
+                room for words. Present on Herdr, which declares the capability. */}
+            {newSpace.capable && (
+              <button
+                type="button"
+                onClick={onNewSpace}
+                aria-label="New space"
+                className="flex size-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-95"
+              >
+                <FolderPlus className="size-4" />
+              </button>
+            )}
           </>
         }
       />
 
       {open && (
         <div id="spaces-body" className="flex flex-col divide-y divide-border/60">
+          {/* The other half of the hidden "+" above: the adapter's own reason, where the operator
+              who went looking for it is already reading. Renders nothing on a multiplexer that can
+              create a space, and nothing on one that declined without saying why. */}
+          {!newSpace.capable && newSpace.note !== "" && (
+            <p className="px-1 py-2 text-xs leading-snug text-muted-foreground">{newSpace.note}</p>
+          )}
           {/* Deliberately NOT autofocused: on a phone that would throw the keyboard over the list
               you just asked to see. */}
           {/* Sticky: at 45 spaces the list is five screens, and a filter that scrolls away turns
@@ -110,10 +139,13 @@ export function SpaceOverview({
             </p>
           ) : (
             visible.map((w) => {
-              const bucket = worstBySpace.get(w.workspaceId);
+              // (host, workspaceId): these rows are the lead's spaces, so a peer that happens to
+              // expose the same workspace id contributes nothing to them.
+              const key = spaceKey(host, w.workspaceId);
+              const bucket = worstBySpace.get(key);
               const status = bucket ? TRIAGE_STATUS[bucket] : null;
               const blocked = bucket === "needs";
-              const seen = lastSeen.get(w.workspaceId) ?? 0;
+              const seen = lastSeen.get(key) ?? 0;
               return (
                 <button
                   key={w.workspaceId}

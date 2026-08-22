@@ -1,6 +1,6 @@
 {
   "name": "collie",
-  "version": "0.32.0",
+  "version": "1.0.0-beta.14",
   "private": true,
   "license": "MIT",
   "description": "Collie — a mobile web UI to monitor and reply to your Herdr agent herd over Tailscale",
@@ -8,22 +8,33 @@
   "scripts": {
     "start": "bun run bridge/index.ts",
     "dev": "bun --watch bridge/index.ts",
-    "build": "bun run typecheck && cd web && bun install && bun run typecheck && bun run build",
+    "build": "bun run cli/main.ts build",
     "build:web": "cd web && bun run build",
+    "build:cli": "bun build --compile --target=bun ./cli/main.ts --outfile bin/collie",
     "web:dev": "cd web && bun run dev",
-    "test": "bun test ./bridge ./scripts && bash scripts/collie-ctl.test.sh",
+    "lint": "oxlint --max-warnings 0",
+    "lint:fix": "oxlint --fix --max-warnings 0",
+    "test": "bun test ./bridge ./cli ./scripts && bash scripts/collie-ctl.test.sh && bash scripts/collie-cli.test.sh",
     "test:ctl": "bash scripts/collie-ctl.test.sh",
+    "test:pack": "bun test ./bridge/pack/harness.test.ts",
     "typecheck": "bunx tsc --noEmit"
   },
   "devDependencies": {
+    "@oxlint/plugins": "1.78.0",
     "@types/bun": "latest",
     "@types/qrcode-terminal": "^0.12.2",
+    "@types/react": "^19.2.18",
     "@types/web-push": "^3.6.4",
+    "ink-testing-library": "^4.0.0",
     "jsqr": "^1.4.0",
-    "typescript": "^5"
+    "oxlint": "1.78.0",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
-    "qrcode-terminal": "^0.12.0"
+    "commander": "^15.0.0",
+    "ink": "^7.1.1",
+    "qrcode-terminal": "^0.12.0",
+    "react": "^19.2.8"
   },
   "optionalDependencies": {
     "web-push": "^3.6.7"

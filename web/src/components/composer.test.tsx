@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ComponentProps } from "react";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -9,16 +9,18 @@ import { clearStatus, useStatus } from "@/lib/status";
 import { isReloadHeld, __resetReloadGuard } from "@/lib/reload-guard";
 import { loadDraft } from "@/lib/drafts";
 import { server } from "@/test/setup";
-import { recordReply } from "@/test/handlers";
+import { fixtureServers, recordReply } from "@/test/handlers";
+import { PackProvider } from "./pack-provider";
 import { Composer } from "./composer";
+import type { ServerSummary } from "@/lib/types";
 
 // A guarded send is TWO reply calls: type (submit:false), then — once the text is verified on the
 // input line — submit-only (empty text). Overriding the reply handler therefore has to keep the fake
 // pane's input line honest via recordReply, or the verification poll never passes. Helper so each
 // override says what it is asserting rather than repeating the protocol.
 function replyHandler(onTyped: (text: string) => void, onSubmit?: () => void) {
-  return http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
-    const body = (await request.json()) as { text: string; submit?: boolean };
+  return http.post<never, { text: string; submit?: boolean }>(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+    const body = await request.json();
     recordReply(body);
     if (body.submit) onSubmit?.();
     else onTyped(body.text);
@@ -80,8 +82,12 @@ function StatusSentinel() {
   return <div data-testid="status">{status?.text ?? ""}</div>;
 }
 
-/** renderComposer + the status sentinel, for cases that assert on the status line. */
-function renderComposerWithStatus(overrides: Partial<ComponentProps<typeof Composer>> = {}) {
+/** renderComposer + the status sentinel, for cases that assert on the status line. `servers` opts
+ *  the render into a pack (default: solo, i.e. no host chrome and no host in any copy). */
+function renderComposerWithStatus(
+  overrides: Partial<ComponentProps<typeof Composer>> = {},
+  servers?: ServerSummary[],
+) {
   const props: ComponentProps<typeof Composer> = {
     paneId: "w1:p1",
     agent: "claude",
@@ -104,10 +110,10 @@ function renderComposerWithStatus(overrides: Partial<ComponentProps<typeof Compo
     {
       path: "/",
       element: (
-        <>
+        <PackProvider servers={servers}>
           <StatusSentinel />
           <Composer {...props} />
-        </>
+        </PackProvider>
       ),
     },
   ]);
@@ -203,8 +209,8 @@ describe("Composer — send", () => {
       http.get(/\/api\/pane\/[^/]+$/, () =>
         HttpResponse.json({ paneId: "w1:p1", text: ompModal, truncated: false, revision: 2 }),
       ),
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        const body = (await request.json()) as { keys: string[] };
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        const body = await request.json();
         wire.push(`keys:${body.keys[0]}×${body.keys.length}`);
         return HttpResponse.json({ ok: true });
       }),
@@ -258,8 +264,8 @@ describe("Composer — send", () => {
     const callOrder: string[] = [];
     let sentKeys: string[] | null = null;
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        const body = (await request.json()) as { keys: string[] };
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        const body = await request.json();
         sentKeys = body.keys;
         callOrder.push("keys");
         return HttpResponse.json({ ok: true });
@@ -317,8 +323,8 @@ describe("Composer — send", () => {
             revision: 2,
           }),
         ),
-        http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-          const body = (await request.json()) as { expected_prompt?: string };
+        http.post<never, { expected_prompt?: string }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+          const body = await request.json();
           bound = body.expected_prompt;
           wire.push("keys");
           return HttpResponse.json({ ok: true });
@@ -416,8 +422,8 @@ describe("Composer — send", () => {
           wire.push("keys");
           return HttpResponse.json({ ok: true });
         }),
-        http.post(/\/api\/pane\/w9%3Ap9\/reply$/, async ({ request }) => {
-          const body = (await request.json()) as { text: string; submit?: boolean };
+        http.post<never, { text: string; submit?: boolean }>(/\/api\/pane\/w9%3Ap9\/reply$/, async ({ request }) => {
+          const body = await request.json();
           recordReply(body);
           wire.push(body.submit ? "submit" : `type:${body.text}`);
           return HttpResponse.json({ ok: true });
@@ -790,8 +796,8 @@ describe("Composer — typing into the terminal", () => {
     const keyCalls: string[][] = [];
     let replyCalls = 0;
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        keyCalls.push(((await request.json()) as { keys: string[] }).keys);
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        keyCalls.push((await request.json()).keys);
         return HttpResponse.json({ ok: true });
       }),
       replyHandler(() => replyCalls++),
@@ -815,8 +821,8 @@ describe("Composer — typing into the terminal", () => {
   it("sends a swiped/IME-composed word once when composition commits", async () => {
     const keyCalls: string[][] = [];
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        keyCalls.push(((await request.json()) as { keys: string[] }).keys);
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        keyCalls.push((await request.json()).keys);
         return HttpResponse.json({ ok: true });
       }),
     );
@@ -848,8 +854,8 @@ describe("Composer — typing into the terminal", () => {
   it("sends terminal keys that do not change the textarea value", async () => {
     const keyCalls: string[][] = [];
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        keyCalls.push(((await request.json()) as { keys: string[] }).keys);
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        keyCalls.push((await request.json()).keys);
         return HttpResponse.json({ ok: true });
       }),
     );
@@ -993,8 +999,8 @@ describe("Composer — blocked pre-flight override", () => {
       http.get(/\/api\/pane\/[^/]+$/, () =>
         HttpResponse.json({ paneId: "w1:p1", text: PICKER, truncated: false, revision: 1 }),
       ),
-      http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
-        const body = (await request.json()) as { text: string; submit?: boolean };
+      http.post<never, { text: string; submit?: boolean }>(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+        const body = await request.json();
         calls.push(body.submit ? "submit" : "type");
         return HttpResponse.json({ ok: true });
       }),
@@ -1079,8 +1085,8 @@ describe("Composer — password prompt", () => {
       http.get(/\/api\/pane\/[^/]+$/, () =>
         HttpResponse.json({ paneId: "w1:p1", text: SUDO, truncated: false, revision: 1 }),
       ),
-      http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
-        const body = (await request.json()) as { text: string; submit?: boolean };
+      http.post<never, { text: string; submit?: boolean }>(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+        const body = await request.json();
         calls.push(body.submit ? "submit" : "type");
         return HttpResponse.json({ ok: true });
       }),
@@ -1181,6 +1187,31 @@ describe("Composer — destructive-input confirm", () => {
     await user.click(screen.getByRole("button", { name: /really send/i }));
     await waitFor(() => expect(box).toHaveValue(""));
     expect(props.onSent).toHaveBeenCalled();
+  });
+
+  it("names the machine in the confirm — and only on a pack", async () => {
+    const user = userEvent.setup();
+    // Solo: the copy is exactly what it has always been, host clause and all absent.
+    renderComposerWithStatus({ scope: { host: "workshop" } });
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "sudo reboot");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(screen.getByTestId("status")).toHaveTextContent(
+      "Destructive: sudo (runs as root) — tap Send again to confirm",
+    );
+    cleanup();
+
+    // On a pack, "rm -r" is a different sentence depending on whose disk it runs on.
+    clearStatus();
+    renderComposerWithStatus({ scope: { host: "workshop" } }, fixtureServers);
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "sudo reboot");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+    expect(screen.getByTestId("status")).toHaveTextContent(
+      "Destructive: sudo (runs as root) on workshop — tap Send again to confirm",
+    );
+    // The status line above Send already names the machine ("… on workshop", asserted above) — the
+    // pane-view header is the single machine indicator now, so no standalone chip renders above the
+    // input to duplicate it.
+    expect(screen.queryByLabelText("Sends to host: workshop")).not.toBeInTheDocument();
   });
 
   it("does not arm the confirm for innocent input", async () => {
@@ -1423,8 +1454,8 @@ describe("Composer — terminal-draft preview", () => {
     const callOrder: string[] = [];
     let sentKeys: string[] | null = null;
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        sentKeys = ((await request.json()) as { keys: string[] }).keys;
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        sentKeys = (await request.json()).keys;
         callOrder.push("keys");
         return HttpResponse.json({ ok: true });
       }),
@@ -1618,6 +1649,8 @@ describe("Composer — reload-guard hold (no-SW self-update safety gate)", () =>
     expect(isReloadHeld()).toBe(false);
 
     const file = new File(["x"], "shot.png", { type: "image/png" });
+    // SAFETY: the composer renders exactly one `input[type=file]` (its upload trigger), and
+    // `querySelector` is typed `Element | null` for an arbitrary selector string.
     const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
@@ -1720,8 +1753,8 @@ describe("Composer — keys dock (in-flow, not an overlay)", () => {
     const user = userEvent.setup();
     let sentKeys: string[] | null = null;
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
-        const body = (await request.json()) as { keys: string[] };
+      http.post<never, { keys: string[] }>(/\/api\/pane\/[^/]+\/keys$/, async ({ request }) => {
+        const body = await request.json();
         sentKeys = body.keys;
         return HttpResponse.json({ ok: true });
       }),
@@ -1814,8 +1847,8 @@ describe("Composer — quick dock (in-flow, matches the keys dock)", () => {
       release = resolve;
     });
     server.use(
-      http.post(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
-        const body = (await request.json()) as { text: string; submit?: boolean };
+      http.post<never, { text: string; submit?: boolean }>(/\/api\/pane\/[^/]+\/reply$/, async ({ request }) => {
+        const body = await request.json();
         if (!body.submit) await gate;
         recordReply(body);
         return HttpResponse.json({ ok: true });
@@ -1922,10 +1955,15 @@ describe("Composer — a composed key queue is guarded on the way out", () => {
   // as effectively, which is why the guard lives on the drawer transition rather than the button.
   // The Controls row's "Keys" toggle and the tray's own "Keys" segmented tab share an accessible
   // name; only the toggle carries aria-expanded, which is what ties it to the dock.
-  const controlsToggle = (name: string) =>
-    screen
+  const controlsToggle = (name: string): HTMLElement => {
+    const toggle = screen
       .getAllByRole("button", { name })
-      .find((b) => b.hasAttribute("aria-expanded")) as HTMLElement;
+      .find((b) => b.hasAttribute("aria-expanded"));
+    // Asserted as a real failure rather than by widening `undefined` away: if the toggle is gone,
+    // that IS the bug, and the case should say so here instead of at the first property read.
+    if (!toggle) throw new Error(`no aria-expanded toggle named ${name}`);
+    return toggle;
+  };
 
   it.each([
     ["the Keys toggle", () => controlsToggle("Keys")],

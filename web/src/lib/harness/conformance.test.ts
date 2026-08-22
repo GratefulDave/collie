@@ -24,7 +24,7 @@ const PANES_DIR = join(import.meta.dirname, "..", "..", "fixtures", "panes");
 // in-flight-send captures — a `❯ …` input box (with or without a slash-autocomplete menu above it) is
 // composer chrome, not a dialog, so it must stay raw. The wrapped-draft capture is the same: a
 // (multi-line) input box, stripped as chrome, never lifted.
-const NEUTRAL = [
+const NEUTRAL = new Set([
   "claude--working.txt",
   "claude--fresh-idle.txt",
   "claude--done.txt",
@@ -47,17 +47,23 @@ const NEUTRAL = [
   // negative control for the generic menu grammar — its statusline is `·`-separated like a key-hint
   // footer, and the input-box gate is the only thing that keeps it raw.
   "claude--menu-model-picker-dismissed.txt",
-];
+  // GHOST TEXT: an input box holding the generated "suggested next prompt" Claude paints when the box
+  // is empty, and the same box after typing over it. Both are ordinary idle screens — composer chrome,
+  // never a dialog. They exist to pin how the suggestion is PAINTED (faint, SGR 2), which is the only
+  // thing separating it from a draft; see harness/claude/chrome.ts.
+  "claude--ghost-suggestion.txt",
+  "claude--ghost-typed-over.txt",
+]);
 
 const allClaudeFixtures = readdirSync(PANES_DIR)
   .filter((f) => f.startsWith("claude--") && f.endsWith(".txt"))
-  .sort();
+  .toSorted();
 const allOmpFixtures = readdirSync(PANES_DIR)
   .filter((f) => f.startsWith("omp--") && f.endsWith(".txt"))
-  .sort();
+  .toSorted();
 
-const ownFixtures = allClaudeFixtures.filter((f) => !NEUTRAL.includes(f));
-const neutralFixtures = allClaudeFixtures.filter((f) => NEUTRAL.includes(f));
+const ownFixtures = allClaudeFixtures.filter((f) => !NEUTRAL.has(f));
+const neutralFixtures = allClaudeFixtures.filter((f) => NEUTRAL.has(f));
 
 describeAdapterConformance(claudeAdapter, {
   ownFixtures,

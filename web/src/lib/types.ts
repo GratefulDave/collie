@@ -57,6 +57,16 @@ export interface AgentView {
    */
   terminalTitle?: string;
   /**
+   * A finished sentence the bridge composed about this pane, for the operator to read. Absent on
+   * almost every pane, and on every bridge older than the version that introduced it.
+   *
+   * RENDER IT, NEVER READ IT. The frontend does not parse it, branch on it, or infer anything from
+   * its presence: it carries no harness name and no multiplexer name, and the pane's status, its
+   * controls and its place in the sort are decided exactly as they were without it. Text only,
+   * never markup — the same XSS boundary as `paneLabel`.
+   */
+  hint?: string;
+  /**
    * Epoch ms of this agent's last status transition, as the bridge observed it. Absent on an older
    * bridge — which is exactly why triage degrades cleanly; see `triage()`.
    */
@@ -68,6 +78,17 @@ export interface AgentView {
    * `lastActiveAt > lastSeenAt`, so opening the pane clears it by construction.
    */
   lastSeenAt?: number;
+  /**
+   * Which member of the pack this pane lives on — the `?h=` value (PACK_PROTOCOL.md §4). Mirrors
+   * `PaneWire.host` in bridge/types.ts.
+   *
+   * **Present exactly when {@link SnapshotResponse.servers} is**, and absent otherwise: a solo
+   * snapshot host-tags nothing (§11), so every install that exists today reads `undefined` here and
+   * renders byte-identically. A pane id (`w1:p1`) is unique only within one session on one machine,
+   * so this is the field that makes a row addressable — open it with the PANE's host, never the
+   * ambient one, or a reply lands on the right pane name on the wrong terminal.
+   */
+  host?: string;
 }
 
 /**
@@ -129,6 +150,40 @@ export function isReadOnly(device: DeviceAuth | undefined): boolean {
   return !!device && device.enforced && !device.authorized;
 }
 
+// ── Device pairing (mirrors bridge/pairing.ts) ───────────────────────────────────────────────────
+// The OTHER write gate: a bearer credential this device holds, independent of the header-based
+// DeviceAuth above and composing with it by AND. See lib/pairing.ts for the client-side store.
+
+/** One paired device, as `GET /api/devices` reports it. The token itself never leaves the bridge. */
+export interface PairedDeviceWire {
+  label: string;
+  createdAt: number;
+  lastSeenAt: number;
+  /** True for the device making the request — i.e. the one you're reading this on. */
+  current: boolean;
+}
+
+/** The body of `GET /api/devices` and `POST /api/devices/revoke`. */
+export interface DevicesResponse {
+  /**
+   * Whether a bearer token is required for writes. Not a setting — it is simply "at least one device
+   * is paired", so pairing nobody leaves Collie exactly as it was.
+   */
+  enforced: boolean;
+  /** The label this request's token authenticated as, or null when it authenticated as nobody. */
+  current: string | null;
+  devices: PairedDeviceWire[];
+}
+
+/** Why a `POST /api/pair` claim was rejected (the `error` field of its 400 body). */
+export type PairFailure =
+  | "no-pending"
+  | "expired"
+  | "exhausted"
+  | "bad-code"
+  | "duplicate-label"
+  | "bad-request";
+
 /**
  * One entry in the snapshot's session registry — a named Herdr session the bridge is fanning out.
  * Order is primary-first, then alphabetical. An unreachable session (crashed / stale socket) reports
@@ -145,6 +200,40 @@ export interface SessionSummary {
   agents: number;
   working: number;
   blocked: number;
+  /**
+   * Which member of the pack fronts this session — the `?h=` value. Present exactly when
+   * {@link SnapshotResponse.servers} is (PACK_PROTOCOL.md §9.2/§11); absent on every solo snapshot.
+   * Sessions are a PER-HOST registry, which is why the switcher lists one host's sessions at a time:
+   * a flat merged list would offer "default" twice with no way to tell them apart.
+   */
+  host?: string;
+}
+
+/**
+ * One member of the pack (PACK_PROTOCOL.md §9.2) — mirrors `ServerSummary` in bridge/types.ts field
+ * for field. The lead's own entry is included, so the phone renders one uniform host list instead of
+ * special-casing "here".
+ *
+ * Note what is NOT here: per-host agent/working/blocked counts. `SessionSummary` carries those
+ * because the bridge computes them per session; a `ServerSummary` does not, so the switcher derives
+ * them client-side from the merged `agents` array (see `hostCounts` in lib/hosts.ts). That keeps the
+ * counts consistent with the rows actually on screen — including an unreachable host's last-good
+ * panes, which stay listed rather than zeroing (§10.2).
+ */
+export interface ServerSummary {
+  /** Member id — the `?h=` value. */
+  id: string;
+  /** Operator-chosen label; today the member id itself. */
+  name: string;
+  isLead: boolean;
+  /** Whether the lead's last poll of this member succeeded. Always true for the lead's own entry. */
+  reachable: boolean;
+  /** Version negotiation state (§7). */
+  protocol: "ok" | "incompatible" | "unknown";
+  /** The peer's refusal reason, verbatim, when incompatible — rendered as text, never paraphrased. */
+  protocolDetail?: string;
+  /** Epoch ms, stamped by the LEAD on receipt — never the peer's clock (§10.2). `0` = never answered. */
+  lastSeenAt: number;
 }
 
 /**
@@ -184,6 +273,14 @@ export interface SnapshotResponse {
   notifications?: { snoozedUntil: number | null };
   /** The bridge's session registry (primary-first). Absent on a single-session / older bridge. */
   sessions?: SessionSummary[];
+  /**
+   * Every member of the pack, the lead's own entry first (PACK_PROTOCOL.md §9.2).
+   *
+   * **Optional-and-absent, like `update?` and unlike the always-present `sessions`** — a solo bridge
+   * emits no such key at all (§11), so absent (or fewer than two entries) is the one condition under
+   * which the whole host dimension renders nothing: no switcher, no chips, no extra row height.
+   */
+  servers?: ServerSummary[];
   /** Version / upgrade status. Absent on an older bridge that doesn't report it. */
   update?: UpdateInfo;
   ts: number;
@@ -270,6 +367,12 @@ export interface CreatedPane {
 export type CreateResponse = { ok: true; pane: CreatedPane } | { ok: false; error: string };
 
 /**
+ * Which role the bridge plays in a pack (PACK_PROTOCOL.md §3). Mirrors PackMode in bridge/types.ts.
+ * `solo` is a lead with zero peers — today's Collie, exactly.
+ */
+export type PackMode = "solo" | "lead" | "peer";
+
+/**
  * One operator-declared palette row (a `[[commands]]` table in their `commands.toml`). Mirrors
  * OperatorCommand in
  * bridge/types.ts. Resolved against the shipped catalog by `commandsFor()`, which hands a pane
@@ -304,15 +407,82 @@ export interface OperatorKeyRow {
   danger?: boolean;
 }
 
+/**
+ * Every capability a multiplexer adapter may declare. Mirrors `MUX_CAPABILITIES` in
+ * bridge/mux/capabilities.ts, which is where each one's meaning and its backing route are written
+ * down — the two trees do not share a module, so this list is a copy the way `STATUS_RANK` is.
+ *
+ * A name here is only ever used to ASK. Nothing in `web/src` may key off which multiplexer answered
+ * (scripts/check-mux-names.sh), and that is the difference this list exists to keep.
+ */
+export const MUX_CAPABILITIES = [
+  "paneGrid",
+  "gridScrollback",
+  "agentDetection",
+  "agentSessionRef",
+  "typeText",
+  "sendKeys",
+  "renamePane",
+  "closePane",
+  "createTab",
+  "renameTab",
+  "closeTab",
+  "createSpace",
+  "pushTopologyEvents",
+  "pushPaneEvents",
+] as const;
+
+export type MuxCapability = (typeof MUX_CAPABILITIES)[number];
+
+/**
+ * What the bridge says about the multiplexer underneath (`/api/config`). Mirrors `MuxConfig` in
+ * bridge/types.ts.
+ *
+ * `name` is for display and support — the subject of a sentence, never a branch. Read the
+ * capabilities through lib/mux-capability.ts rather than reaching in here: that module owns the one
+ * rule that an unanswered capability counts as PRESENT.
+ */
+export interface MuxConfig {
+  name: string;
+  /** Total over {@link MUX_CAPABILITIES} on any bridge that knows the capability. */
+  capabilities: Partial<Record<MuxCapability, boolean>>;
+  /** Neutral key spellings this multiplexer refuses. */
+  unsupportedKeys: string[];
+  /** The adapter's own words for the capabilities it lacks — the text an explanation renders. */
+  notes: Partial<Record<MuxCapability, string>>;
+  /**
+   * Where the bridge serves this multiplexer's mark, for an `<img src>`. Absent on a bridge whose
+   * adapter has no mark (and on every bridge older than the field), and absent means NO IMAGE — the
+   * header renders its text alone rather than standing something in.
+   *
+   * The path arrives as DATA and is never spelled here: a mark chosen in the frontend would be a
+   * lookup keyed by the multiplexer's name, which is the one thing this app must not do
+   * (lib/mux-capability.ts, scripts/check-mux-names.sh).
+   */
+  logoUrl?: string;
+}
+
 export interface BridgeConfig {
   push: boolean;
   vapidPublicKey: string;
   /** Build id of the bundle the bridge is currently serving (for stale-cache detection). */
   build?: string;
+  /**
+   * The bridge's pack mode. **Absent means `solo`** — a solo bridge emits no such key, so its
+   * `/api/config` body stays byte-identical to the pre-federation one. Always read it as
+   * `mode ?? "solo"`; never infer the mode from behaviour.
+   */
+  mode?: PackMode;
   /** The operator's own palette rows. Absent when there is no `commands.toml`. */
   operatorCommands?: OperatorCommand[];
   /** The operator's own Keys-tray presets. Absent when there is no `keys.toml`. */
   operatorKeys?: OperatorKeyRow[];
+  /**
+   * The multiplexer and its declared capabilities. **Absent on a bridge older than this field**, and
+   * that absence is read as "everything is supported" — a mid-upgrade Herdr operator must never
+   * watch controls disappear while a cached config is in flight (lib/mux-capability.ts).
+   */
+  mux?: MuxConfig;
 }
 
 /**
@@ -329,18 +499,18 @@ export interface NotifyPrefs {
 }
 
 /** Lower sorts first — "needs you" at the top. Mirrors STATUS_RANK on the server. */
-export const STATUS_RANK: Record<AgentStatus, number> = {
+export const STATUS_RANK = {
   blocked: 0,
   working: 1,
   unknown: 2,
   idle: 3,
   done: 4,
-};
+} satisfies Record<AgentStatus, number>;
 
-export const STATUS_LABEL: Record<AgentStatus, string> = {
+export const STATUS_LABEL = {
   blocked: "needs you",
   working: "working",
   idle: "idle",
   done: "done",
   unknown: "unknown",
-};
+} satisfies Record<AgentStatus, string>;

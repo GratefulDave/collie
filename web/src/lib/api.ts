@@ -3,15 +3,21 @@
 
 import { trackBusy } from "./busy";
 import { markLive } from "./connection-health";
+import { abortSignalAfter, abortSignalAny } from "./env";
+import { asJsonString, parseJsonObject } from "./json";
+import { authHeader, clearNotPaired, markNotPaired, NOT_PAIRED_BODY } from "./pairing";
+import { normalizeScope, paneScopeKey, type Scope } from "./scope";
 import { observeServerBuild, SERVER_BUILD_HEADER } from "./server-build";
 import { withBasePath } from "./base-path";
 import type {
   ActionResponse,
   BridgeConfig,
   CreateResponse,
+  DevicesResponse,
   NotifyPrefs,
   PaneHistoryResponse,
   PaneReadResponse,
+  PairFailure,
   SnapshotResponse,
   UpdateInfo,
   UploadResponse,
@@ -53,7 +59,7 @@ class ApiError extends Error {
 }
 
 /** True when an API request failed with the given HTTP status. */
-export function isApiErrorStatus(error: unknown, status: number): boolean {
+export function isApiErrorStatus<TThrown>(error: TThrown, status: number): boolean {
   return error instanceof ApiError && error.status === status;
 }
 
@@ -84,21 +90,25 @@ export function withTimeout(
   signal: AbortSignal | null | undefined,
   ms: number,
 ): AbortSignal | undefined {
-  if (typeof AbortSignal.timeout !== "function") return signal ?? undefined;
-  const timeoutSignal = AbortSignal.timeout(ms);
+  const timeoutSignal = abortSignalAfter(ms);
+  if (timeoutSignal === null) return signal ?? undefined;
   if (!signal) return timeoutSignal;
-  if (typeof AbortSignal.any !== "function") return signal;
-  return AbortSignal.any([signal, timeoutSignal]);
+  return abortSignalAny([signal, timeoutSignal]) ?? signal;
 }
 
-// Append the `session=<name>` query param to an API path, composing with any query already present
-// (fetchPane carries `?lines=`). The browser URL uses the short `?s=`; on the wire it's `session=`.
-// Blank / absent session → the primary session, so the path is returned untouched (no param).
-function withSession(path: string, session?: string): string {
-  const s = session?.trim();
-  if (!s) return path;
-  const sep = path.includes("?") ? "&" : "?";
-  return `${path}${sep}session=${encodeURIComponent(s)}`;
+// Append the addressing scope to an API path, composing with any query already present (fetchPane
+// carries `?lines=`). The browser URL uses the short `?h=` / `?s=`; on the wire they take their long
+// names, `host=` and `session=`, in that same fixed order.
+//
+// Blank / absent host → the lead (the collie this phone is connected to); blank / absent session →
+// that host's primary session. Both absent returns the path UNTOUCHED, so a solo install puts no
+// query on the wire at all — byte-identical requests to what shipped.
+function withScope(path: string, scope?: Scope): string {
+  const { host, session } = normalizeScope(scope);
+  let out = path;
+  if (host) out += `${out.includes("?") ? "&" : "?"}host=${encodeURIComponent(host)}`;
+  if (session) out += `${out.includes("?") ? "&" : "?"}session=${encodeURIComponent(session)}`;
+  return out;
 }
 
 // Best-effort human-readable failure detail: the response body if present, else the status text.
@@ -120,23 +130,29 @@ const recoverPromptChanged = (status: number, detail: string): ActionResponse | 
   status === 409 ? promptChangedResponse(detail) : null;
 
 function promptChangedResponse(detail: string): ActionResponse | null {
-  try {
-    const body = JSON.parse(detail) as {
-      ok?: unknown;
-      code?: unknown;
-      error?: unknown;
-    };
-    if (
-      body.ok === false &&
-      body.code === "prompt_changed" &&
-      typeof body.error === "string"
-    ) {
-      return { ok: false, error: body.error, code: "prompt_changed" };
-    }
-  } catch {
-    // A non-JSON error body follows the existing ApiError path below.
+  // A non-JSON error body parses to `undefined` and follows the existing ApiError path below.
+  const body = parseJsonObject(detail);
+  if (!body) return null;
+  if (body.ok !== false || body.code !== "prompt_changed") return null;
+  const error = asJsonString(body.error);
+  if (error === undefined) return null;
+  return { ok: false, error, code: "prompt_changed" };
+}
+
+/**
+ * Read the pairing gate's verdict off a finished request, at the one place every request passes.
+ *
+ * Only a WRITE can discover that this device is unpaired — reads are ungated — so the refusal latch
+ * is set here, from the bridge's own 403 body, and cleared by the opposite proof: a mutation that
+ * actually went through. GETs say nothing either way and are ignored on both counts.
+ */
+function notePairing(method: string, status: number, detail?: string): void {
+  if (method === "GET") return;
+  if (status === 403 && detail?.trim() === NOT_PAIRED_BODY) {
+    markNotPaired();
+    return;
   }
-  return null;
+  if (status >= 200 && status < 300) clearNotPaired();
 }
 
 // Capture the bridge's build id off any response that carries it. Every poll (snapshot/pane) — and
@@ -165,17 +181,32 @@ async function doReq<T>(path: string, init?: RequestInit, recover?: Recover<T>):
     headers: {
       "content-type": "application/json",
       [XHR_HEADER]: XHR_HEADER_VALUE,
+      // The device credential, injected once for every JSON request rather than plumbed per call.
+      // Absent header when this device holds no token — which is exactly right for a bridge with
+      // nothing paired, and for the bootstrap POST /api/pair that mints the first one.
+      ...authHeader(),
       ...init?.headers,
     },
   });
   captureBuild(res);
   if (!res.ok) {
     const detail = await errorDetail(res);
+    notePairing(method, res.status, detail);
     const recovered = recover?.(res.status, detail);
     if (recovered !== null && recovered !== undefined) return recovered;
     throw new ApiError(`${url} → ${res.status} ${detail}`, res.status);
   }
-  if (res.status === 204) return undefined as T;
+  notePairing(method, res.status);
+  if (res.status === 204) {
+    // SAFETY: `T` is the response contract each exported wrapper below declares for its own
+    // endpoint; `doReq` is the generic transport and has no shape of its own to check against. A
+    // 204 carries no body by definition, so the only honest value is `undefined`, and every caller
+    // that passes a 204-returning path types `T` to include it.
+    return undefined as T;
+  }
+  // SAFETY: as above — the bridge's JSON body is `T` by the endpoint's contract. The shapes that
+  // are NOT under the bridge's control (a proxy's error page, a refusal body) never reach here:
+  // they are non-ok and were parsed field-by-field by the `recover` handlers above.
   return (await res.json()) as T;
 }
 
@@ -189,10 +220,10 @@ function req<T>(path: string, init?: RequestInit, recover?: Recover<T>): Promise
 }
 
 export async function fetchSnapshot(
-  session?: string,
+  scope?: Scope,
   signal?: AbortSignal,
 ): Promise<SnapshotResponse> {
-  const snap = await req<SnapshotResponse>(withSession("/api/snapshot", session), { signal });
+  const snap = await req<SnapshotResponse>(withScope("/api/snapshot", scope), { signal });
   // A snapshot whose herd link is UP is a provably-live moment — stamp the shared connection-health
   // anchor so escalation is measured from here. A snapshot that 200s but reports `bridge:
   // "disconnected"` is NOT live (the pill/banner still escalate on it), so it must NOT reset the
@@ -223,24 +254,29 @@ const PANE_CACHE_MAX = 20;
 export async function fetchPane(
   paneId: string,
   lines?: number,
-  session?: string,
+  scope?: Scope,
   signal?: AbortSignal,
 ): Promise<PaneReadResponse> {
   const q = lines ? `?lines=${lines}` : "";
-  const url = withSession(`/api/pane/${encodeURIComponent(paneId)}${q}`, session);
-  // Pane ids are per-session (each session is a separate Herdr server), so the ETag/body cache must
-  // be keyed by session too — otherwise a "w1:p1" in one session would 304 into another's mirror.
-  const cacheKey = `${session ?? ""}\u0000${paneId}`;
+  const url = withScope(`/api/pane/${encodeURIComponent(paneId)}${q}`, scope);
+  // Pane ids are unique only within one session on one machine (each session is its own Herdr
+  // server; each pack member is its own machine again), so the ETag/body cache is keyed by the full
+  // (host, session, paneId) triple — otherwise a "w1:p1" in one session, or on one host, would 304
+  // into another's mirror. Shared with the loaders' caches via lib/scope, so the two can't drift.
+  const cacheKey = paneScopeKey(scope, paneId);
 
   const cached = paneCache.get(cacheKey);
   // SEEN_HEADER is what tells the bridge this read came from our own page and may mark the pane
   // seen. A cross-site no-cors GET can't set a custom header, so it can't clear your alerts by
   // guessing pane ids (bridge/server.ts → marksPaneSeen).
-  const headers: Record<string, string> = {
+  const headers = new Headers({
     "x-collie-seen": "1",
     [XHR_HEADER]: XHR_HEADER_VALUE,
-  };
-  if (cached) headers["if-none-match"] = cached.etag;
+    // A read needs no token, but the bridge stamps `lastSeenAt` off whatever it resolves — so a
+    // paired device's polls are what keep its "last seen" honest. Same injection point as `doReq`.
+    ...authHeader(),
+  });
+  if (cached) headers.set("if-none-match", cached.etag);
 
   const res = await fetch(withBasePath(url), { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
   captureBuild(res); // pane polls carry the build header too (incl. 304s) — keep the store fresh
@@ -258,6 +294,8 @@ export async function fetchPane(
 
   // Parse the body BEFORE recording the ETag, so the cache only ever holds an (etag, text) pair
   // that actually arrived intact.
+  // SAFETY: a 200 on `/api/pane/:id` is the bridge's own `PaneReadResponse` by contract — the same
+  // endpoint contract every other call in this module rests on. Non-ok answers threw above.
   const data = (await res.json()) as PaneReadResponse;
   const etag = res.headers.get("etag");
   if (etag) {
@@ -284,7 +322,7 @@ export async function fetchPane(
 export function fetchHistory(
   paneId: string,
   opts: { limit?: number; before?: string } = {},
-  session?: string,
+  scope?: Scope,
   signal?: AbortSignal,
 ): Promise<PaneHistoryResponse> {
   const q = new URLSearchParams();
@@ -294,7 +332,7 @@ export function fetchHistory(
   const path = `/api/pane/${encodeURIComponent(paneId)}/history${qs ? `?${qs}` : ""}`;
   // Reading the transcript is looking at the pane — and history is a READ, so like fetchPane it
   // carries the header that lets the bridge count it (bridge/server.ts → marksPaneSeen).
-  return req<PaneHistoryResponse>(withSession(path, session), {
+  return req<PaneHistoryResponse>(withScope(path, scope), {
     signal,
     headers: { "x-collie-seen": "1" },
   });
@@ -304,18 +342,16 @@ export function sendReply(
   paneId: string,
   text: string,
   submit = true,
-  session?: string,
+  scope?: Scope,
   expectedPrompt?: string,
 ): Promise<ActionResponse> {
   return req<ActionResponse>(
-    withSession(`/api/pane/${encodeURIComponent(paneId)}/reply`, session),
+    withScope(`/api/pane/${encodeURIComponent(paneId)}/reply`, scope),
     {
       method: "POST",
-      body: JSON.stringify({
-        text,
-        submit,
-        ...(expectedPrompt !== undefined ? { expected_prompt: expectedPrompt } : {}),
-      }),
+      // `JSON.stringify` omits an `undefined` property entirely, so an absent binding puts no
+      // `expected_prompt` on the wire — byte-identical to not naming the field at all.
+      body: JSON.stringify({ text, submit, expected_prompt: expectedPrompt }),
     },
     recoverPromptChanged,
   );
@@ -324,25 +360,23 @@ export function sendReply(
 export function sendKeys(
   paneId: string,
   keys: string[],
-  session?: string,
+  scope?: Scope,
   expectedPrompt?: string,
 ): Promise<ActionResponse> {
   return req<ActionResponse>(
-    withSession(`/api/pane/${encodeURIComponent(paneId)}/keys`, session),
+    withScope(`/api/pane/${encodeURIComponent(paneId)}/keys`, scope),
     {
       method: "POST",
-      body: JSON.stringify({
-        keys,
-        ...(expectedPrompt !== undefined ? { expected_prompt: expectedPrompt } : {}),
-      }),
+      // As in `sendReply`: an `undefined` property is omitted by `JSON.stringify`.
+      body: JSON.stringify({ keys, expected_prompt: expectedPrompt }),
     },
     recoverPromptChanged,
   );
 }
 
 /** Close a pane ("kill the agent"). */
-export function closePane(paneId: string, session?: string): Promise<ActionResponse> {
-  return req<ActionResponse>(withSession(`/api/pane/${encodeURIComponent(paneId)}/close`, session), {
+export function closePane(paneId: string, scope?: Scope): Promise<ActionResponse> {
+  return req<ActionResponse>(withScope(`/api/pane/${encodeURIComponent(paneId)}/close`, scope), {
     method: "POST",
   });
 }
@@ -351,9 +385,9 @@ export function closePane(paneId: string, session?: string): Promise<ActionRespo
 export function renamePane(
   paneId: string,
   label: string,
-  session?: string,
+  scope?: Scope,
 ): Promise<ActionResponse> {
-  return req<ActionResponse>(withSession(`/api/pane/${encodeURIComponent(paneId)}/rename`, session), {
+  return req<ActionResponse>(withScope(`/api/pane/${encodeURIComponent(paneId)}/rename`, scope), {
     method: "POST",
     body: JSON.stringify({ label }),
   });
@@ -363,17 +397,17 @@ export function renamePane(
 export function renameTab(
   tabId: string,
   label: string,
-  session?: string,
+  scope?: Scope,
 ): Promise<ActionResponse> {
-  return req<ActionResponse>(withSession(`/api/tab/${encodeURIComponent(tabId)}/rename`, session), {
+  return req<ActionResponse>(withScope(`/api/tab/${encodeURIComponent(tabId)}/rename`, scope), {
     method: "POST",
     body: JSON.stringify({ label }),
   });
 }
 
 /** Close a tab, killing every pane inside it. */
-export function closeTab(tabId: string, session?: string): Promise<ActionResponse> {
-  return req<ActionResponse>(withSession(`/api/tab/${encodeURIComponent(tabId)}/close`, session), {
+export function closeTab(tabId: string, scope?: Scope): Promise<ActionResponse> {
+  return req<ActionResponse>(withScope(`/api/tab/${encodeURIComponent(tabId)}/close`, scope), {
     method: "POST",
   });
 }
@@ -382,9 +416,9 @@ export function closeTab(tabId: string, session?: string): Promise<ActionRespons
 export function createTab(
   workspaceId: string,
   opts: { label?: string; cwd?: string } = {},
-  session?: string,
+  scope?: Scope,
 ): Promise<CreateResponse> {
-  return req<CreateResponse>(withSession("/api/tab", session), {
+  return req<CreateResponse>(withScope("/api/tab", scope), {
     method: "POST",
     body: JSON.stringify({ workspaceId, ...opts }),
   });
@@ -393,14 +427,23 @@ export function createTab(
 /** Create a new space (workspace) with a fresh shell pane. `cwd` omitted = the host's home dir. */
 export function createWorkspace(
   opts: { label?: string; cwd?: string } = {},
-  session?: string,
+  scope?: Scope,
 ): Promise<CreateResponse> {
-  return req<CreateResponse>(withSession("/api/workspace", session), {
+  return req<CreateResponse>(withScope("/api/workspace", scope), {
     method: "POST",
     body: JSON.stringify(opts),
   });
 }
 
+/**
+ * The bridge's startup config: push setup, the build id, the operator's own rows, and the
+ * multiplexer's declared capabilities (M10/06 — read them through lib/mux-capability.ts, never by
+ * reaching into `mux.name`).
+ *
+ * Read once per page load by lib/operator-config.ts, which is the only caller that should exist:
+ * every field here is startup-resolved on the bridge, so a second channel would be a second answer
+ * to the same question.
+ */
 export function fetchConfig(): Promise<BridgeConfig> {
   return req<BridgeConfig>("/api/config");
 }
@@ -441,27 +484,99 @@ export function checkForUpdates(): Promise<UpdateInfo> {
   return req<UpdateInfo>("/api/update/check", { method: "POST" });
 }
 
+// ── Device pairing ───────────────────────────────────────────────────────────────────────────────
+
+/** A successful claim (the token, returned exactly once) or the bridge's named reason for refusing. */
+export type PairResult =
+  | { ok: true; token: string; label: string }
+  | { ok: false; reason: PairFailure };
+
+/**
+ * A refused claim is a NORMAL answer, not a transport failure — the operator mistyped a code, or
+ * never minted one — so it is recovered into a value the pairing card can render a sentence for,
+ * exactly like the reply/keys 409. Anything other than a well-formed 400 still throws.
+ */
+const PAIR_FAILURES: readonly PairFailure[] = [
+  "no-pending",
+  "expired",
+  "exhausted",
+  "bad-code",
+  "duplicate-label",
+  "bad-request",
+];
+
+const recoverPairFailure: Recover<{ ok: false; reason: PairFailure }> = (status, detail) => {
+  if (status !== 400) return null;
+  // A non-JSON 400 body, or one with no `error` string, falls through to the usual ApiError.
+  const body = parseJsonObject(detail);
+  if (!body) return null;
+  const named = asJsonString(body.error);
+  if (named === undefined) return null;
+  // A refusal this build doesn't know the name of is still a refusal, not a transport failure: it
+  // reads as the bridge's own catch-all so the card says something actionable. (Left as the raw
+  // string, `failureText`'s exhaustive switch returned `undefined` and the card said nothing.)
+  return { ok: false, reason: PAIR_FAILURES.find((f) => f === named) ?? "bad-request" };
+};
+
+/**
+ * Claim the code `bin/collie pair` printed on the host and enrol this device under `label`.
+ *
+ * The bootstrap: same-origin gated like every other POST, but deliberately gated by NEITHER the
+ * pairing nor the device-header check — it is the one door an unpaired phone can walk through. The
+ * token in the reply exists exactly once; store it (lib/pairing.ts) or lose it.
+ */
+export async function pairDevice(code: string, label: string): Promise<PairResult> {
+  const res = await req<{ token: string; label: string } | { ok: false; reason: PairFailure }>(
+    "/api/pair",
+    { method: "POST", body: JSON.stringify({ code, label }) },
+    recoverPairFailure,
+  );
+  return "token" in res ? { ok: true, token: res.token, label: res.label } : res;
+}
+
+/** The paired-device registry. Read-level, so an unpaired device may ask (and learn it is unpaired). */
+export function fetchDevices(signal?: AbortSignal): Promise<DevicesResponse> {
+  return req<DevicesResponse>("/api/devices", { signal });
+}
+
+/**
+ * Revoke a paired device by label, returning the registry as it now stands. WRITE-level, so it needs
+ * this device's own token — including when the label being revoked IS this device, which is allowed
+ * and self-unpairs (the caller drops the local token afterwards).
+ */
+export function revokeDevice(label: string): Promise<DevicesResponse> {
+  return req<DevicesResponse>("/api/devices/revoke", {
+    method: "POST",
+    body: JSON.stringify({ label }),
+  });
+}
+
 /**
  * Upload an image; the bridge saves it to a host file and returns the path to reference in a
  * message. Uses multipart/form-data (NOT the JSON `req` helper — the browser sets the boundary).
  */
-export function uploadImage(paneId: string, file: File, session?: string): Promise<UploadResponse> {
+export function uploadImage(paneId: string, file: File, scope?: Scope): Promise<UploadResponse> {
   // Multipart, so it bypasses `req` (the browser sets the boundary) — track it explicitly instead.
   return trackBusy(
     (async () => {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await fetch(withBasePath(withSession(`/api/pane/${encodeURIComponent(paneId)}/upload`, session)), {
+      const res = await fetch(withBasePath(withScope(`/api/pane/${encodeURIComponent(paneId)}/upload`, scope)), {
         method: "POST",
         body: fd,
         // No content-type: the browser sets the multipart boundary. The XHR marker still applies —
         // an upload refused by a lapsed proxy session must surface as a status, not a redirect.
-        headers: { [XHR_HEADER]: XHR_HEADER_VALUE },
+        headers: { [XHR_HEADER]: XHR_HEADER_VALUE, ...authHeader() },
         signal: withTimeout(undefined, UPLOAD_TIMEOUT_MS),
       });
       if (!res.ok) {
-        throw new ApiError(`upload → ${res.status} ${await errorDetail(res)}`, res.status);
+        const detail = await errorDetail(res);
+        notePairing("POST", res.status, detail);
+        throw new ApiError(`upload → ${res.status} ${detail}`, res.status);
       }
+      notePairing("POST", res.status);
+      // SAFETY: a 200 on `/api/pane/:id/upload` is the bridge's own `UploadResponse` by contract;
+      // every non-ok answer threw above.
       return (await res.json()) as UploadResponse;
     })(),
   );

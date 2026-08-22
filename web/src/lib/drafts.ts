@@ -12,6 +12,8 @@
 // AND a try/catch, because Safari private mode throws on setItem rather than reporting quota. A
 // draft is never important enough to break a render or a send.
 
+import { normalizeScope, type Scope } from "./scope";
+
 const PREFIX = "collie:draft:";
 
 /** Drafts older than this are pruned on first use — an ancient half-thought must never resurface. */
@@ -58,8 +60,14 @@ interface DraftEntry {
  */
 const memory = new Map<string, DraftEntry>();
 
-function keyFor(session: string | undefined, paneId: string): string {
-  return `${PREFIX}${session ?? "default"}:${paneId}`;
+// A pane id is unique only within one session on one machine, so a draft is keyed by the whole
+// (host, session, paneId) triple — otherwise the draft you typed for `w1:p1` on one machine would be
+// restored into `w1:p1` on another. The lead's keys are byte-identical to what shipped: the host
+// segment is emitted only when there IS one, so every existing stored draft is still found. Both
+// tiers key off this one function, so memory and disk can never disagree about which pane is which.
+function keyFor(scope: Scope | undefined, paneId: string): string {
+  const { host, session } = normalizeScope(scope);
+  return `${PREFIX}${host ? `${host}@` : ""}${session ?? "default"}:${paneId}`;
 }
 
 function storage(): Storage | null {
@@ -104,6 +112,9 @@ function parse(raw: string | null): DraftEntry | null {
   try {
     const value: unknown = JSON.parse(raw);
     if (typeof value !== "object" || value === null) return null;
+    // SAFETY: `value` was just checked to be a non-null object, so reading `text`/`at` off it is
+    // defined behaviour; both are validated as the right primitive on the very next line before any
+    // of them is used. `Partial` is what makes those two checks mandatory rather than assumed.
     const entry = value as Partial<DraftEntry>;
     if (typeof entry.text !== "string" || typeof entry.at !== "number") return null;
     return { text: entry.text, at: entry.at };
@@ -119,14 +130,14 @@ export function fitsDraftStore(text: string): boolean {
 }
 
 /** The disk tier's entry for a pane, expiring (and removing) anything past MAX_AGE_MS. */
-function loadStored(session: string | undefined, paneId: string): DraftEntry | null {
+function loadStored(scope: Scope | undefined, paneId: string): DraftEntry | null {
   const store = storage();
   if (!store) return null;
   try {
-    const entry = parse(store.getItem(keyFor(session, paneId)));
+    const entry = parse(store.getItem(keyFor(scope, paneId)));
     if (entry === null) return null;
     if (Date.now() - entry.at > MAX_AGE_MS) {
-      store.removeItem(keyFor(session, paneId));
+      store.removeItem(keyFor(scope, paneId));
       return null;
     }
     return entry;
@@ -142,10 +153,10 @@ function loadStored(session: string | undefined, paneId: string): DraftEntry | n
  * instance writes only to disk, and this tier has never seen it. Memory wins every ordinary tie
  * because it is written first and holds what the disk tier refused.
  */
-export function loadDraft(session: string | undefined, paneId: string): string | null {
+export function loadDraft(scope: Scope | undefined, paneId: string): string | null {
   prunedOnce();
-  const cached = memory.get(keyFor(session, paneId)) ?? null;
-  const stored = loadStored(session, paneId);
+  const cached = memory.get(keyFor(scope, paneId)) ?? null;
+  const stored = loadStored(scope, paneId);
   if (cached === null) return stored?.text ?? null;
   if (stored === null) return cached.text;
   return stored.at > cached.at ? stored.text : cached.text;
@@ -156,13 +167,13 @@ export function loadDraft(session: string | undefined, paneId: string): string |
  * deliberately emptied the box" looks like, and it means the clear-on-send path needs no special
  * case beyond saving the now-empty input.
  */
-export function saveDraft(session: string | undefined, paneId: string, text: string): void {
+export function saveDraft(scope: Scope | undefined, paneId: string, text: string): void {
   prunedOnce();
   if (text.trim() === "") {
-    clearDraft(session, paneId);
+    clearDraft(scope, paneId);
     return;
   }
-  const key = keyFor(session, paneId);
+  const key = keyFor(scope, paneId);
   const at = Date.now();
 
   // Memory first, and unconditionally: it is the tier that has to hold what the disk tier won't, and
@@ -195,7 +206,7 @@ function evictMemory(keep: string): void {
   if (total <= MEMORY_MAX_CHARS) return;
   const byAge = [...memory.entries()]
     .filter(([key]) => key !== keep)
-    .sort((a, b) => a[1].at - b[1].at);
+    .toSorted((a, b) => a[1].at - b[1].at);
   for (const [key, entry] of byAge) {
     memory.delete(key);
     total -= entry.text.length;
@@ -213,8 +224,8 @@ function clearStored(store: Storage, key: string): void {
 
 /** Drop a pane's draft from BOTH tiers. The password-prompt outcome (ADR 0017) calls this, and it is
  *  the reason the memory tier needs no gate of its own — see the note on `memory`. */
-export function clearDraft(session: string | undefined, paneId: string): void {
-  const key = keyFor(session, paneId);
+export function clearDraft(scope: Scope | undefined, paneId: string): void {
+  const key = keyFor(scope, paneId);
   memory.delete(key);
   const store = storage();
   if (!store) return;

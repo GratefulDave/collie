@@ -1,4 +1,4 @@
-# Architecture — Collie (a Herdr web bridge over Tailscale)
+# Architecture — Collie (a Herdr web UI over Tailscale)
 
 > **Why Collie is shaped the way it is.** The deployment model, the interaction loop, and especially
 > the security posture — the reasoning the code can't state itself. This describes what is built; a
@@ -21,7 +21,7 @@ voice, no SSH.
 
 ## 2. What Collie is
 
-A Herdr web bridge — a long-lived local process that
+A collie — a long-lived local process that
 
 - connects to Herdr's Unix-socket API (`$HERDR_SOCKET_PATH`),
 - serves a **mobile-first web app**, with live state polled over HTTP (see §5),
@@ -42,7 +42,7 @@ The browser never touches the socket directly; the bridge is the only thing that
         ▼
    Collie (this project)
      • static web app + small JSON API (browser polls /api/snapshot)
-     • herdr-client adapter (the ONLY code that knows socket method names)
+     • mux adapter (bridge/mux/ — the ONLY code that knows socket method names)
      • snapshot poll, event-poked (see §5)
         │  newline-delimited JSON over Unix socket
         ▼
@@ -57,7 +57,7 @@ watching the TUI. A long-lived network daemon must be supervised independently.
 
 - **The bridge runs as a `systemd --user` service** (launchd agent on macOS) — starts at login,
   restarts on failure, survives Herdr restarts.
-- **The Herdr plugin stays — as a thin registration/launcher,** so the bridge shows up in
+- **The Herdr plugin stays — as a thin registration/launcher,** so Collie shows up in
   `herdr plugin list` and Herdr conventions still apply. Its `[[actions]]` do things like
   `systemctl --user start collie` and **print the tailnet URL**; they do *not* host the server. A
   `[[build]]` step builds the web UI on `herdr plugin install` (GitHub); local `link` installs skip
@@ -127,10 +127,12 @@ app. Closing this needs the server-side blocking-message capture described above
 
 ## 5. Architecture notes
 
-- **The `herdr-client` adapter is the only module that knows socket method names** (`pane.read`,
-  `agent.send`, `events.subscribe`, …). It translates to/from an internal domain model
-  (`AgentStatus`, `AgentView`, `SnapshotResponse` — `bridge/types.ts`), so a Herdr API rename is a
-  one-file fix, not a shatter.
+- **The mux adapter is the only module that knows socket method names** (`pane.read`, `agent.send`,
+  `events.subscribe`, …). The rest of the bridge depends on the **mux port** (`bridge/mux/types.ts`),
+  a Collie-owned contract each multiplexer implements — Herdr's implementation is
+  `bridge/mux/herdr/`, built through `bridge/mux/registry.ts` (ADR 0022). It translates to/from an
+  internal domain model (`AgentStatus`, `AgentView`, `SnapshotResponse` — `bridge/types.ts`), so a
+  Herdr API rename is a one-file fix, not a shatter.
 - **One protocol, two dialers.** Herdr's control socket is AF_UNIX on Linux/macOS and a *named pipe*
   on Windows (named after the full socket path). `bridge/dial.ts` is the only place that knows the
   difference: `Bun.connect({unix})` on POSIX, `node:net` on Windows. The wire protocol is identical —
@@ -209,6 +211,12 @@ default). These four are genuine RCE vectors and are **load-bearing — do not r
   it needs the port not to be shared in the first place (its own network namespace, or a uid
   owner-match filter such as nftables `meta skuid`); a plain port firewall rule won't stop a
   same-host peer (raised in [#33](https://github.com/AltanS/collie/issues/33)).
+  **Named exception: the pack listener.** When pack federation is enabled, a peer's `/pack/v1/*`
+  prefix shares the bridge's one listener and one bind — `COLLIE_HOST`, the operator's to set, with
+  a loud warning on a wildcard bind — and admits a request only past two independent factors, pinned
+  mutual TLS plus the pack secret, before any handler runs. See [`PACK_PROTOCOL.md` §3](./PACK_PROTOCOL.md#3-roles-and-modes)
+  (amended 2026-08-08, F3) and
+  [ADR 0013](./.adr/0013-a-peer-listens-without-becoming-a-front-door.md).
   Under `tailscale serve`, the `Tailscale-User-Login` header is the person gate — trusted **only**
   when the request source is loopback (i.e. it came from tailscaled). `COLLIE_TRUSTED_USER` rejects a
   *mismatching* login and **passes an absent one**: it narrows which tailnet user is trusted, it does
@@ -222,6 +230,15 @@ default). These four are genuine RCE vectors and are **load-bearing — do not r
   read-only, so reaching the port is no longer sufficient to write. Device ids are names your proxy
   asserts, not secrets — treat them as guessable and keep the front door and its ACL as the real
   containment.
+  **Device pairing (`bridge/pairing.ts`) is the second, independent write factor**, and the one that
+  needs no proxy at all: `collie pair` mints a one-time code out of band (the operator's own
+  terminal), the phone trades it at `POST /api/pair` for a 256-bit bearer token, and the bridge keeps
+  only its SHA-256. It is enforced exactly when the registry is non-empty, so an install that never
+  pairs anything is unchanged, and revocation (`collie devices revoke`) lands on the running service
+  without a restart because the registry is re-read per request. The two gates compose by AND —
+  neither weakens or replaces the other — and neither touches `/pack/v1/*`, whose two factors are its
+  own. Where the header gate answers *is this device on the operator's list*, pairing answers *does
+  this device hold a credential I issued*: a claim no proxy, DNS name or tailnet identity can forge.
 - **`pane.read` output renders safely** — it's attacker-influenceable (filenames, agent output,
   fetched web content). Never `innerHTML`; it renders as React text nodes under a **strict CSP**
   (`default-src 'self'`), so an escaping miss can't run injected script that calls back into the

@@ -74,5 +74,5 @@ describe("ctrlPresetsFor", () => {
 it("the scope ladder's family names are exactly the shipped catalog's", () => {
   // canonicalAgent() lives in operator-scope.ts but folds onto the CATALOG's own names — this pins
   // the two lists together, since adding an agent catalog is the one thing that moves both.
-  expect([...AGENT_FAMILIES].sort()).toEqual([...CATALOG_AGENTS].sort());
+  expect([...AGENT_FAMILIES].toSorted()).toEqual([...CATALOG_AGENTS].toSorted());
 });

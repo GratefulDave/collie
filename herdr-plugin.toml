@@ -1,52 +1,61 @@
 id = "herdr.collie"
 name = "Collie"
-version = "0.32.0"
+version = "1.0.0-beta.14"
 min_herdr_version = "0.7.0"
 description = "Mobile web UI to monitor and reply to your agent herd, served over Tailscale"
 platforms = ["linux", "macos"]
 
 # This plugin is a thin launcher. The actual bridge runs as a systemd --user service on Linux or a
-# launchd agent on macOS, so it outlives Herdr restarts (see ARCHITECTURE.md §3). The actions below
-# shell out to scripts/collie-ctl.sh, which gets HERDR_SOCKET_PATH / HERDR_PLUGIN_CONFIG_DIR injected.
+# launchd agent on macOS, so it outlives Herdr restarts (see ARCHITECTURE.md §3). Every action below
+# runs scripts/collie-ctl.sh, which since M6/01 implements nothing: it resolves Bun, builds bin/collie
+# if the checkout has none, and `exec`s that binary with the same argv. The CLI (cli/) is the ONE
+# implementation of every verb. Herdr injects HERDR_SOCKET_PATH / HERDR_PLUGIN_CONFIG_DIR into
+# these invocations and nothing else — no login shell — which the shim and the binary both expect.
+#
+# The command strings are FROZEN, byte for byte. On Herdr <0.8.0 a managed install invokes the
+# action set cached at install time, so `bash scripts/collie-ctl.sh <verb>` must keep resolving
+# there (ADR 0006) — and every README recipe spells the verbs that way too. Pointing an action
+# straight at bin/collie would break both for no gain: the shim already `exec`s it.
 
 # Build the web UI at install time. Herdr runs [[build]] steps ONLY on `herdr plugin install`
 # (GitHub) — NOT on `herdr plugin link` (local dev), which instead builds lazily on first `start`
-# (collie-ctl.sh's ensure_build). Delegating to `collie-ctl.sh build` keeps a single build
-# definition (version gate → cd web && bun install && bun run build) shared with the `update` action.
-# Still needs Bun on PATH — building the frontend is the one unavoidable Bun step.
+# (cli/build.ts's ensureBuild). This is the bootstrap exception and stays a bash entry: it is the
+# step that PRODUCES bin/collie, so it cannot invoke it — the shim builds from source with Bun and
+# `collie build` then installs both trees, typechecks, compiles the binary and builds the PWA.
+# Still needs Bun on PATH — building is the one unavoidable Bun step.
 [[build]]
 command = ["bash", "scripts/collie-ctl.sh", "build"]
 platforms = ["linux", "macos"]
 
 [[actions]]
 id = "start"
-title = "Start web bridge"
+title = "Start Collie"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "start"]
 
 [[actions]]
 id = "stop"
-title = "Stop web bridge"
+title = "Stop Collie"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "stop"]
 
 [[actions]]
 id = "restart"
-title = "Restart web bridge"
+title = "Restart Collie"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "restart"]
 
 # Full teardown: stops + disables the Linux unit or removes the macOS LaunchAgent, then resets
 # tailscale serve. Leaves the .env and the checkout (so `start` can bring it right back). See
-# scripts/collie-ctl.sh → cmd_uninstall.
+# cli/lifecycle.ts → cmdUninstall.
 [[actions]]
 id = "uninstall"
-title = "Uninstall web bridge (remove service)"
+title = "Uninstall Collie (remove service)"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "uninstall"]
 
 # Link-mode plugins ARE their on-disk git checkout (Herdr has no native `plugin update`), so this
-# action pulls + rebuilds + restarts in one step. See scripts/collie-ctl.sh → cmd_update.
+# action pulls + rebuilds + restarts in one step. See cli/update.ts → cmdUpdate.
 [[actions]]
 id = "update"
 title = "Update plugin"
@@ -56,8 +65,7 @@ command = ["bash", "scripts/collie-ctl.sh", "update"]
 # The consent for a MAJOR upgrade (ADR 0020). `update` stays inside the major this install is on, so
 # crossing one is a separate, deliberate invocation — and it has to be invokable from HERE, because a
 # plugin action runs with no TTY and the phone banner that announces the major has no terminal at
-# all. The flag IS the consent; there is no prompt behind it. See scripts/collie-ctl.sh →
-# update_checkout.
+# all. The flag IS the consent; there is no prompt behind it. See cli/update.ts → cmdUpdate.
 [[actions]]
 id = "update-major"
 title = "Update across a major version"
@@ -66,13 +74,13 @@ command = ["bash", "scripts/collie-ctl.sh", "update", "--major"]
 
 [[actions]]
 id = "url"
-title = "Show bridge URL"
+title = "Show Collie URL"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "url"]
 
 [[actions]]
 id = "status"
-title = "Bridge status"
+title = "Collie status"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "status"]
 
@@ -89,8 +97,9 @@ command = ["bash", "scripts/collie-ctl.sh", "version"]
 # for an agent to block. Restart between them; the keys are read at start.
 #
 # NOTE: on Herdr <0.8.0 a managed install invokes the action set cached at INSTALL time (ADR 0006),
-# so these two appear only after the next `herdr plugin install`. The shell verbs work immediately
-# either way.
+# so these two appear only after the next `herdr plugin install`. `bin/collie push-keys` /
+# `push-test` work immediately either way — the shim named here implements neither, it delegates
+# both to the binary like every other verb.
 [[actions]]
 id = "push-keys"
 title = "Generate push keys"

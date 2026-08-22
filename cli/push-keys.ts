@@ -1,9 +1,13 @@
-// Generate the VAPID keypair Web Push needs, and write it into the plugin .env — the step that used
-// to be "find the web-push CLI, run it, hand-edit a file you've never opened, in a directory you had
-// to go looking for". Run it via
-//   bash scripts/collie-ctl.sh push-keys ["mailto:you@example.com"]
-// (or the `push-keys` Herdr action), which resolves the config dir the same way every other verb
-// does, so the keys land in the .env the service actually reads.
+// `collie push-keys` (also spelled `collie push keys`) — generate the VAPID keypair Web Push needs
+// and write it into the plugin .env, the step that used to be "find the web-push CLI, run it,
+// hand-edit a file you've never opened, in a directory you had to go looking for".
+//
+// A verb in `cli/`, not shell in the bootstrap shim: every verb is implemented ONCE here and
+// compiled into `bin/collie` (ADR 0006). The Herdr action still spells
+// `bash scripts/collie-ctl.sh push-keys` because those command strings are frozen — the shim
+// delegates it here like every other verb, and the config dir is `CliContext`'s, resolved exactly
+// the same way `start`, `serve` and `push test` resolve it. That single resolution is the whole
+// point of the verb: the .env it writes is the .env the service reads.
 //
 // ── WHY THIS DOESN'T USE `web-push` ──────────────────────────────────────────
 // `web-push` ships `generateVAPIDKeys()`, but it is an OPTIONAL dependency (bridge/push.ts imports
@@ -16,6 +20,10 @@
 // nothing.
 import { chmod, lstat, readFile, rename, writeFile } from "node:fs/promises";
 import { generateKeyPairSync } from "node:crypto";
+import { join } from "node:path";
+
+import type { CliContext } from "./context.ts";
+import { EXIT, type Io } from "./io.ts";
 
 /** The three vars that turn push on, in the order they are written. */
 export const VAPID_KEYS = [
@@ -29,9 +37,19 @@ export type VapidKey = (typeof VAPID_KEYS)[number];
  * A VAPID keypair, base64url, in the shape `web-push` and the browser's `applicationServerKey` both
  * expect: public = the uncompressed P-256 point, private = the 32-byte scalar.
  */
-export function generateVapidKeys(): { publicKey: string; privateKey: string } {
+export interface VapidKeyPair {
+  publicKey: string;
+  privateKey: string;
+}
+
+/** {@link VapidKeyPair}, freshly generated. */
+export function generateVapidKeys(): VapidKeyPair {
   const pair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  // SAFETY: a P-256 JWK export names its coordinates `x`/`y` and its scalar `d` (RFC 7518 §6.2).
+  // All three are read as optional and every one is re-checked on the next lines before use, so an
+  // export that disagrees throws here rather than yielding a short key.
   const pub = pair.publicKey.export({ format: "jwk" }) as { x?: string; y?: string };
+  // SAFETY: as above — the private half of the same RFC 7518 §6.2 JWK, `d` checked below.
   const priv = pair.privateKey.export({ format: "jwk" }) as { d?: string };
   if (!pub.x || !pub.y || !priv.d) throw new Error("node:crypto returned an incomplete P-256 JWK");
   const x = Buffer.from(pub.x, "base64url");
@@ -92,7 +110,7 @@ export function mergeEnv(text: string, vars: Record<string, string>): string {
 
   if (appended.length > 0) {
     while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    lines.push("", "# --- Web Push (VAPID) — written by `collie-ctl.sh push-keys` ---", ...appended);
+  lines.push("", "# --- Web Push (VAPID) — written by `collie push-keys` ---", ...appended);
   }
   // Exactly one trailing newline, whatever the file arrived with.
   while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
@@ -127,16 +145,27 @@ export function validateSubject(subject: string): string {
 /** What `loadConfig()` falls back to — the same placeholder, so nothing changes meaning by default. */
 export const DEFAULT_SUBJECT = "mailto:admin@example.com";
 
-// Sourced by scripts/push-keys.test.ts rather than run: the pure halves above are the testable part.
-if (import.meta.main) {
-  const argv = process.argv.slice(2);
-  const force = argv.includes("--force");
-  const [envPath, subjectArg] = argv.filter((a) => a !== "--force");
 
-  if (!envPath) {
-    console.error("usage: push-keys.ts <path/to/.env> [mailto:you@example.com] [--force]");
-    process.exit(2);
-  }
+// ── the verb ─────────────────────────────────────────────────────────────────
+
+export interface PushKeysDeps {
+  ctx: CliContext;
+  io: Io;
+}
+
+/**
+ * `collie push-keys [subject] [--force]`.
+ *
+ * Three refusals, each because the alternative is silent — live keys are never replaced without
+ * `--force`, a symlinked `.env` is refused rather than renamed over, and the subject is
+ * ALLOWLISTED (see {@link validateSubject}). A subject passed to an already-configured install is a
+ * subject update and nothing else, so correcting a typo'd contact address never costs the
+ * subscribers.
+ */
+export async function cmdPushKeys(deps: PushKeysDeps, args: readonly string[]): Promise<number> {
+  const force = args.includes("--force");
+  const subjectArg = args.find((a) => a !== "--force");
+  const envPath = join(deps.ctx.configDir, ".env");
 
   let text = "";
   try {
@@ -149,8 +178,8 @@ if (import.meta.main) {
   try {
     subject = subjectArg === undefined ? undefined : validateSubject(subjectArg);
   } catch (e) {
-    console.error(`✗ ${(e as Error).message}`);
-    process.exit(2);
+    deps.io.err(`✗ ${message(e)}`);
+    return EXIT.USAGE;
   }
 
   const already = VAPID_KEYS.filter((k) => k !== "COLLIE_VAPID_SUBJECT").every(
@@ -164,14 +193,12 @@ if (import.meta.main) {
   const subjectOnly = already && !force && subject !== undefined;
 
   if (already && !force && !subjectOnly) {
-    console.error(
-      `✗ push keys are already configured in ${envPath}\n` +
-        "  Replacing them invalidates EVERY existing subscription: each device must open Collie and\n" +
-        "  re-enable notifications, and until it does it will silently receive nothing.\n" +
-        "  If that's what you want: `bash scripts/collie-ctl.sh push-keys --force`.\n" +
-        "  (To change only the contact subject, pass it — that never touches the keys.)",
-    );
-    process.exit(1);
+    deps.io.err(`✗ push keys are already configured in ${envPath}`);
+    deps.io.err("  Replacing them invalidates EVERY existing subscription: each device must open Collie and");
+    deps.io.err("  re-enable notifications, and until it does it will silently receive nothing.");
+    deps.io.err("  If that's what you want: `collie push-keys --force`.");
+    deps.io.err("  (To change only the contact subject, pass it — that never touches the keys.)");
+    return EXIT.FAIL;
   }
 
   // The subject is written only when there is something to say: an argument, or a value already in
@@ -196,46 +223,69 @@ if (import.meta.main) {
   // A SYMLINKED .env is refused rather than renamed over. Some operators keep this file in a dotfiles
   // repo or have it rendered by a secret manager and symlink it into place; `rename` would silently
   // replace the link with a regular file, and their source of truth would quietly stop being one.
+  //
+  // The remedy has to be something the operator does to the FILE, not to this command: the verb
+  // takes no path (the config dir is `CliContext`'s, resolved once, and that single resolution is
+  // the whole reason the verb exists), so "point it at the real file" would name no object.
   const link = await lstat(envPath).catch(() => null);
   if (link?.isSymbolicLink()) {
-    console.error(
-      `✗ ${envPath} is a symlink — writing it would replace the link with a plain file.\n` +
-        `  Point this at the real file instead: push-keys "$(readlink -f ${envPath})"`,
-    );
-    process.exit(1);
+    deps.io.err(`✗ ${envPath} is a symlink — writing it would replace the link with a plain file,`);
+    deps.io.err("  and whatever renders it (a dotfiles repo, a secret manager) would stop being the");
+    deps.io.err("  source of truth. Either add the keys where that file is generated and re-render,");
+    deps.io.err("  or make this a real file first and re-run:");
+    deps.io.err(`    cp -L ${envPath} ${envPath}.real && mv ${envPath}.real ${envPath}`);
+    deps.io.err("  Nothing was written either way — any existing keys are untouched.");
+    return EXIT.FAIL;
   }
 
   const tmp = `${envPath}.push-keys.tmp`;
   try {
     await writeFile(tmp, merged, { mode: 0o600, flag: "wx" });
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+    // SAFETY: `writeFile` rejects with Node's fs error, which carries `.code`; a rejection that
+    // somehow doesn't reads as "not EEXIST" and takes the generic-failure path just below.
+    if ((e as NodeJS.ErrnoException).code !== "EEXIST") {
+      deps.io.err(`✗ could not write ${tmp}: ${message(e)}`);
+      return EXIT.FAIL;
+    }
     // Left behind by a run that died between write and rename. Say so and stop: deleting it blind is
     // how `wx` stops meaning anything, and it may hold the only copy of a key someone just generated.
-    console.error(`✗ ${tmp} already exists — a previous run left it behind.\n  Inspect it, then remove it and retry.`);
-    process.exit(1);
+    deps.io.err(`✗ ${tmp} already exists — a previous run left it behind.`);
+    deps.io.err("  Inspect it, then remove it and retry.");
+    return EXIT.FAIL;
   }
   await rename(tmp, envPath);
   await chmod(envPath, 0o600);
 
   if (subjectOnly) {
-    console.log(`✓ updated COLLIE_VAPID_SUBJECT in ${envPath} — the keys are untouched`);
+    deps.io.out(`✓ updated COLLIE_VAPID_SUBJECT in ${envPath} — the keys are untouched`);
   } else {
-    console.log(`✓ wrote COLLIE_VAPID_PUBLIC / _PRIVATE to ${envPath} (mode 600)`);
-    if (already) console.log("  ⚠ keys replaced — every subscribed device must re-enable notifications.");
+    deps.io.out(`✓ wrote COLLIE_VAPID_PUBLIC / _PRIVATE to ${envPath} (mode 600)`);
+    if (already) deps.io.out("  ⚠ keys replaced — every subscribed device must re-enable notifications.");
   }
-  console.log(`  subject: ${effectiveSubject ?? `${DEFAULT_SUBJECT} (default — pass one to set your own)`}`);
+  deps.io.out(
+    `  subject: ${effectiveSubject ?? `${DEFAULT_SUBJECT} (default — pass one to set your own)`}`,
+  );
 
+  // Keys without a sender are a service that starts up and pushes nothing, so say so — but only
+  // after the keys are safely written: this check must never be what stops step one.
   try {
     await import("web-push");
   } catch {
-    console.log(
+    deps.io.out(
       "  ⚠ `web-push` isn't installed, so the bridge still can't SEND — run `bun install` in the checkout.",
     );
   }
 
-  console.log("\nNext:");
-  console.log("  1. herdr plugin action invoke restart --plugin herdr.collie");
-  console.log("  2. On your phone: open Collie → Settings → enable notifications");
-  console.log("  3. bash scripts/collie-ctl.sh push-test");
+  deps.io.out("");
+  deps.io.out("Next:");
+  deps.io.out("  1. herdr plugin action invoke restart --plugin herdr.collie");
+  deps.io.out("  2. On your phone: open Collie → Settings → enable notifications");
+  deps.io.out("  3. collie push test");
+  return EXIT.OK;
+}
+
+/** The message of a thrown value, without assuming the `catch` handed us an Error. */
+function message<TThrown>(e: TThrown): string {
+  return e instanceof Error ? e.message : String(e);
 }

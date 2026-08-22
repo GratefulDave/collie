@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { ArrowLeft, Bell, Loader2 } from "lucide-react";
-import { useNavigate, useRouteLoaderData } from "react-router";
+import { useLoaderData, useNavigate } from "react-router";
 
 import { Button } from "@/components/ui/button";
 import { BuildStamp } from "@/components/build-stamp";
@@ -8,6 +8,7 @@ import { UpdateBanner } from "@/components/update-banner";
 import { ConnectionInfo } from "@/components/connection-info";
 import { Card } from "@/components/ui/card";
 import { NotifyPrefsControl } from "@/components/notify-prefs-control";
+import { PairedDevices } from "@/components/paired-devices";
 import { SnoozeControl } from "@/components/snooze-control";
 import { ThemeControl } from "@/components/theme-control";
 import { HapticsControl } from "@/components/haptics-control";
@@ -15,21 +16,29 @@ import { UpdateCheckControl } from "@/components/update-check-control";
 import { Switch } from "@/components/ui/switch";
 import { fetchConfig } from "@/lib/api";
 import { usePushControl } from "@/hooks/use-push";
-import { ROOT_ROUTE_ID, type HomeData } from "@/lib/loaders";
+import { type DevicesData } from "@/lib/loaders";
 import { homePath } from "@/lib/nav";
-import { useSession } from "@/lib/session";
+import { useScope } from "@/lib/session";
 import type { PushAvailability } from "@/lib/push";
+import { useOptionalRootData } from "@/lib/route-data";
+
+const EMPTY_DEVICES: DevicesData = { enforced: false, current: null, devices: [], error: false };
 
 // Settings page — currently just the push-notification toggle. Reachable from the home header gear.
 // Lives under the root route, so the snapshot polling/push-setup in RootLayout keeps running behind it.
 export function SettingsRoute() {
   const navigate = useNavigate();
-  const session = useSession();
+  const scope = useScope();
   const { state, busy, setEnabled } = usePushControl();
   const [error, setError] = useState<string | null>(null);
 
-  // Settings lives under the root route, so the live snapshot (bridge + device auth) is right here.
-  const root = useRouteLoaderData(ROOT_ROUTE_ID) as HomeData | undefined;
+  const root = useOptionalRootData();
+  // This route's OWN loader: the paired-device registry (lib/loaders.ts devicesLoader).
+  // Defaulted rather than asserted: a harness that mounts this route without the loader (or a
+  // navigation whose loader threw) must still render the rest of Settings, not crash the page.
+  // SAFETY: `devicesLoader` returns `DevicesData` for this route; `undefined` is the case the
+  // default below exists for. React Router types a data-mode `useLoaderData()` as `unknown`.
+  const devices = (useLoaderData() as DevicesData | undefined) ?? EMPTY_DEVICES;
   // The build the bridge reports it's serving — handy in the diagnostics panel alongside the local
   // stamp in the footer. Best-effort: stays undefined if the bridge is unreachable.
   const [serverBuild, setServerBuild] = useState<string | undefined>();
@@ -63,7 +72,7 @@ export function SettingsRoute() {
           size="icon"
           // size="icon" is 36px; the header's other controls are 44px since the tap-target pass.
           className="size-11"
-          onClick={() => navigate(homePath(session))}
+          onClick={() => navigate(homePath(scope))}
           aria-label="Back"
         >
           <ArrowLeft className="size-5" />
@@ -133,6 +142,11 @@ export function SettingsRoute() {
 
         {/* On-demand upstream update check (independent of push) — drives the footer UpdateBanner. */}
         <UpdateCheckControl />
+
+        {/* Access sits with the connection diagnostics — both answer "what is this device allowed
+            to do, and why". Pairing is the gate you can change from here; ConnectionInfo below only
+            reports the header-based one. */}
+        <PairedDevices data={devices} />
 
         <ConnectionInfo bridge={root?.bridge} device={root?.device} build={serverBuild} />
 

@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  bridgeConfigBody,
+  muxConfigBody,
+  muxLogoResponse,
   BUILD_HEADER,
   cacheControlFor,
   checkAccess,
@@ -14,30 +17,51 @@ import {
   keysPane,
   normalizeTabLabel,
   paneReadResponse,
+  parsePairRequest,
+  parseSnoozeRequest,
   replyPane,
+  requestDevice,
   resolveStaticPath,
   sendReplySteps,
   startupWarnings,
   withBuildHeader,
   type ReplySender,
 } from "./server.ts";
-import { AuditLog } from "./audit.ts";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { AuditLog, type AuditEntry } from "./audit.ts";
 import type { Config } from "./config.ts";
-import type { HerdrClient, PaneRead } from "./herdr-client.ts";
+import { declareCapabilities, MUX_CAPABILITIES } from "./mux/capabilities.ts";
+import { withAgentBeacons } from "./beacon/decorate.ts";
+import { fakeBeaconReader } from "./beacon/fake.ts";
+import { withAgentHints } from "./beacon/hint.ts";
+import { HerdrMux, herdrMuxFactory } from "./mux/herdr/adapter.ts";
+import { tmuxMuxFactory } from "./mux/tmux/adapter.ts";
+import type { HerdrClient, PaneRead } from "./mux/herdr/client.ts";
+import { muxAck, type MuxAck, type MuxAdapter, type MuxGrid } from "./mux/types.ts";
+import { neverProxy } from "./pack/fixtures.ts";
+import { PackLead } from "./pack/lead.ts";
+import { PackRegistry } from "./pack/registry.ts";
+import { computeEtag } from "./http-cache.ts";
+import { MUX_LOGO_PATH, type SnapshotResponse } from "./types.ts";
 
 // checkAccess is the API security gate (same-origin/CSRF + optional Tailscale identity). A
 // regression here silently opens remote shell access, so it gets the most direct coverage.
 
+// A real Request, not a fake: checkAccess reads only headers, and Bun's Headers already does the
+// case-insensitive lookup (and keeps `host`, which a browser would strip) — so there is nothing left
+// for a hand-rolled stub to get subtly wrong.
 function req(headers: Record<string, string>): Request {
-  const lower: Record<string, string> = {};
-  for (const [k, v] of Object.entries(headers)) lower[k.toLowerCase()] = v;
-  return {
-    headers: { get: (name: string) => lower[name.toLowerCase()] ?? null },
-  } as unknown as Request;
+  return new Request("http://collie.invalid/api/snapshot", { headers });
 }
 
 function cfg(overrides: Partial<Config> = {}): Config {
   return {
+    mux: "herdr",
+    muxEndpoint: "/tmp/herdr.sock",
+    tmuxBin: "",
+    zellijBin: "",
     socketPath: "/tmp/herdr.sock",
     port: 8787,
     host: "127.0.0.1",
@@ -273,13 +297,13 @@ describe("sendReplySteps — two-step send & partial-failure clarity", () => {
   class FakeClient implements ReplySender {
     readonly calls: string[] = [];
     constructor(private readonly failOn?: "text" | "keys") {}
-    sendPaneText(_paneId: string, _text: string): Promise<void> {
+    typeText(_paneId: string, _text: string): Promise<MuxAck> {
       this.calls.push("text");
-      return this.failOn === "text" ? Promise.reject(new Error("text rejected")) : Promise.resolve();
+      return this.failOn === "text" ? Promise.reject(new Error("text rejected")) : Promise.resolve(muxAck());
     }
-    sendPaneKeys(_paneId: string, _keys: string[]): Promise<void> {
+    sendKeys(_paneId: string, _keys: readonly string[]): Promise<MuxAck> {
       this.calls.push("keys");
-      return this.failOn === "keys" ? Promise.reject(new Error("keys rejected")) : Promise.resolve();
+      return this.failOn === "keys" ? Promise.reject(new Error("keys rejected")) : Promise.resolve(muxAck());
     }
   }
 
@@ -325,6 +349,17 @@ describe("sendReplySteps — two-step send & partial-failure clarity", () => {
   });
 });
 
+/**
+ * HerdrClient carries private socket fields, so no fake can ever *be* one structurally.
+ * `Partial<HerdrClient>` keeps the compiler checking every method a fake DOES supply against the
+ * real client's signature — the only step asserted is "the rest is never reached".
+ */
+function asMux(fake: Partial<HerdrClient>): MuxAdapter {
+  // SAFETY: the pane-write handlers under test reach exactly readPane / sendPaneText / sendPaneKeys,
+  // all of which FakePaneClient implements; no other member is reachable from these code paths.
+  return new HerdrMux(fake as HerdrClient);
+}
+
 describe("pane write prompt binding", () => {
   type ReadArgs = Parameters<HerdrClient["readPane"]>;
 
@@ -360,7 +395,19 @@ describe("pane write prompt binding", () => {
     }
   }
 
-  function request(body: unknown): Request {
+  /**
+   * A pane-action body as the phone posts it. `expected_prompt` is deliberately wider than the
+   * handler's contract: two tests below post a non-string on purpose, and rejecting that IS the
+   * behaviour under test, so the fixture type has to be able to express it.
+   */
+  interface PaneActionBody {
+    keys?: string[];
+    text?: string;
+    submit?: boolean;
+    expected_prompt?: string | number | null;
+  }
+
+  function request(body: PaneActionBody): Request {
     return new Request("http://localhost/api/pane/w1%3Ap1/action", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -368,11 +415,16 @@ describe("pane write prompt binding", () => {
     });
   }
 
-  function auditEntries(): { audit: AuditLog; entries: Array<Record<string, unknown>> } {
-    const entries: Array<Record<string, unknown>> = [];
+  /** One audit line as `JSON.parse` returns it: the entry as written, plus formatAuditLine's stamp. */
+  type AuditLine = AuditEntry & { ts: string };
+
+  function auditEntries() {
+    const entries: AuditLine[] = [];
     return {
       audit: new AuditLog((line) => {
-        entries.push(JSON.parse(line));
+        // SAFETY: the appender is handed formatAuditLine's own output — this test never feeds it
+        // anything else — so the parse round-trips the AuditEntry it just serialised.
+        entries.push(JSON.parse(line) as AuditLine);
       }),
       entries,
     };
@@ -382,7 +434,7 @@ describe("pane write prompt binding", () => {
     const client = new FakePaneClient();
     const { audit } = auditEntries();
     const res = await keysPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg(),
       "w1:p1",
       request({ keys: ["1"] }),
@@ -399,7 +451,7 @@ describe("pane write prompt binding", () => {
     const client = new FakePaneClient();
     const { audit } = auditEntries();
     const res = await replyPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg(),
       "w1:p1",
       request({ text: "hello", submit: false }),
@@ -416,7 +468,7 @@ describe("pane write prompt binding", () => {
     const client = new FakePaneClient();
     const { audit, entries } = auditEntries();
     const res = await keysPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg({ readLines: 321 }),
       "w1:p1",
       request({ keys: ["1"], expected_prompt: "Approve this command?\n1. Yes\n2. No" }),
@@ -438,7 +490,7 @@ describe("pane write prompt binding", () => {
     client.text = expected;
     const { audit } = auditEntries();
     const res = await keysPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg({ readLines: 20 }),
       "w1:p1",
       request({ keys: ["1"], expected_prompt: expected }),
@@ -460,7 +512,7 @@ describe("pane write prompt binding", () => {
     const client = new FakePaneClient();
     const { audit } = auditEntries();
     const res = await replyPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg({ readLines: 321 }),
       "w1:p1",
       request({
@@ -482,7 +534,7 @@ describe("pane write prompt binding", () => {
     client.text = "Command finished";
     const { audit, entries } = auditEntries();
     const res = await keysPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg(),
       "w1:p1",
       request({ keys: ["1"], expected_prompt: "Approve this command?\n1. Yes\n2. No" }),
@@ -508,7 +560,7 @@ describe("pane write prompt binding", () => {
     client.text = "Command finished";
     const { audit } = auditEntries();
     const res = await replyPane(
-      client as unknown as HerdrClient,
+      asMux(client),
       cfg(),
       "w1:p1",
       request({
@@ -531,7 +583,7 @@ describe("pane write prompt binding", () => {
       const client = new FakePaneClient();
       const { audit } = auditEntries();
       const res = await keysPane(
-        client as unknown as HerdrClient,
+        asMux(client),
         cfg(),
         "w1:p1",
         request({ keys: ["1"], expected_prompt }),
@@ -551,7 +603,7 @@ describe("pane write prompt binding", () => {
       const client = new FakePaneClient();
       const { audit } = auditEntries();
       const res = await replyPane(
-        client as unknown as HerdrClient,
+        asMux(client),
         cfg(),
         "w1:p1",
         request({ text: "hello", expected_prompt }),
@@ -570,7 +622,7 @@ describe("pane write prompt binding", () => {
 
 describe("paneReadResponse — pane read → REST body", () => {
   test("passes text, truncated, and the monotonic revision through", () => {
-    const read: PaneRead = { pane_id: "w1:p1", text: "hello", truncated: true, revision: 42 };
+    const read: MuxGrid = { paneId: "w1:p1", text: "hello", truncated: true, revision: 42 };
     expect(paneReadResponse("w1:p1", read)).toEqual({
       paneId: "w1:p1",
       text: "hello",
@@ -580,7 +632,7 @@ describe("paneReadResponse — pane read → REST body", () => {
   });
 
   test("carries a zero revision unchanged (fresh pane) rather than dropping the field", () => {
-    const read: PaneRead = { pane_id: "w2:p1", text: "", truncated: false, revision: 0 };
+    const read: MuxGrid = { paneId: "w2:p1", text: "", truncated: false, revision: 0 };
     expect(paneReadResponse("w2:p1", read)).toEqual({
       paneId: "w2:p1",
       text: "",
@@ -712,8 +764,8 @@ describe("guard applies the device gate to writes only", () => {
   });
 
   test("feature on, allowlisted device: authorised and attributed (header is trimmed)", () => {
-    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone", "laptop"] });
-    expect(deviceAuth(req({ host: "h", "x-device-id": " phone " }), c)).toEqual({
+    const authCfg = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone", "laptop"] });
+    expect(deviceAuth(req({ host: "h", "x-device-id": " phone " }), authCfg)).toEqual({
       enforced: true,
       device: "phone",
       authorized: true,
@@ -721,8 +773,8 @@ describe("guard applies the device gate to writes only", () => {
   });
 
   test("feature on, non-allowlisted device: read-only (attributed but not authorised)", () => {
-    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
-    expect(deviceAuth(req({ host: "h", "x-device-id": "intruder" }), c)).toEqual({
+    const authCfg = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
+    expect(deviceAuth(req({ host: "h", "x-device-id": "intruder" }), authCfg)).toEqual({
       enforced: true,
       device: "intruder",
       authorized: false,
@@ -730,8 +782,8 @@ describe("guard applies the device gate to writes only", () => {
   });
 
   test("the 'unknown' sentinel is never authorised, even if it appears in the allowlist", () => {
-    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["unknown"] });
-    expect(deviceAuth(req({ host: "h", "x-device-id": "unknown" }), c)).toEqual({
+    const authCfg = cfg({ deviceHeader: HDR, deviceAllowlist: ["unknown"] });
+    expect(deviceAuth(req({ host: "h", "x-device-id": "unknown" }), authCfg)).toEqual({
       enforced: true,
       device: "unknown",
       authorized: false,
@@ -739,12 +791,206 @@ describe("guard applies the device gate to writes only", () => {
   });
 
   test("feature on with an empty allowlist: every header-carrying device is read-only (fail-closed)", () => {
-    const c = cfg({ deviceHeader: HDR, deviceAllowlist: [] });
-    expect(deviceAuth(req({ host: "h", "x-device-id": "phone" }), c)).toEqual({
+    const authCfg = cfg({ deviceHeader: HDR, deviceAllowlist: [] });
+    expect(deviceAuth(req({ host: "h", "x-device-id": "phone" }), authCfg)).toEqual({
       enforced: true,
       device: "phone",
       authorized: false,
     });
+  });
+});
+
+// ── Device pairing composed into the write gate (bridge/pairing.ts) ────────────────────────────
+// The pairing module is exhaustively covered in bridge/pairing.test.ts. What is pinned HERE is the
+// wiring — which is where a security feature actually lives: that an empty registry changes nothing,
+// that a non-empty one gates writes and not reads, that the two device gates compose by AND rather
+// than either replacing the other, and that attribution prefers the label.
+describe("guard — the pairing gate composes with the header gate", () => {
+  const HDR = "x-device-id";
+  /** A minimal PairingGate: `labels` are the paired tokens, keyed by token. */
+  const gateOf = (tokens: Record<string, string>) => ({
+    enforced: () => Object.keys(tokens).length > 0,
+    resolve: (token: string | null) =>
+      token !== null && tokens[token] !== undefined ? { label: tokens[token]! } : null,
+  });
+  const paired = gateOf({ "tok-phone": "phone" });
+  const nothingPaired = gateOf({});
+
+  const write = (c: Config, headers: Record<string, string>, gate?: ReturnType<typeof gateOf>) =>
+    guard(req({ host: "collie.ts.net", origin: "https://collie.ts.net", ...headers }), c, "write", gate);
+  const read = (c: Config, headers: Record<string, string>, gate?: ReturnType<typeof gateOf>) =>
+    guard(req({ host: "collie.ts.net", ...headers }), c, "read", gate);
+
+  test("an empty registry enforces nothing — the feature is off until something is paired", () => {
+    expect(write(cfg(), {}, nothingPaired)).toBeNull();
+    // …and so is passing no gate at all, which is what every pre-pairing call site did.
+    expect(write(cfg(), {})).toBeNull();
+  });
+
+  test("a non-empty registry refuses a write with no bearer token", async () => {
+    const denied = write(cfg(), {}, paired);
+    expect(denied).not.toBeNull();
+    expect(denied!.status).toBe(403);
+    expect(await denied!.text()).toBe("device not paired");
+  });
+
+  test("a wrong or malformed bearer token is refused", () => {
+    expect(write(cfg(), { authorization: "Bearer wrong" }, paired)!.status).toBe(403);
+    expect(write(cfg(), { authorization: "Basic tok-phone" }, paired)!.status).toBe(403);
+    expect(write(cfg(), { authorization: "tok-phone" }, paired)!.status).toBe(403);
+  });
+
+  test("a valid bearer token proceeds", () => {
+    expect(write(cfg(), { authorization: "Bearer tok-phone" }, paired)).toBeNull();
+    expect(write(cfg(), { authorization: "bearer  tok-phone " }, paired)).toBeNull();
+  });
+
+  test("reads are unaffected — parity with the header gate, which is also write-only", () => {
+    expect(read(cfg(), {}, paired)).toBeNull();
+    expect(read(cfg(), { authorization: "Bearer wrong" }, paired)).toBeNull();
+  });
+
+  test("the two gates compose by AND: each refuses independently of the other", async () => {
+    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
+    // Header ok, not paired → the pairing refusal.
+    const noToken = write(c, { "x-device-id": "phone" }, paired)!;
+    expect(await noToken.text()).toBe("device not paired");
+    // Paired, header missing → the header refusal, which is checked first and names itself.
+    const noHeader = write(c, { authorization: "Bearer tok-phone" }, paired)!;
+    expect(await noHeader.text()).toBe("device not authorised");
+    // Both satisfied → through.
+    expect(write(c, { "x-device-id": "phone", authorization: "Bearer tok-phone" }, paired)).toBeNull();
+  });
+
+  test("the header gate is untouched when nothing is paired", async () => {
+    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["phone"] });
+    expect((await write(c, {}, nothingPaired)!.text())).toBe("device not authorised");
+    expect(write(c, { "x-device-id": "phone" }, nothingPaired)).toBeNull();
+  });
+
+  test("the same-origin gate still runs first — a token is no substitute for an Origin", () => {
+    const denied = guard(
+      req({ host: "collie.ts.net", authorization: "Bearer tok-phone" }),
+      cfg(),
+      "write",
+      paired,
+    );
+    expect(denied).not.toBeNull();
+    expect(denied!.status).toBe(403);
+  });
+});
+
+describe("requestDevice — attribution across both gates", () => {
+  const HDR = "x-device-id";
+  const gateOf = (tokens: Record<string, string>) => ({
+    enforced: () => Object.keys(tokens).length > 0,
+    resolve: (token: string | null) =>
+      token !== null && tokens[token] !== undefined ? { label: tokens[token]! } : null,
+  });
+  const paired = gateOf({ "tok-phone": "phone" });
+
+  test("with nothing paired it is exactly deviceAuth — an unpaired deployment sees no change", () => {
+    for (const c of [cfg(), cfg({ deviceHeader: HDR, deviceAllowlist: ["desk"] })]) {
+      const cases: Record<string, string>[] = [{ host: "h" }, { host: "h", "x-device-id": "desk" }];
+      for (const headers of cases) {
+        expect(requestDevice(req(headers), c, gateOf({}))).toEqual(deviceAuth(req(headers), c));
+        expect(requestDevice(req(headers), c)).toEqual(deviceAuth(req(headers), c));
+      }
+    }
+  });
+
+  test("a token's label wins over the header name", () => {
+    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["desk"] });
+    expect(requestDevice(req({ host: "h", "x-device-id": "desk", authorization: "Bearer tok-phone" }), c, paired)).toEqual(
+      { enforced: true, device: "phone", authorized: true },
+    );
+  });
+
+  test("without a token the header name still attributes, but is not authorised", () => {
+    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["desk"] });
+    expect(requestDevice(req({ host: "h", "x-device-id": "desk" }), c, paired)).toEqual({
+      enforced: true,
+      device: "desk",
+      authorized: false,
+    });
+  });
+
+  test("pairing alone reports enforcement even with no header gate configured", () => {
+    expect(requestDevice(req({ host: "h", authorization: "Bearer tok-phone" }), cfg(), paired)).toEqual({
+      enforced: true,
+      device: "phone",
+      authorized: true,
+    });
+    expect(requestDevice(req({ host: "h" }), cfg(), paired)).toEqual({
+      enforced: true,
+      device: null,
+      authorized: false,
+    });
+  });
+
+  test("a paired device that the header gate refuses is not authorised", () => {
+    const c = cfg({ deviceHeader: HDR, deviceAllowlist: ["desk"] });
+    expect(
+      requestDevice(req({ host: "h", "x-device-id": "intruder", authorization: "Bearer tok-phone" }), c, paired),
+    ).toEqual({ enforced: true, device: "phone", authorized: false });
+  });
+});
+
+describe("parsePairRequest — the bootstrap body", () => {
+  test("both fields, with the label normalised", () => {
+    expect(parsePairRequest({ code: "abcd-2345", label: "  Pixel 9 " })).toEqual({
+      code: "abcd-2345",
+      label: "Pixel 9",
+    });
+  });
+
+  test("a missing, empty or oversized field is refused", () => {
+    expect(parsePairRequest(null)).toBeNull();
+    expect(parsePairRequest("code")).toBeNull();
+    expect(parsePairRequest({ code: "abcd2345" })).toBeNull();
+    expect(parsePairRequest({ label: "phone" })).toBeNull();
+    expect(parsePairRequest({ code: "", label: "phone" })).toBeNull();
+    expect(parsePairRequest({ code: "abcd2345", label: "   " })).toBeNull();
+    expect(parsePairRequest({ code: "x".repeat(65), label: "phone" })).toBeNull();
+    expect(parsePairRequest({ code: "abcd2345", label: "x".repeat(49) })).toBeNull();
+    expect(parsePairRequest({ code: 12345678, label: "phone" })).toBeNull();
+  });
+
+  test("the code is passed through unjudged — shape-checking it would be a free oracle", () => {
+    // Not code-shaped at all, but it is the hash compare's job to say so, in constant time.
+    expect(parsePairRequest({ code: "!!!!", label: "phone" })?.code).toBe("!!!!");
+  });
+});
+
+describe("parseSnoozeRequest — absence is not null", () => {
+  test("an explicit null clears the snooze", () => {
+    expect(parseSnoozeRequest({ snoozedUntil: null })).toEqual({ ok: true, until: null });
+  });
+
+  test("a number is passed through as the deadline", () => {
+    expect(parseSnoozeRequest({ snoozedUntil: 1_700_000_000_000 })).toEqual({
+      ok: true,
+      until: 1_700_000_000_000,
+    });
+  });
+
+  test("an OMITTED field is refused — it must never read as a clear", () => {
+    // The regression this pins: `{}` reaching `snooze.set(null)` would silently unmute every
+    // session's notifications on a body that asked for nothing.
+    expect(parseSnoozeRequest({})).toEqual({ ok: false });
+    expect(parseSnoozeRequest({ snoozed_until: null })).toEqual({ ok: false });
+    expect(parseSnoozeRequest({ snoozedUntil: undefined })).toEqual({ ok: false });
+  });
+
+  test("a body that is not an object is refused rather than dereferenced", () => {
+    expect(parseSnoozeRequest(null)).toEqual({ ok: false });
+    expect(parseSnoozeRequest("later")).toEqual({ ok: false });
+    expect(parseSnoozeRequest([null])).toEqual({ ok: false });
+  });
+
+  test("a non-numeric value is refused", () => {
+    expect(parseSnoozeRequest({ snoozedUntil: "1700000000000" })).toEqual({ ok: false });
+    expect(parseSnoozeRequest({ snoozedUntil: true })).toEqual({ ok: false });
   });
 });
 
@@ -910,5 +1156,341 @@ describe("marksPaneSeen — CSRF guard on marking a pane seen", () => {
   test("any header value counts — presence is the proof, not the contents", () => {
     expect(marksPaneSeen(withHeader({ [SEEN_HEADER]: "" }), undefined)).toBe(true);
     expect(marksPaneSeen(withHeader({ [SEEN_HEADER]: "anything" }), undefined)).toBe(true);
+  });
+});
+
+// GET /api/config is where a client learns the pack mode without probing behaviour (M4/01). The
+// handler lives inside Bun.serve, which bun test cannot stand up (CLAUDE.md), so the body it emits
+// is asserted through the pure builder the handler calls.
+describe("bridgeConfigBody — /api/config reports the pack mode", () => {
+  const base = { push: true, vapidPublicKey: "BKey", build: "abc123" } as const;
+
+  test("a solo instance emits today's exact body — no `mode` key at all", () => {
+    const body = bridgeConfigBody({ ...base, mode: "solo" });
+    expect(body).toEqual({ push: true, vapidPublicKey: "BKey", build: "abc123" });
+    expect(Object.keys(body)).toEqual(["push", "vapidPublicKey", "build"]);
+    expect("mode" in body).toBe(false);
+    // Byte level, because the point is the serialized response, not the object.
+    expect(JSON.stringify(body)).toBe('{"push":true,"vapidPublicKey":"BKey","build":"abc123"}');
+  });
+
+  test("a lead and a peer say so", () => {
+    expect(bridgeConfigBody({ ...base, mode: "lead" }).mode).toBe("lead");
+    expect(bridgeConfigBody({ ...base, mode: "peer" }).mode).toBe("peer");
+  });
+
+  test("the mode is appended, never reordering the fields a solo client already parses", () => {
+    expect(Object.keys(bridgeConfigBody({ ...base, mode: "peer" }))).toEqual([
+      "push",
+      "vapidPublicKey",
+      "build",
+      "mode",
+    ]);
+  });
+
+  test("push disabled still round-trips its key untouched", () => {
+    const body = bridgeConfigBody({ push: false, vapidPublicKey: "", build: "unknown", mode: "solo" });
+    expect(body).toEqual({ push: false, vapidPublicKey: "", build: "unknown" });
+  });
+});
+
+// The mux block (M10/06) — how the phone learns what the multiplexer underneath can do, without
+// ever learning to branch on which one it is. Same reason as above: the handler is inside Bun.serve,
+// so the shape is asserted through the pure builder it calls.
+describe("muxConfigBody — the capability declaration, as the phone reads it", () => {
+  const everything = declareCapabilities({
+    supports: [...MUX_CAPABILITIES],
+    unsupportedKeys: ["PageUp", "End"],
+    notes: { gridScrollback: "developer prose about a capability this adapter HAS" },
+  });
+  const partial = declareCapabilities({
+    supports: ["paneGrid", "typeText", "sendKeys"],
+    notes: {
+      agentSessionRef: "a multiplexer keeps no agent session log for Collie to read.",
+      createSpace: "one collie drives one session here, so a new one would not appear at all.",
+    },
+  });
+
+  test("capabilities are TOTAL — every name answered, so nothing reads as absent by omission", () => {
+    const wire = muxConfigBody({ mux: "reference", capabilities: everything });
+    expect(Object.keys(wire.capabilities).toSorted()).toEqual([...MUX_CAPABILITIES].toSorted());
+    for (const cap of MUX_CAPABILITIES) expect(wire.capabilities[cap]).toBe(true);
+  });
+
+  test("an adapter missing capabilities says false, never omits the key", () => {
+    const wire = muxConfigBody({ mux: "partial", capabilities: partial });
+    expect(wire.capabilities.agentSessionRef).toBe(false);
+    expect(wire.capabilities.createSpace).toBe(false);
+    expect(wire.capabilities.paneGrid).toBe(true);
+    expect("agentSessionRef" in wire.capabilities).toBe(true);
+  });
+
+  test("notes ride only for the capabilities the adapter LACKS", () => {
+    expect(muxConfigBody({ mux: "reference", capabilities: everything }).notes).toEqual({});
+    const notes = muxConfigBody({ mux: "partial", capabilities: partial }).notes;
+    expect(Object.keys(notes).toSorted()).toEqual(["agentSessionRef", "createSpace"]);
+  });
+
+  test("the name and the refused keys ride verbatim", () => {
+    const wire = muxConfigBody({ mux: "reference", capabilities: everything });
+    expect(wire.name).toBe("reference");
+    expect(wire.unsupportedKeys).toEqual(["PageUp", "End"]);
+  });
+
+  test("the wire is a copy — mutating it cannot reach the adapter's declaration", () => {
+    const wire = muxConfigBody({ mux: "reference", capabilities: everything });
+    wire.capabilities.paneGrid = false;
+    wire.unsupportedKeys.push("Home");
+    expect(everything.supports.paneGrid).toBe(true);
+    expect(everything.unsupportedKeys).toEqual(["PageUp", "End"]);
+  });
+
+  test("the real Herdr adapter publishes every capability — nothing changes for its operators", () => {
+    const wire = muxConfigBody(herdrMuxFactory.create({ endpoint: "/tmp/none.sock", timeoutMs: 100, options: {} }));
+    for (const cap of MUX_CAPABILITIES) expect(wire.capabilities[cap]).toBe(true);
+    expect(wire.notes).toEqual({});
+  });
+
+  // The mark's URL is published like everything else here: as data the phone prints. An adapter
+  // WITHOUT one must publish no key, because the key's absence is the whole instruction to render
+  // the header's text alone — a `logoUrl` on an adapter with no logo is a 404 in every header.
+  test("an adapter with a logo publishes its URL; one without publishes no key", () => {
+    const withLogo = muxConfigBody({ mux: "reference", capabilities: everything, logo: "<svg/>" });
+    expect(withLogo.logoUrl).toBe(MUX_LOGO_PATH);
+    expect("logoUrl" in muxConfigBody({ mux: "reference", capabilities: everything })).toBe(false);
+  });
+
+  test("the real Herdr adapter ships a mark, so its header renders one", () => {
+    const wire = muxConfigBody(herdrMuxFactory.create({ endpoint: "/tmp/none.sock", timeoutMs: 100, options: {} }));
+    expect(wire.logoUrl).toBe(MUX_LOGO_PATH);
+  });
+
+  // …AND THROUGH THE WRAPPERS, which is where the first version of this shipped broken. `bridge/`
+  // never hands `muxConfigBody` a raw adapter: index.ts wraps every one in the hint tier and a blind
+  // one in the beacon decorator first, and both rebuild the adapter as a literal. Asserting the raw
+  // adapter's mark proves nothing about the object the route actually holds — that is precisely the
+  // gap that let three live instances publish no `logoUrl` while the suite stayed green.
+  test("the mark survives the hint tier — the wrapper EVERY adapter gets", () => {
+    const raw = herdrMuxFactory.create({ endpoint: "/tmp/none.sock", timeoutMs: 100, options: {} });
+    const wrapped = withAgentHints(raw, { hooksInstalled: () => false });
+    expect(muxConfigBody(wrapped).logoUrl).toBe(MUX_LOGO_PATH);
+  });
+
+  test("the mark survives BOTH wrappers on a blind adapter, stacked as index.ts stacks them", () => {
+    const target = { endpoint: "collie-test", timeoutMs: 100, options: {} } as const;
+    const raw = tmuxMuxFactory.create(target);
+    const matcher = tmuxMuxFactory.beaconMatcher?.(target);
+    if (matcher === undefined) throw new Error("the tmux factory must contribute a beacon matcher");
+    const seeing = withAgentBeacons(raw, fakeBeaconReader([]), { matcher, hooksInstalled: () => false });
+    const wrapped = withAgentHints(seeing, { hooksInstalled: () => false });
+    expect(muxConfigBody(wrapped).logoUrl).toBe(MUX_LOGO_PATH);
+  });
+});
+
+// GET /api/mux/logo.svg. The bytes are an ADAPTER's, so the headers are the containment: sandboxed
+// (no script can run even if a future adapter's file carried some), nosniff (a browser may not
+// re-decide what they are), and validated by ETag rather than pinned by a max-age, so a release that
+// changes the mark is picked up on the next load.
+describe("muxLogoResponse — serving an adapter's mark", () => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"></svg>`;
+
+  test("answers the SVG with the image type and both hardening headers", async () => {
+    const res = muxLogoResponse(svg, null);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/svg+xml; charset=utf-8");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
+    expect(await res.text()).toBe(svg);
+  });
+
+  test("carries a strong ETag and revalidates rather than pinning a max-age", () => {
+    const res = muxLogoResponse(svg, null);
+    expect(res.headers.get("cache-control")).toBe("no-cache");
+    expect(res.headers.get("etag")).toBe(computeEtag(svg));
+  });
+
+  test("a client holding the current bytes gets a bodiless 304 — still hardened", async () => {
+    const res = muxLogoResponse(svg, computeEtag(svg));
+    expect(res.status).toBe(304);
+    expect(await res.text()).toBe("");
+    expect(res.headers.get("content-security-policy")).toBe("sandbox");
+    expect(res.headers.get("etag")).toBe(computeEtag(svg));
+  });
+
+  test("a stale validator re-sends the body", () => {
+    expect(muxLogoResponse(svg, `"stale"`).status).toBe(200);
+  });
+});
+
+describe("bridgeConfigBody — the mux block is appended, never reordering what came before", () => {
+  const base = { push: true, vapidPublicKey: "BKey", build: "abc123", mode: "solo" } as const;
+  const mux = { mux: "reference", capabilities: declareCapabilities({ supports: ["paneGrid"] }) };
+
+  test("no adapter in hand: no key at all, which a client reads as an older bridge", () => {
+    expect("mux" in bridgeConfigBody({ ...base })).toBe(false);
+  });
+
+  test("with one, it lands last", () => {
+    expect(Object.keys(bridgeConfigBody({ ...base, mux }))).toEqual([
+      "push",
+      "vapidPublicKey",
+      "build",
+      "mux",
+    ]);
+    expect(Object.keys(bridgeConfigBody({ ...base, mode: "peer", mux }))).toEqual([
+      "push",
+      "vapidPublicKey",
+      "build",
+      "mode",
+      "mux",
+    ]);
+  });
+
+  test("it carries the declaration, not the adapter", () => {
+    const body = bridgeConfigBody({ ...base, mux });
+    expect(body.mux?.name).toBe("reference");
+    expect(body.mux?.capabilities.paneGrid).toBe(true);
+    expect(body.mux?.capabilities.createSpace).toBe(false);
+  });
+});
+
+// ── The merged snapshot route (M4/04) ────────────────────────────────────────
+// `/api/snapshot` is `packLead ? packLead.merge(body) : body`, inside Bun.serve — which bun test
+// cannot stand up (CLAUDE.md). So the two halves are asserted where they actually live: the
+// composition through the real PackLead, and the routing invariants by reading the source that
+// registers them. PACK_PROTOCOL.md §9.2, §10.2.
+
+const snapshotSource = (): SnapshotResponse => ({
+  bridge: "connected",
+  agents: [
+    {
+      paneId: "w1:p1",
+      workspaceId: "w1",
+      workspaceLabel: "collie",
+      workspaceNumber: 1,
+      tabId: "w1:t1",
+      agent: "claude",
+      status: "blocked",
+      cwd: "/home/you",
+      focused: false,
+      kind: "agent",
+    },
+  ],
+  shellPanes: [],
+  workspaces: [],
+  tabs: [],
+  sessions: [{ name: "default", isPrimary: true, reachable: true, agents: 1, working: 0, blocked: 1 }],
+  ts: 1_754_000_000_000,
+});
+
+function leadOverDeadPeer(): PackLead {
+  const registry = new PackRegistry({
+    sessions: { get: () => undefined },
+    self: "desk",
+    members: () => [
+      {
+        memberId: "laptop",
+        fingerprint: "a".repeat(64),
+        certPem: "-----BEGIN CERTIFICATE-----\nunused-in-this-test\n-----END CERTIFICATE-----\n",
+        address: "laptop.example:8787",
+        role: "peer",
+        status: "enrolled",
+        enrolledAt: 0,
+        secretGeneration: 1,
+        signedAt: 0,
+      },
+    ],
+  });
+  return new PackLead({
+    registry,
+    // Every dial fails, exactly as `PeerClient` reports a peer that is off: a value, not a throw.
+    snapshot: async () => ({ ok: false, state: "unreachable", reason: "connection refused", receivedAt: 1 }),
+    proxy: neverProxy,
+    self: { id: "desk", name: "the herd" },
+  });
+}
+
+describe("the merged snapshot — an unreachable peer degrades its entry, never the response", () => {
+  test("a dead peer yields a body (which the route 200s), not a throw and not a 5xx", async () => {
+    const lead = leadOverDeadPeer();
+    await lead.sweep();
+    // The route has no try/catch around this call and needs none — that is the contract.
+    const merged = lead.merge(snapshotSource());
+    expect(merged.bridge).toBe("connected");
+    expect(merged.servers).toEqual([
+      { id: "desk", name: "the herd", isLead: true, reachable: true, protocol: "ok", lastSeenAt: expect.any(Number) },
+      { id: "laptop", name: "laptop", isLead: false, reachable: false, protocol: "unknown", lastSeenAt: 0 },
+    ]);
+    // The lead's own herd is untouched by its peer being down.
+    expect(merged.agents.map((p) => p.paneId)).toEqual(["w1:p1"]);
+    expect(JSON.parse(JSON.stringify(merged))).toBeTruthy();
+  });
+
+  test("with no lead runtime the body is passed through by identity — solo's zero tax at the seam", () => {
+    const body = snapshotSource();
+    // Character-for-character the route's own expression, with the route's own optional dep.
+    const route = (packLead: PackLead | undefined, b: SnapshotResponse) => (packLead ? packLead.merge(b) : b);
+    const out = route(undefined, body);
+    expect(out).toBe(body);
+    expect(JSON.stringify(out)).not.toMatch(/"servers"|"host"/);
+  });
+});
+
+describe("the host gate — `?host=` selects among enrolled members and nothing else", () => {
+  const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+
+  test("the selector is parsed only when a pack surface is mounted", () => {
+    // The same trust-store-existence predicate the pack router mounts on: a solo instance never
+    // applies the `?host=` grammar to a URL at all (§11).
+    expect(src).toContain("const host = packHandler ? selectHostFrom(url) : LOCAL_HOST;");
+  });
+
+  test("every session-scoped route resolves through the gate, never past it", () => {
+    // The load-bearing claim: `?h=laptop` + `w1:p1` must never be served the DESK's `w1:p1`, and
+    // pane ids collide across machines, so a fall-through here is a cross-host write.
+    //
+    // All four session-scoped routes (tab create, workspace create, tab action, the pane family)
+    // reach their runtime through the caller's resolver and nothing else.
+    expect([...src.matchAll(/await caller\.resolve\(\);/g)]).toHaveLength(4);
+    // Exactly four `registry.get(` calls remain, and each is a sanctioned one, named here rather
+    // than exempted: assembling THIS collie's own snapshot body; `localRuntime`, the single
+    // "(session) → runtime, or 404" helper both callers share; `/api/config`, which reports THIS
+    // collie's own multiplexer (M10/06) and is not session-scoped at all; and `/api/mux/logo.svg`,
+    // which serves that same local multiplexer's mark and is session-scoped no more than the config
+    // that publishes its URL. A fifth would be a route reaching past the gate.
+    expect([...src.matchAll(/registry\.get\(/g)]).toHaveLength(4);
+    // The mux read is a read of the LOCAL primary — never `?host=`, because a peer's capabilities
+    // are its own business and reach the lead over the pack API, never out of this registry.
+    expect(src).toContain("const activeMux = registry.get();");
+    // An unknown or ill-formed host is a 404, mirroring unknownSession() (§4)…
+    expect(src).toMatch(/`unknown host: \$\{host\.kind === "member" \? host\.id : host\.raw\}`/);
+    // …and a KNOWN peer is forwarded, with the peer's own response handed back (§5, §9.1). The
+    // forward is the gate's own branch — no route may grow a second one.
+    expect([...src.matchAll(/packLead!\.forward\(/g)]).toHaveLength(1);
+    expect(src).not.toContain("per-pane proxying is not implemented in this build");
+  });
+
+  test("a peer's own routes are the SAME closure the browser's are (§5), with two callers", () => {
+    // The 1:1 rule: `/pack/v1/pane/:id/reply` and `/api/pane/:id/reply` are not two handlers that
+    // agree — they are one block reached by two callers. Exactly one definition, exactly two calls.
+    expect([...src.matchAll(/const serveSessionRoute = async/g)]).toHaveLength(1);
+    expect([...src.matchAll(/serveSessionRoute\(\s*req/g)]).toHaveLength(2);
+    // The peer's caller supplies its OWN gate and its OWN audit attribution — the lead's verdict is
+    // never an input, and the write lands in the peer's log marked pack-originated (§12).
+    expect(src).toContain("packGate(level, cfg, device)");
+    expect(src).toContain('audit.scoped({ via: "pack", from })');
+  });
+
+  test('"seen" is marked once, on the owning host, and never for a remote pane (.adr/0003)', () => {
+    // One call site, and it sits AFTER the resolver — so a pane on a peer has already returned the
+    // peer's forwarded response and cannot reach it. The peer marks it, against its own ledger,
+    // because the `x-collie-seen` header is forwarded verbatim. Two machines counting one look would
+    // be exactly the "one shared fact" ADR 0003 forbids.
+    const calls = [...src.matchAll(/activity\.noteSeen\(/g)];
+    expect(calls).toHaveLength(1);
+    expect(src.indexOf("activity.noteSeen(")).toBeGreaterThan(src.indexOf("await caller.resolve();"));
+    // And it is still keyed by (session, paneId) alone: the ledger's host dimension exists for the
+    // LEAD's own bookkeeping, not for a peer marking its own panes (bridge/activity.ts).
+    expect(src).toContain("activity.noteSeen(session, paneId)");
   });
 });

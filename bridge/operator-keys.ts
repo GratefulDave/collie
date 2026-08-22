@@ -1,3 +1,4 @@
+import type { JsonObject, JsonValue } from "./json.ts";
 import { createOperatorFileReader, diskIo, type OperatorFileIo } from "./operator-file.ts";
 import type { OperatorKeyRow } from "./types.ts";
 
@@ -14,19 +15,19 @@ import type { OperatorKeyRow } from "./types.ts";
 // lives client-side in `web/src/lib/operator-keys.ts`. This module only decides what a row IS.
 
 /** The named keys Herdr's `pane.send_keys` accepts bare, in their canonical spelling (HERDR_API.md). */
-const NAMED: Record<string, string> = {
-  up: "Up",
-  down: "Down",
-  left: "Left",
-  right: "Right",
-  tab: "Tab",
-  enter: "Enter",
-  escape: "Escape",
-  space: "Space",
-  backspace: "Backspace",
+const NAMED = new Map<string, string>([
+  ["up", "Up"],
+  ["down", "Down"],
+  ["left", "Left"],
+  ["right", "Right"],
+  ["tab", "Tab"],
+  ["enter", "Enter"],
+  ["escape", "Escape"],
+  ["space", "Space"],
+  ["backspace", "Backspace"],
   // Herdr's own alias for Backspace. Normalised away so one chord has one spelling on the wire.
-  bs: "Backspace",
-};
+  ["bs", "Backspace"],
+]);
 
 /** Modifiers Herdr accepts, case-insensitively, joined with `+`. NOT tmux's `C-`/`M-` prefixes. */
 const MODIFIERS = new Set(["ctrl", "shift", "alt", "cmd", "super"]);
@@ -68,7 +69,8 @@ export function normalizeChord(raw: string): string | null {
 function normalizeBase(base: string): string | null {
   if (base === "") return null;
   const lower = base.toLowerCase();
-  if (Object.hasOwn(NAMED, lower)) return NAMED[lower]!;
+  const named = NAMED.get(lower);
+  if (named !== undefined) return named;
   if (/^f([1-9]|1[0-2])$/.test(lower)) return lower.toUpperCase();
   // One literal character, typed as itself. `[...base]` counts code points, so an emoji or an
   // accented character is one character here exactly as it is on the operator's keyboard.
@@ -111,11 +113,11 @@ export function validateOperatorKeys(
   const out: OperatorKeyRow[] = [];
   const at = new Map<string, number>();
   for (const raw of rows) {
-    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    if (typeof raw !== "object" || raw === null || raw === undefined || Array.isArray(raw)) {
       warn("ignoring a row that is not a [[keys]] table");
       continue;
     }
-    const row = raw as Record<string, unknown>;
+    const row: JsonObject = raw;
     const label = typeof row.label === "string" ? row.label.trim() : "";
     if (label === "") {
       warn(`ignoring a row with no label: ${JSON.stringify(row.keys)}`);
@@ -140,11 +142,12 @@ export function validateOperatorKeys(
       continue;
     }
     const parsed: OperatorKeyRow = {
-      ...(agent ? { agent } : {}),
       label,
       keys: chords,
       danger: row.danger === true,
     };
+    // Assigned, never conditionally spread: an unscoped row carries NO `agent` key.
+    if (agent) parsed.agent = agent;
     // Identity is scope+label, because the label IS what the button says: two rows sharing one on
     // one pane would be two buttons a thumb cannot tell apart. The later row wins IN PLACE, so
     // correcting a preset does not reshuffle the grid.
@@ -162,7 +165,7 @@ export function validateOperatorKeys(
 }
 
 /** The row's `keys` array, normalised — or null (already warned) when the row cannot be sent. */
-function readChords(value: unknown, label: string, warn: (message: string) => void): string[] | null {
+function readChords(value: JsonValue | undefined, label: string, warn: (message: string) => void): string[] | null {
   if (!Array.isArray(value) || value.length === 0) {
     warn(`ignoring "${label}" — keys must be a non-empty array of chords`);
     return null;

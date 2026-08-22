@@ -27,15 +27,17 @@ function sub(endpoint: string): PushSubscription {
 }
 
 /** Enable push and seed subscriptions without the real VAPID/web-push init handshake. */
-function enable(push: Push, seed: PushSubscription[]): Map<string, PushSubscription> {
-  const internals = push as unknown as { _enabled: boolean; subs: Map<string, PushSubscription> };
-  internals._enabled = true;
-  for (const s of seed) internals.subs.set(s.endpoint, s);
-  return internals.subs;
+function enable(push: Push, seed: PushSubscription[]) {
+  // Bracket access reaches Push's private state without an assertion, so the compiler still checks
+  // both fields against their real declarations.
+  push["_enabled"] = true;
+  for (const s of seed) push["subs"].set(s.endpoint, s);
+  return push["subs"];
 }
 
 async function fileEndpoints(dir: string): Promise<string[]> {
   const raw = JSON.parse(await readFile(join(dir, "push-subscriptions.json"), "utf8"));
+  // SAFETY: Push is the only writer of this file and always serialises its whole subscription list.
   return (raw as PushSubscription[]).map((s) => s.endpoint);
 }
 
@@ -64,9 +66,9 @@ describe("Push — broadcast delivery & pruning", () => {
 
     const warnings: string[] = [];
     const origWarn = console.warn;
-    console.warn = ((...args: unknown[]) => {
+    console.warn = (...args: unknown[]) => {
       warnings.push(args.map(String).join(" "));
-    }) as typeof console.warn;
+    };
     try {
       await push.notify("hi", "there");
     } finally {
@@ -112,7 +114,7 @@ describe("Push — eviction of persistently-failing subscriptions", () => {
    *  view of this behaviour) without spraying the test run. */
   async function capturingConsole<T>(fn: () => Promise<T>): Promise<{ result: T; lines: string[] }> {
     const lines: string[] = [];
-    const collect = ((...args: unknown[]) => void lines.push(args.map(String).join(" "))) as typeof console.warn;
+    const collect = (...args: unknown[]) => void lines.push(args.map(String).join(" "));
     const [origWarn, origLog] = [console.warn, console.log];
     console.warn = collect;
     console.log = collect;
@@ -260,7 +262,7 @@ describe("Push — persistence", () => {
       push.addSubscription(sub("c")),
     ]);
 
-    expect((await fileEndpoints(cfg.stateDir)).sort()).toEqual(["a", "b", "c"]);
+    expect((await fileEndpoints(cfg.stateDir)).toSorted()).toEqual(["a", "b", "c"]);
   });
 });
 
@@ -303,6 +305,31 @@ describe("Push — per-message collapse topic (update must not share the herd sl
     // message by Doze / App Standby bucket, which silently ate alerts entirely. See push.ts.
     expect(sends[0]!.options).toEqual({ topic: "collie-herd", TTL: 21_600, urgency: "high" });
     expect("target" in JSON.parse(sends[0]!.payload).data).toBe(false);
+  });
+
+  test("the payload `data` gains `host` only when the message names one", async () => {
+    const cfg = await tempCfg();
+    const { sender, sends } = capturing();
+    const push = new Push(cfg, sender);
+    enable(push, [sub("a")]);
+
+    // A local (or solo) alert: no `host` key at all — omitted, not null, exactly as `session` is.
+    await push.send({ title: "claude needs you", body: "…", tag: "collie:herd", paneId: "w1:p1" });
+    expect(JSON.parse(sends[0]!.payload).data).toEqual({ paneId: "w1:p1" });
+
+    // A peer's alert, raised by the lead: the host completes the `(host, session, paneId)` address.
+    await push.send({
+      title: "claude needs you",
+      body: "…",
+      tag: "collie:herd@laptop",
+      paneId: "w1:p1",
+      host: "laptop",
+    });
+    expect(JSON.parse(sends[1]!.payload).data).toEqual({ paneId: "w1:p1", host: "laptop" });
+
+    // Both dimensions at once still stamp independently.
+    await push.send({ title: "t", body: "b", paneId: "w1:p1", session: "work", host: "laptop" });
+    expect(JSON.parse(sends[2]!.payload).data).toEqual({ paneId: "w1:p1", session: "work", host: "laptop" });
   });
 
   test("a clear stays on the herd topic (it closes the herd slot)", async () => {
@@ -398,7 +425,7 @@ describe("Push — superseding, metadata and forget", () => {
     const { push } = await fresh();
     await push.addSubscription(sub("a"), { userAgent: "first" });
     const first = push.listSubscriptions()[0]!.createdAt;
-    expect(typeof first).toBe("string");
+    expect(first).toBeString();
 
     await push.addSubscription(sub("a"), { userAgent: "second" });
     const again = push.listSubscriptions()[0]!;
