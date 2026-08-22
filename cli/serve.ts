@@ -149,7 +149,12 @@ export function cmdServe(deps: ServeDeps): number {
   }
 
   const proxy = `http://127.0.0.1:${deps.ctx.port}`;
-  const listenerPort = deps.ctx.serveMode === "http" ? deps.ctx.port : 443;
+  // Ours: on this deployment tailscaled's bare portless form (`serve --bg <port>`) answers with its
+  // own x-portless 404 instead of forwarding, so https always passes an explicit --https port.
+  // COLLIE_SERVE_PORT (the pre-v1 knob) picks it; it defaults to 443.
+  const servePort = Number.parseInt(deps.ctx.env.COLLIE_SERVE_PORT ?? "", 10);
+  const listenerPort =
+    deps.ctx.serveMode === "http" ? deps.ctx.port : Number.isInteger(servePort) ? servePort : 443;
   if (!ensureRootAvailable(deps, listenerPort, deps.ctx.serveMode, proxy)) return EXIT.FAIL;
 
   // Write-ahead ownership: the record goes down BEFORE the serve call, so a serve that half-lands
@@ -165,7 +170,7 @@ export function cmdServe(deps: ServeDeps): number {
   const args =
     deps.ctx.serveMode === "http"
       ? ["serve", "--bg", `--http=${deps.ctx.port}`, "--set-path=/", String(deps.ctx.port)]
-      : ["serve", "--bg", "--set-path=/", String(deps.ctx.port)];
+      : ["serve", "--bg", `--https=${listenerPort}`, "--set-path=/", String(deps.ctx.port)];
   const r = deps.exec.capture("tailscale", args);
   // The shell captured this into ${CONFIG_DIR}/serve.out and `cat`-ed it on failure; the file stays
   // so an operator who went looking for it after a failed publish still finds it.
@@ -175,7 +180,7 @@ export function cmdServe(deps: ServeDeps): number {
     deps.io.out(
       deps.ctx.serveMode === "http"
         ? `tailscale serve (http) → tailnet :${deps.ctx.port} -> 127.0.0.1:${deps.ctx.port}`
-        : `tailscale serve (https) → tailnet :443 -> 127.0.0.1:${deps.ctx.port}`,
+        : `tailscale serve (https) → tailnet :${listenerPort} -> 127.0.0.1:${deps.ctx.port}`,
     );
     return EXIT.OK;
   }

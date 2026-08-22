@@ -222,7 +222,7 @@ describe("serve — publishing", () => {
   test("https publishes on :443 while the proxy target stays the bridge port", () => {
     const h = harness();
     expect(cmdServe(h.deps)).toBe(EXIT.OK);
-    expect(h.exec.calls).toContain("tailscale serve --bg --set-path=/ 8787");
+    expect(h.exec.calls).toContain("tailscale serve --bg --https=443 --set-path=/ 8787");
     expect(h.files.read(HANDLER_FILE)).toBe("https:443|host.example:443|http://127.0.0.1:8787\n");
   });
 
