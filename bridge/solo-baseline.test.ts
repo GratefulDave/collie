@@ -500,7 +500,6 @@ describe("solo zero-tax — routes", () => {
       "/",
       "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history))?$/",
       "/^\\/api\\/tab\\/([^/]+)\\/(rename|close)$/",
-      "/__collie_legacy_root_sw_cleanup.js",
       "/api/config",
       // Device pairing (bridge/pairing.ts) — a SOLO feature that legitimately extends this list.
       // It is named here, not exempted: the guard's job is that a route arrives on purpose.

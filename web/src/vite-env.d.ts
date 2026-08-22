@@ -9,11 +9,3 @@ declare const __BUILD_INFO__: {
   time: string;
   id: string;
 };
-
-interface ImportMetaEnv {
-  BASE_URL: string;
-}
-
-interface ImportMeta {
-  readonly env: ImportMetaEnv;
-}

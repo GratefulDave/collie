@@ -8,7 +8,6 @@ import { asJsonString, parseJsonObject } from "./json";
 import { authHeader, clearNotPaired, markNotPaired, NOT_PAIRED_BODY } from "./pairing";
 import { normalizeScope, paneScopeKey, type Scope } from "./scope";
 import { observeServerBuild, SERVER_BUILD_HEADER } from "./server-build";
-import { withBasePath } from "./base-path";
 import type {
   ActionResponse,
   BridgeConfig,
@@ -174,8 +173,7 @@ async function doReq<T>(path: string, init?: RequestInit, recover?: Recover<T>):
   // GET reads get the short leash; anything mutating gets the longer mutation budget.
   const method = init?.method?.toUpperCase() ?? "GET";
   const timeoutMs = method === "GET" ? GET_TIMEOUT_MS : MUTATION_TIMEOUT_MS;
-  const url = withBasePath(path);
-  const res = await fetch(url, {
+  const res = await fetch(path, {
     ...init,
     signal: withTimeout(init?.signal, timeoutMs),
     headers: {
@@ -194,7 +192,7 @@ async function doReq<T>(path: string, init?: RequestInit, recover?: Recover<T>):
     notePairing(method, res.status, detail);
     const recovered = recover?.(res.status, detail);
     if (recovered !== null && recovered !== undefined) return recovered;
-    throw new ApiError(`${url} → ${res.status} ${detail}`, res.status);
+    throw new ApiError(`${path} → ${res.status} ${detail}`, res.status);
   }
   notePairing(method, res.status);
   if (res.status === 204) {
@@ -278,7 +276,7 @@ export async function fetchPane(
   });
   if (cached) headers.set("if-none-match", cached.etag);
 
-  const res = await fetch(withBasePath(url), { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
+  const res = await fetch(url, { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
   captureBuild(res); // pane polls carry the build header too (incl. 304s) — keep the store fresh
 
   if (res.status === 304 && cached) {
@@ -561,7 +559,7 @@ export function uploadImage(paneId: string, file: File, scope?: Scope): Promise<
     (async () => {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await fetch(withBasePath(withScope(`/api/pane/${encodeURIComponent(paneId)}/upload`, scope)), {
+      const res = await fetch(withScope(`/api/pane/${encodeURIComponent(paneId)}/upload`, scope), {
         method: "POST",
         body: fd,
         // No content-type: the browser sets the multipart boundary. The XHR marker still applies —

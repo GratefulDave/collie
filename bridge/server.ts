@@ -868,11 +868,6 @@ export function startServer(opts: {
         await updateMonitor.checkRelease();
         return json(updateMonitor.status(), req.headers.get("accept-encoding"));
       }
-      if (pathname === "/__collie_legacy_root_sw_cleanup.js") {
-        return legacyRootWorkerCleanup(process.env.COLLIE_BASE_PATH ?? "/");
-      }
-
-
 
       // ── Device pairing (bridge/pairing.ts) ───────────────────────────────
       if (pathname === "/api/pair" && req.method === "POST") {
@@ -2103,33 +2098,6 @@ export function resolveStaticPath(
   const full = normalize(join(webDir, rel));
   if (full !== webDir && !full.startsWith(webDir + sep)) return null;
   return { rel, full };
-}
-
-function legacyRootWorkerCleanup(basePath: string): Response {
-  const validBasePath =
-    basePath === "/" || /^\/[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/.test(basePath) ? basePath : "/";
-  const script = `const basePath=${JSON.stringify(validBasePath)};
-self.addEventListener("install", event => event.waitUntil(self.skipWaiting()));
-self.addEventListener("activate", event => event.waitUntil((async () => {
-  await self.clients.claim();
-  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-  await self.registration.unregister();
-  await Promise.all(clients
-    .filter(client => {
-      const path = new URL(client.url).pathname;
-      return path === basePath || path.startsWith(basePath + "/");
-    })
-    .map(client => client.navigate(client.url)));
-})()));`;
-  return secure(
-    new Response(script, {
-      headers: {
-        "content-type": "text/javascript; charset=utf-8",
-        "cache-control": "no-cache",
-        "service-worker-allowed": "/",
-      },
-    }),
-  );
 }
 
 /**

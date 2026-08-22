@@ -3,7 +3,6 @@ import { precacheAndRoute, createHandlerBoundToURL } from "workbox-precaching";
 import { NavigationRoute, registerRoute } from "workbox-routing";
 import { clientsClaim } from "workbox-core";
 
-import { withBasePath } from "./lib/base-path";
 import { decidePush, notificationPath, type NotifData, type PushPayload } from "./lib/push-decision";
 import { FONT_URLS, NAVIGATION_NETWORK_ONLY } from "./lib/sw-routes";
 
@@ -25,15 +24,12 @@ declare const self: ServiceWorkerGlobalScope & {
 precacheAndRoute(self.__WB_MANIFEST);
 // SPA fallback so deep links (/pane/:id) resolve offline too. The denylist is the set of paths this
 // SW must never answer from the precache — the API, and the `/auth/` namespace reserved for a
-// fronting proxy's sign-in page. It must be mounted with the app: NavigationRoute matches origin
-// pathnames, while Vite scopes this worker to COLLIE_BASE_PATH. See lib/sw-routes for the contract.
-const BASE_PATH_PATTERN = withBasePath("/").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const NAVIGATION_DENYLIST = NAVIGATION_NETWORK_ONLY.map(
-  (rule) => new RegExp(rule.source.replace("^\\/", `^${BASE_PATH_PATTERN}`), rule.flags),
-);
+// fronting proxy's sign-in page. Without that second entry an installed PWA, which has no address
+// bar, has no reachable path to the proxy at all: every navigation, including a reload, is answered
+// by the cached app shell. See lib/sw-routes for the contract.
 registerRoute(
-  new NavigationRoute(createHandlerBoundToURL(withBasePath("/index.html")), {
-    denylist: NAVIGATION_DENYLIST,
+  new NavigationRoute(createHandlerBoundToURL("/index.html"), {
+    denylist: [...NAVIGATION_NETWORK_ONLY],
   }),
 );
 
@@ -101,7 +97,7 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
 // ── Web Push ────────────────────────────────────────────────────────────────────────────────────
 // The branching (suppress vs show vs clear, tag/title/renotify) lives in lib/push-decision so it's
 // unit-tested; here we only parse the event, read client visibility, and run the side effect.
-const ICON = withBasePath("/web-app-manifest-192x192.png");
+const ICON = "/web-app-manifest-192x192.png";
 
 self.addEventListener("push", (event: PushEvent) => {
   event.waitUntil(handlePush(event));
@@ -165,9 +161,8 @@ self.addEventListener("notificationclick", (event: NotificationEvent) => {
   // SAFETY: `Notification.data` is `any` — but it is OUR data: the only writer is `handlePush`
   // above, in this same file, which attaches a `NotifData`. Every field is optional and defaulted.
   const data = (event.notification.data as NotifData | null) ?? {};
-  event.waitUntil(openPath(withBasePath(notificationPath(data))));
+  event.waitUntil(openPath(notificationPath(data)));
 });
-
 
 // Focus an existing Collie tab (navigating it to `path`) or open a new one. `path` is origin-relative.
 async function openPath(path: string): Promise<void> {

@@ -1,6 +1,5 @@
 import { fetchConfig, XHR_HEADER, XHR_HEADER_VALUE } from "@/lib/api";
 import type { BridgeConfig } from "@/lib/types";
-import { COLLIE_BASE_PATH, withBasePath } from "@/lib/base-path";
 
 // Client-side control of Web Push: the browser subscription plus a per-device preference. We persist
 // the user's choice so we don't re-subscribe on next load.
@@ -129,7 +128,7 @@ export async function enablePush(): Promise<EnableResult> {
   if (!pushSupported()) return { ok: false, reason: "unsupported" };
   if (!window.isSecureContext) return { ok: false, reason: "insecure" };
 
-  const reg = await navigator.serviceWorker.register(withBasePath("/sw.js"), { scope: COLLIE_BASE_PATH });
+  const reg = await navigator.serviceWorker.register("/sw.js");
   const cfg = await fetchConfig();
   if (!cfg.push || !cfg.vapidPublicKey) return { ok: false, reason: "server-off" };
   if (Notification.permission === "denied") return { ok: false, reason: "denied" };
@@ -153,7 +152,7 @@ export async function enablePush(): Promise<EnableResult> {
     });
   }
   const body = subscribeBody(sub.toJSON(), rememberedEndpoint());
-  const res = await fetch(withBasePath("/api/subscribe"), {
+  const res = await fetch("/api/subscribe", {
     method: "POST",
     headers: { "content-type": "application/json", [XHR_HEADER]: XHR_HEADER_VALUE },
     body: JSON.stringify(body),
