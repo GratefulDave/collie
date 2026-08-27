@@ -1,4 +1,4 @@
-import type { MuxAdapter, MuxSubscription } from "./mux/types.ts";
+import type { MuxAdapter, MuxAttention, MuxSubscription, MuxWatchOptions } from "./mux/types.ts";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Event-poked polling. A long-lived watch on the multiplexer whose ONLY job is to
@@ -29,11 +29,21 @@ interface EventPokerOpts {
   debounceMs?: number;
   /** Reconnect backoff schedule (ms); the last entry repeats indefinitely. */
   backoffMs?: number[];
+  /**
+   * Is somebody looking? Handed straight to `watch()` and never read here.
+   *
+   * This class owns the watch's LIFECYCLE and nothing else, so attention passes through it exactly
+   * as the pane set does: what an adapter does with the answer — a tighter census, or nothing at all
+   * because it pushes — is the adapter's own decision (mux/types.ts § MuxWatchOptions.attention).
+   * Omitted ⇒ no `attention` key reaches the adapter, and every adapter behaves as it did before.
+   */
+  attention?: () => MuxAttention;
 }
 
 export class EventPoker {
   private readonly debounceMs: number;
   private readonly backoff: number[];
+  private readonly attention: (() => MuxAttention) | undefined;
   private agentPanes: string[] = [];
   private started = false;
   private healthy = false;
@@ -52,6 +62,7 @@ export class EventPoker {
   ) {
     this.debounceMs = opts.debounceMs ?? 200;
     this.backoff = opts.backoffMs ?? [1000, 2000, 5000, 15000];
+    this.attention = opts.attention;
   }
 
   onPoke(cb: () => void): () => void {
@@ -99,7 +110,9 @@ export class EventPoker {
       if (this.stream !== handle) return;
       this.schedulePoke();
     };
-    const handle: MuxSubscription = this.mux.watch({
+    // ASSIGNED below, never conditionally spread: an omitted getter must leave the key ABSENT, so
+    // an adapter's `attention?.()` reads as "nobody said" rather than as a call on undefined.
+    const options: MuxWatchOptions = {
       panes: this.agentPanes,
       onUp: () => {
         if (this.stream !== handle) return;
@@ -117,7 +130,9 @@ export class EventPoker {
         this.setHealthy(false, watched, reason);
         if (this.started) this.scheduleReconnect();
       },
-    });
+    };
+    if (this.attention !== undefined) options.attention = this.attention;
+    const handle: MuxSubscription = this.mux.watch(options);
     this.stream = handle;
   }
 
@@ -156,5 +171,17 @@ export class EventPoker {
     if (healthy) console.log(`[events] stream up (${watched} panes watched)`);
     else console.log(`[events] stream down: ${reason ?? "unknown"} — fast polling until it recovers`);
     for (const cb of this.healthListeners) cb(healthy);
+    // Subscribe, THEN reconcile. A watch that has just come up was dark a moment ago, and whatever
+    // happened while it was dark produced no event by definition — there was nobody to produce one
+    // to. The engine has no other way to learn about it: this same ack is what relaxes it to the
+    // idle safety-net cadence, and `setCadence` re-arms from now, forfeiting the tick that was
+    // already pending. So a first poll that raced the multiplexer's own startup and came back empty
+    // stands uncorrected for a WHOLE idle interval — measured at 13.7 s on a cold zellij start, for
+    // a herd that was there the entire time.
+    //
+    // One debounced poke closes that gap. The healthy-flip guard at the top of this method is the
+    // gate that keeps it honest: a routine resubscribe over a live stream acks while already
+    // healthy and returns before it ever reaches here, so this fires on the TRANSITION only.
+    if (healthy) this.schedulePoke();
   }
 }

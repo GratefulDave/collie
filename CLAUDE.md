@@ -190,6 +190,10 @@ lint guard or the pack-wire guard.
   read-only, idle pause), a hidden page, and a failed batch — never persisted, never restored. Don't
   lift it, and don't add the reply guard's `composerReady` pre-flight to it; the reasoning for both
   sits in `web/src/components/send-mode-menu.tsx`'s header.
+- **The phone moves the operator's terminal only on the "Show in terminal" tap** (`setFocus`, one
+  row in the pane sheet). `MuxPane.focused` is a fact the snapshot reports, and the terminal never
+  moves the phone in the other direction — that may not become a side effect of navigation
+  ([ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md)).
 - **The operator's rows in `commands.toml` replace the shipped command catalog on the panes they
   address, never merge into it** ([ADR 0018](./.adr/0018-operator-command-rows-replace-the-catalog.md));
   the bridge re-reads the file behind an mtime check, so edits are live and need no restart.
@@ -197,6 +201,17 @@ lint guard or the pack-wire guard.
   Ctrl presets on the panes they address (ADR 0018 again), and only those presets: the tray's
   keyboard is fixed. Both files share one reader (`bridge/operator-file.ts`) and one scope ladder
   (`web/src/lib/operator-scope.ts`); teach both, never one.
+- **`quick-replies.toml` is the third on that contract** — the operator's groups replace the Quick
+  dock's shipped phrases on the panes they address (ADR 0018 once more), shell panes included when
+  a row is scoped to them. Same reader, same scope ladder: the three files differ in grammar and
+  never in posture, so teach all three or none.
+- **Every user-facing string goes through `t()`/`tn()` from `@/lib/i18n`**, and a component that
+  calls them subscribes via `useLocale()` so it re-renders on a locale (or lazy-dictionary) change.
+  `messages/en.ts` is the source of truth; all six dictionary files change together, enforced by
+  `tsc`. Not translated: terminal/agent output, quick replies, menu/dialog labels the screen printed,
+  key caps, pack role names, push notifications, service-worker strings, pack-link errors, and the
+  slash-command descriptions in `web/src/lib/agent-commands.ts` (another tool's vocabulary — deferred)
+  ([ADR 0030](./.adr/0030-the-ui-is-translated-by-a-typed-dictionary-not-a-library.md)).
 - **PWA** via `vite-plugin-pwa` (`web/vite.config.ts`): manifest + `sw.js`, registered manually
   from `virtual:pwa-register` in `main.tsx` (bundled = CSP-safe). Install/SW need a **secure
   context** — over plain HTTP they no-op silently (Chrome insecure-origin flag, or HTTPS, to test).
@@ -257,12 +272,18 @@ lint guard or the pack-wire guard.
 - **The Herdr socket is never dialled across a machine boundary, and no Herdr vocabulary crosses a
   pack link** — the lead consumes a peer's Collie API, never its Herdr socket
   ([ADR 0011](./.adr/0011-the-pack-protocol-is-the-mux-driver-seam.md)).
+- **How soon Collie sees an out-of-band change is DECLARED (`topologyLatency`), never measured**, and
+  `refresh()` is on the floor of the port so the phone can ask for a look now
+  ([ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md)). Every mutating route refreshes before
+  it answers; `POST /api/refresh` is a read because it mutates nothing.
 
 ## The journal (scrollback the mirror can't give you)
 
 `bridge/journal/` reads the agent's own session log off disk, per harness (`claude` / `codex` / `pi`,
-registered in `registry.ts`). It is the **only** thing in the bridge that touches the filesystem, so
-the containment rule in [`files.ts`](./bridge/journal/files.ts) is absolute: **every** path an
+registered in `registry.ts`). It is the **only** thing in the bridge that touches the filesystem —
+**unless the operator ran `collie stt setup`**, which adds one file, `stt.json` in the state dir, read
+and written by `bridge/stt/config.ts` ([ADR 0029](./.adr/0029-speech-to-text-is-a-provider-seam-collie-owns.md)).
+Nothing else moved: the containment rule in [`files.ts`](./bridge/journal/files.ts) is absolute: **every** path an
 adapter is about to read goes through `containedRealpath` — after symlink resolution, on the real
 paths, including paths derived from one already checked. The client never supplies a path. Run
 `bun scripts/journal-probe.ts` against real logs after touching an adapter; unit tests pin the
@@ -274,6 +295,27 @@ Loopback bind only · exactly one hardened front door — `tailscale serve` (nev
 conforming reverse proxy per DEPLOYMENT.md Variant C (`COLLIE_SKIP_SERVE=1`) · same-origin gate ·
 optional identity/device gates · strict CSP. A socket call can type into a real terminal — treat a
 collie as remote shell access.
+
+**The loopback gates fail closed, and the pack link is exempt by construction, never by relaxation.**
+Host validation is on by default (`COLLIE_ALLOW_ANY_HOST=1` opts out), `COLLIE_TRUSTED_USER` rejects
+an ABSENT `Tailscale-User-Login` as well as a wrong one (`COLLIE_TRUSTED_USER_OPTIONAL=1`), a
+non-loopback bind refuses to start (`COLLIE_ALLOW_NON_LOOPBACK_BIND=1`), and a non-loopback TCP peer
+is refused. **A collie in a pack is exempt from the bind refusal and `/pack/v1/*` from the peer
+check** — a member is dialled across a machine boundary and that surface carries pinned mutual TLS
+plus the pack secret ([ADR 0013](./.adr/0013-a-peer-listens-without-becoming-a-front-door.md)). The
+exemption is granted by POSITION — the peer check sits after the federated dispatch in
+`bridge/server.ts` — so no pack path is ever spelled there. The standby door is its own listener on
+its own `COLLIE_STANDBY_HOST` and neither gate reaches it; don't route it through the front door's
+`fetch` to share them.
+
+**The bridge makes no outbound call and spawns no long-running child for content — unless the
+operator ran `collie stt setup`.** Speech-to-text (`bridge/stt/`, CLI `cli/stt.ts`) is a registered
+provider seam, absent until that verb writes `stt.json`: it then holds a provider credential at 0600,
+opens an operator-configured outbound path carrying microphone audio, and on the `codex` provider
+spawns a `codex app-server` child. All three costs are declined by doing nothing, the local-engine
+configuration keeps the egress on loopback, and the wire identity is probed honest-first and recorded
+([ADR 0029](./.adr/0029-speech-to-text-is-a-provider-seam-collie-owns.md)). Setup is a CLI act, never
+a web form, for the reason pairing is.
 
 **Two device gates guard writes, independently, and compose by AND.** `COLLIE_DEVICE_HEADER` trusts
 a name a proxy injects; **pairing** (`bridge/pairing.ts`, `collie pair` / `collie devices`) requires a

@@ -154,12 +154,16 @@ export function withAgentHints(adapter: MuxAdapter, deps: AgentHintDeps): MuxAda
     },
 
     // ── Everything below is the wrapped adapter's, verbatim ────────────────────
+    // A hint is a sentence composed at snapshot time, so it is fresh whenever the snapshot is —
+    // there is nothing of this decorator's to refresh, only the wrapped adapter's census.
+    refresh: (): Promise<void> => adapter.refresh(),
     readGrid: (paneId: string, request: MuxGridRequest): Promise<MuxOutcome<MuxGrid>> =>
       adapter.readGrid(paneId, request),
     typeText: (paneId: string, txt: string): Promise<MuxAck> => adapter.typeText(paneId, txt),
     sendKeys: (paneId: string, keys: readonly string[]): Promise<MuxAck> => adapter.sendKeys(paneId, keys),
     renamePane: (paneId: string, label: string | null): Promise<MuxAck> => adapter.renamePane(paneId, label),
     closePane: (paneId: string): Promise<MuxAck> => adapter.closePane(paneId),
+    setFocus: (paneId: string): Promise<MuxAck> => adapter.setFocus(paneId),
     createTab: (request: MuxTabRequest): Promise<MuxOutcome<MuxCreatedPane>> => adapter.createTab(request),
     renameTab: (tabId: string, label: string): Promise<MuxAck> => adapter.renameTab(tabId, label),
     closeTab: (tabId: string): Promise<MuxAck> => adapter.closeTab(tabId),

@@ -136,8 +136,10 @@ export interface Config {
   /** TCP port the bridge listens on (loopback only). `tailscale serve` proxies to it. */
   port: number;
   /**
-   * Bind host. ALWAYS loopback by default — binding 0.0.0.0 would make the Tailscale identity
-   * check meaningless (see ARCHITECTURE.md §6). Override only if you know exactly why.
+   * Bind host. Loopback is REQUIRED, not merely the default — `loadConfig` refuses a non-loopback
+   * value unless {@link allowNonLoopbackBind} is set, because binding wide makes the Tailscale
+   * identity check, the device header and the same-origin gate all client-forgeable
+   * (see ARCHITECTURE.md §6).
    */
   host: string;
   /**
@@ -145,6 +147,12 @@ export interface Config {
    * it in a 0700 directory prevents other local accounts from bypassing the Tailscale proxy.
    */
   unixSocket: string;
+  /**
+   * Escape hatch for {@link host}: permit a bind that is not loopback (`COLLIE_ALLOW_NON_LOOPBACK_BIND=1`).
+   * Without it the bridge refuses to start on a wide bind rather than warning and carrying on.
+   * Setting it also disables the peer-address check in server.ts.
+   */
+  allowNonLoopbackBind: boolean;
   /** Poll cadence for the state engine, ms. Also the fast fallback cadence when the event stream is down. */
   pollMs: number;
   /**
@@ -189,11 +197,23 @@ export interface Config {
    */
   keysFile: string;
   /**
-   * Tailscale identity gate. If set, every request must carry a matching
-   * `Tailscale-User-Login` header injected by `tailscale serve`; missing and mismatching
-   * identities are rejected. Empty disables this gate.
+   * Where the operator's Quick-dock groups live — `quick-replies.toml`, the third sibling in the
+   * same dir, read the same way (bridge/operator-quick-replies.ts) and likewise never read here.
+   */
+  quickRepliesFile: string;
+  /**
+   * Tailscale identity gate. If set under `tailscale serve`, the request must carry a matching
+   * `Tailscale-User-Login` header. A mismatch is rejected. A missing header is also rejected —
+   * serve injects none for tagged nodes, so tolerating it let any tagged node write. Under
+   * {@link skipServe} or {@link trustedUserOptional}, only a mismatch is rejected. Empty = the
+   * gate is off.
    */
   trustedUser: string;
+  /**
+   * Escape hatch for {@link trustedUser}: accept a request with no `Tailscale-User-Login`
+   * (`COLLIE_TRUSTED_USER_OPTIONAL=1`). Re-opens the tagged-node gap. For host-local development.
+   */
+  trustedUserOptional: boolean;
   /**
    * How much of each value's content the audit trail keeps — see {@link AuditContent} in audit.ts
    * for what `none` does and does not redact.
@@ -216,14 +236,25 @@ export interface Config {
   /** Extra allowed request origins beyond localhost (e.g. your MagicDNS https origin). */
   allowedOrigins: string[];
   /**
-   * Host-header allowlist (`host` or `host:port` values). When non-empty, the operator has opted
-   * in to strict Host validation: any request whose `Host` header isn't a loopback form, one of
-   * these, or a host parsed from {@link allowedOrigins} is rejected before the Origin check. This
-   * closes the DNS-rebinding hole (Host==Origin==evil.com would otherwise pass), which matters most
-   * under `COLLIE_SERVE_MODE=http` (no TLS). Empty = validation off (legacy behaviour) — set this
-   * to your MagicDNS name (`collie.<tailnet>.ts.net`), especially in http serve mode.
+   * Additional allowed Host headers (`host` or `host:port` values) beyond loopback and the
+   * discovered {@link tailscaleHosts}. Host validation is fail-closed by default: any request whose
+   * `Host` header isn't a loopback form, one of these, a discovered Tailscale host, or a host
+   * parsed from {@link allowedOrigins} is rejected before the Origin check. Required under
+   * `COLLIE_SKIP_SERVE=1` (where Collie discovers no Tailscale hosts) to name your public domain.
    */
   publicHosts: string[];
+  /**
+   * Hosts this bridge is actually published on, discovered by `collie-ctl.sh` from
+   * `tailscale status --json` and injected as COLLIE_TAILSCALE_HOSTS. Operators don't set this.
+   * Matched with or without a port. Empty under COLLIE_SKIP_SERVE=1.
+   */
+  tailscaleHosts: string[];
+  /**
+   * Escape hatch that turns Host validation OFF entirely (COLLIE_ALLOW_ANY_HOST=1). That is the
+   * DNS-rebinding hole — a hostile page rebinds to 127.0.0.1 and sends Host==Origin==evil.example.
+   * Warned about at startup.
+   */
+  allowAnyHost: boolean;
   /** Web Push (VAPID). All three required to enable push; otherwise push is disabled. */
   vapidPublic: string;
   vapidPrivate: string;
@@ -240,9 +271,10 @@ export interface Config {
   multiSession: boolean;
   /**
    * Whether `tailscale serve` is bypassed (COLLIE_SKIP_SERVE=1) because an operator-run reverse
-   * proxy (Caddy/Nginx) fronts the loopback bridge instead. If {@link trustedUser} is set, the
-   * proxy must inject a matching `Tailscale-User-Login` or every API request is denied; leave it
-   * empty and use {@link deviceHeader} for per-device write auth (DEPLOYMENT.md → Variant C).
+   * proxy (Caddy/Nginx) fronts the loopback bridge instead. The bridge itself handles every request
+   * identically either way — this flag only informs the startup warnings: without `tailscale serve`
+   * in front, the `Tailscale-User-Login` header is never injected, so {@link trustedUser} is inert
+   * and per-device auth ({@link deviceHeader}) becomes the way to gate writes (DEPLOYMENT.md → Variant C).
    */
   skipServe: boolean;
 }
@@ -263,6 +295,51 @@ export const DEFAULT_PORT = 8787;
  */
 export function resolveBridgeHost(env: Record<string, string | undefined> = process.env): string {
   return env.COLLIE_HOST ?? "127.0.0.1";
+}
+
+/**
+ * Whether a bind host keeps the listener on loopback. Loopback is the trust basis for every write
+ * gate in the bridge. Accepts every spelling of loopback, not just `127.0.0.1`/`localhost`: the
+ * whole 127.0.0.0/8 block, and IPv6 `::1` in bare, bracketed and expanded form.
+ *
+ * Pure + exported so the table of accepted/rejected spellings is unit-tested.
+ */
+export function isLoopbackBindHost(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (h === "localhost") return true;
+  if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
+/**
+ * Why this bind must be refused, or `null` when it may stand. One sentence the operator can act on;
+ * the caller decides what to do with it.
+ *
+ * **The decision is not config's to take alone, which is why this is a predicate and not a throw.**
+ * Loopback is the trust basis for every browser-side write gate — the `Tailscale-User-Login` header,
+ * `COLLIE_DEVICE_HEADER` and the same-origin check are all client-settable, so on a wide bind they
+ * mean nothing. That is why a solo instance and a lead refuse to start. But a pack **peer** binds off
+ * loopback BY CONSTRUCTION: its lead dials it across a machine boundary, and the surface it exposes
+ * there is gated by pinned mutual TLS plus the pack secret rather than by any of those headers
+ * (PACK_PROTOCOL.md §3, [ADR 0013](../.adr/0013-a-peer-listens-without-becoming-a-front-door.md)).
+ * The mode that decides is not known until the trust store has been read, which happens after this
+ * function runs — so `bridge/index.ts` calls it once the mode is in hand.
+ *
+ * Pure and exported so both the refusal and its exemption are unit-tested without a listener.
+ */
+export function nonLoopbackBindRefusal(
+  cfg: Pick<Config, "host" | "allowNonLoopbackBind">,
+): string | null {
+  if (cfg.allowNonLoopbackBind || isLoopbackBindHost(cfg.host)) return null;
+  const shown = cfg.host.trim() === "" ? "(empty — every interface)" : cfg.host;
+  return (
+    `COLLIE_HOST=${shown} is not a loopback address. Collie binds loopback only: the ` +
+    `Tailscale-User-Login header, COLLIE_DEVICE_HEADER and the same-origin gate are all ` +
+    `client-settable and mean nothing on a wide bind, so binding here would hand write access ` +
+    `to anything that can reach the port. Use 127.0.0.1 (the default) and put your ingress in ` +
+    `front of it. If you truly mean to bind wide and have another control in front, set ` +
+    `COLLIE_ALLOW_NON_LOOPBACK_BIND=1.`
+  );
 }
 
 /**
@@ -322,6 +399,9 @@ export function loadConfig(): Config {
 
   const submitKeys = envList("COLLIE_SUBMIT_KEYS");
 
+  const host = resolveBridgeHost();
+  const allowNonLoopbackBind = envBool("COLLIE_ALLOW_NON_LOOPBACK_BIND", false);
+
   // The operator's config dir — where their `.env` lives, and now their `commands.toml` beside it.
   // Resolved exactly the way scripts/collie-ctl.sh resolves it MINUS the `herdr` shell-out: the
   // launcher passes HERDR_PLUGIN_CONFIG_DIR into the unit (and the launchd plist) precisely so this
@@ -342,8 +422,9 @@ export function loadConfig(): Config {
     socketPath,
     dialMode: envEnum("COLLIE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto"),
     port: envInt("COLLIE_PORT", DEFAULT_PORT, { min: 1, max: 65535 }),
-    host: resolveBridgeHost(),
+    host,
     unixSocket: (process.env.COLLIE_UNIX_SOCKET ?? "").trim(),
+    allowNonLoopbackBind,
     pollMs: envInt("COLLIE_POLL_MS", 1500, { min: 250 }),
     pollIdleMs: envInt("COLLIE_POLL_IDLE_MS", 12_000, { min: 1000 }),
     notifyDelayMs: envInt("COLLIE_NOTIFY_DELAY_MS", 30_000, { min: 0 }),
@@ -371,16 +452,24 @@ export function loadConfig(): Config {
         "COLLIE_OPENCODE_ROOT",
         join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode"),
       ),
+      grok: envRoots(
+        "COLLIE_GROK_ROOT",
+        join(process.env.GROK_HOME ?? join(homedir(), ".grok"), "sessions"),
+      ),
     },
     submitKeys: submitKeys.length ? submitKeys : ["Enter"],
     commandsFile: join(configDir, "commands.toml"),
     keysFile: join(configDir, "keys.toml"),
+    quickRepliesFile: join(configDir, "quick-replies.toml"),
     trustedUser: process.env.COLLIE_TRUSTED_USER ?? "",
+    trustedUserOptional: envBool("COLLIE_TRUSTED_USER_OPTIONAL", false),
     auditContent: envEnum("COLLIE_AUDIT_CONTENT", ["preview", "none"] as const, "preview"),
     deviceHeader: (process.env.COLLIE_DEVICE_HEADER ?? "").trim(),
     deviceAllowlist: envList("COLLIE_DEVICE_ALLOWLIST"),
     allowedOrigins: envList("COLLIE_ALLOWED_ORIGINS"),
     publicHosts: envList("COLLIE_PUBLIC_HOSTS"),
+    tailscaleHosts: envList("COLLIE_TAILSCALE_HOSTS"),
+    allowAnyHost: envBool("COLLIE_ALLOW_ANY_HOST", false),
     vapidPublic: process.env.COLLIE_VAPID_PUBLIC ?? "",
     vapidPrivate: process.env.COLLIE_VAPID_PRIVATE ?? "",
     vapidSubject: process.env.COLLIE_VAPID_SUBJECT ?? "mailto:admin@example.com",

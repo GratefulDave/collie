@@ -84,6 +84,7 @@ const HERDR_CAPABILITIES = declareCapabilities({
     "sendKeys",
     "renamePane",
     "closePane",
+    "setFocus",
     "createTab",
     "renameTab",
     "closeTab",
@@ -92,10 +93,15 @@ const HERDR_CAPABILITIES = declareCapabilities({
     "pushPaneEvents",
   ],
   unsupportedKeys: HERDR_UNSENDABLE_KEYS,
+  // Herdr announces every structure change on `events.subscribe`, so there is no census and no
+  // number to state (HERDR_API.md § Event stream). `refresh()` is correspondingly a no-op below.
+  topologyLatency: { kind: "push" },
   notes: {
     gridScrollback:
       "Herdr reports a pane's scrollback depth, so how far back a read can reach is known rather than guessed (MuxPane.readableLines) — its own `truncated` flag is always false and must not be gated on.",
   },
+  // Herdr's workspaces are Collie's spaces, and there are as many as the operator created.
+  spaces: "many",
 });
 
 /** `MuxTarget.options` key carrying which local dialer to use. Opaque to the registry, by rule. */
@@ -167,6 +173,19 @@ export class HerdrMux implements MuxAdapter {
       spaces: wire.workspaces.map(toMuxSpace),
       tabs: wire.tabs.map(toMuxTab),
     };
+  }
+
+  /**
+   * A no-op that resolves, and it is the honest implementation rather than a stub.
+   *
+   * {@link snapshot} is one fresh RPC every time — Herdr caches nothing on this side — so "the very
+   * next snapshot reflects the current topology" is already true before this is called. And the
+   * watch is a real event stream, not a census, so there is no interval to pull back to a floor.
+   * Spending a round trip here would buy nothing and would put load on the socket that types into
+   * the operator's terminals.
+   */
+  refresh(): Promise<void> {
+    return Promise.resolve();
   }
 
   private async fetchWire(): Promise<{
@@ -253,6 +272,11 @@ export class HerdrMux implements MuxAdapter {
 
   async closePane(paneId: string): Promise<MuxAck> {
     return this.attempt(() => this.client.closePane(paneId));
+  }
+
+  /** Show this pane on the operator's own screen. One RPC moves pane, tab and workspace (client.ts). */
+  async setFocus(paneId: string): Promise<MuxAck> {
+    return this.attempt(() => this.client.focusPane(paneId));
   }
 
   /**
@@ -444,5 +468,8 @@ export const herdrMuxFactory: MuxAdapterFactory = {
     return new HerdrMux(
       new HerdrClient(target.endpoint, target.timeoutMs || DEFAULT_TIMEOUT_MS, dialModeOf(target.options)),
     );
+  },
+  describeTarget(endpoint: string) {
+    return `socket ${endpoint}`;
   },
 };

@@ -32,11 +32,20 @@
 // ── ONE TITLE SLOT, AND WHO GETS IT ──────────────────────────────────────────────────────────────
 //
 // tmux has exactly one per-pane label — `pane_title` — where the contract has two (`paneLabel`, the
-// operator's, and `terminalTitle`, the program's). Collie spends it on the OPERATOR: `renamePane`
-// writes it and it comes back as `paneLabel`. `terminalTitle` is therefore never reported on tmux;
-// reporting the same string twice under two names would tell the UI that a program said something it
-// did not. tmux's own default for the slot is the host name, which is why {@link operatorLabel}
-// drops a title equal to it — an untouched pane has no label, and saying "bluefin" would be noise.
+// operator's, and `terminalTitle`, the program's). ANY program in the pane can write it with an OSC
+// title, and tmux KEEPS what it wrote after it exits: live-observed, a bare `bash` still advertising
+// a finished agent's task. Read as `paneLabel`, that is Collie telling the operator they named a pane
+// they never touched — with a dead agent's sentence as the name.
+//
+// So the slot is split by MEMORY, which is the contract's rule for every one-slot multiplexer
+// (MUX_CONTRACT.md § Contract-owned rules, *Pane naming*): {@link TmuxMux.ownLabels} holds the labels
+// THIS adapter set through `renamePane`, and a title equal to the pane's remembered label comes back
+// as `paneLabel`. Everything else in the slot is the program's and comes back as `terminalTitle`.
+// The memory is in-process, so a bridge restart degrades an operator's label to `terminalTitle` —
+// visible, less prominent, and never a claim about who wrote it.
+//
+// tmux's own default for the slot is the host name, which is why {@link programTitle} drops a title
+// equal to it: an untouched pane says nothing, and reporting "bluefin" would be noise.
 
 import { declareCapabilities } from "../capabilities.ts";
 import { TMUX_LOGO_SVG } from "./logo.ts";
@@ -63,7 +72,14 @@ import {
   type MuxTabRequest,
   type MuxWatchOptions,
 } from "../types.ts";
-import { resolveTmuxBinary, SpawnTmuxExec, tmuxServerArgs, type TmuxExec, type TmuxRunResult } from "./exec.ts";
+import {
+  resolveTmuxBinary,
+  SpawnTmuxExec,
+  tmuxServerArgs,
+  tmuxServerLabel,
+  type TmuxExec,
+  type TmuxRunResult,
+} from "./exec.ts";
 import { toTmuxKey, TMUX_UNSENDABLE_KEYS } from "./keys.ts";
 import { tmuxBeaconMatcher } from "./markers.ts";
 import {
@@ -73,6 +89,7 @@ import {
   parseListing,
   saysMissing,
   saysNoServer,
+  type TmuxClient,
   type TmuxListing,
   type TmuxPaneRecord,
   type TmuxSession,
@@ -91,6 +108,33 @@ export const DEFAULT_TMUX_TIMEOUT_MS = 5000;
 
 /** The named paste buffer literal text travels through. Collie's own, deleted after every paste. */
 const TYPE_BUFFER = "collie-type";
+
+/**
+ * The global `window-size` value that kills a pre-3.7 tmux SERVER the moment it spawns a window.
+ *
+ * Not a Collie bug and not a guess: tmux ≤ 3.6b dereferences the not-yet-existing window's
+ * `manual_sx` in `spawn_window → default_window_size → clients_calculate_size`, and the whole server
+ * — every session the operator has — segfaults. Reproduced on scratch servers and confirmed by the
+ * coredump; upstream is tmux issue #4849, fixed by commit 7d41761e, first shipped in 3.7. Both create
+ * verbs trigger it (`new-window` AND `new-session`), and nothing else about the call matters —
+ * clients, control mode, `default-size` and `-x/-y` are all irrelevant. `latest`, `largest` and
+ * `smallest` are safe.
+ */
+const FATAL_WINDOW_SIZE = "manual";
+
+/**
+ * Read the effective `window-size`, and the version, in ONE invocation before a create spawns.
+ *
+ * `;`-joined exactly as {@link LISTING_ARGS} is, so the guard costs one round trip and never two. The
+ * version half is appended only until it is known — a running server cannot change its own binary.
+ */
+const WINDOW_SIZE_ARGS: readonly string[] = ["show-options", "-gv", "window-size"];
+/**
+ * The version half, on its own, because `collie doctor` asks the same question of the same server
+ * (`cli/doctor.ts` § the `mux` finding). Exported rather than spelled twice: a diagnostic that
+ * derived the version differently from the adapter could report a server the adapter never saw.
+ */
+export const TMUX_VERSION_ARGS: readonly string[] = ["display-message", "-p", "-F", "#{version}"];
 
 /**
  * How many request shapes one pane's revision tracker remembers.
@@ -126,6 +170,7 @@ const TMUX_CAPABILITIES = declareCapabilities({
     "sendKeys",
     "renamePane",
     "closePane",
+    "setFocus",
     "createTab",
     "renameTab",
     "closeTab",
@@ -134,6 +179,11 @@ const TMUX_CAPABILITIES = declareCapabilities({
     "pushPaneEvents",
   ],
   unsupportedKeys: TMUX_UNSENDABLE_KEYS,
+  // `push`, and the 5-second resync behind it is a BACKSTOP rather than the bound: control mode
+  // announces windows and sessions appearing, closing and being renamed (watch.ts § the two ways).
+  // The census exists for the sessions no control client is attached to and for a tmux too old to
+  // have control mode at all — stating 5 s here would describe the fallback rather than the promise.
+  topologyLatency: { kind: "push" },
   notes: {
     agentDetection:
       "tmux does not know what an agent is. It can say which command is in the foreground, and that is not the same question — so every pane reads as a shell rather than as a guess that would pick the wrong grammar.",
@@ -149,6 +199,8 @@ const TMUX_CAPABILITIES = declareCapabilities({
     pushPaneEvents:
       "Control mode pushes `%output` for the panes of each attached session, up to eight sessions; beyond that the same 5-second listing is the floor.",
   },
+  // One tmux server holds as many sessions as the operator makes, and each one is a Collie space.
+  spaces: "many",
 });
 
 /** One pane's derived revision, and the reads it was derived from. */
@@ -176,6 +228,28 @@ export class TmuxMux implements MuxAdapter {
    */
   private readonly revisions = new Map<string, PaneRevision>();
 
+  /**
+   * The tmux version this server runs, once it has said so. `null` until the first create asks.
+   *
+   * Cached because a running server cannot swap its own binary: the answer is fixed for the life of
+   * the socket, and a restarted server is a new process this adapter re-probes at its next create. An
+   * unreadable answer is NOT cached — it stays `null` and is asked again, which also keeps the guard
+   * conservative (see {@link spawnSurvivesManualWindowSize}).
+   */
+  private tmuxVersion: string | null = null;
+
+  /**
+   * The label this adapter set on each pane, keyed by pane id — the split of tmux's ONE title slot
+   * (see the header, and MUX_CONTRACT.md § Contract-owned rules, *Pane naming*).
+   *
+   * Written only by {@link renamePane}, on a call tmux accepted. Cleared by a `renamePane(null)` and
+   * by {@link forgetGonePanes} when the pane leaves the listing, so a recycled memory can never
+   * outlive the pane it described. It holds at most one short string per live pane.
+   */
+  private readonly ownLabels = new Map<string, string>();
+  /** The watches this adapter has handed out and that are still live — {@link refresh}'s subjects. */
+  private readonly watches = new Set<TmuxWatch>();
+
   constructor(private readonly exec: TmuxExec) {}
 
   /** Is a tmux server answering on the configured socket? One cheap listing. */
@@ -195,11 +269,34 @@ export class TmuxMux implements MuxAdapter {
    * Herdr's does, and what the connected/disconnected banner already reads.
    */
   async snapshot(): Promise<MuxSnapshot> {
+    return toSnapshot(await this.listing(), this.ownLabels);
+  }
+
+  /**
+   * The one listing call, parsed — the raw tmux world behind {@link snapshot}.
+   *
+   * Split out because {@link setFocus} needs the fourth section (the clients), and the port's
+   * snapshot has no word for a client. Same spawn, same parse, one caller each.
+   */
+  private async listing(): Promise<TmuxListing> {
     const result = await this.exec.run([...LISTING_ARGS]);
     if (result.code !== 0 && result.stdout.length === 0) {
       throw new Error(`tmux list: ${result.stderr.trim() || `exited ${String(result.code)}`}`);
     }
-    return toSnapshot(parseListing(result.stdout));
+    const listing = parseListing(result.stdout);
+    this.forgetGonePanes(listing);
+    return listing;
+  }
+
+  /** Drop the remembered label of every pane tmux no longer lists. The map's only shrink path. */
+  private forgetGonePanes(listing: TmuxListing): void {
+    if (this.ownLabels.size === 0) return;
+    const live = new Set(listing.panes.map((pane) => pane.id));
+    // Deleting through a Map's own key iterator is defined behaviour — an entry removed before it is
+    // reached is simply not visited — so no copy of the keys is taken.
+    for (const paneId of this.ownLabels.keys()) {
+      if (!live.has(paneId)) this.ownLabels.delete(paneId);
+    }
   }
 
   /**
@@ -289,14 +386,60 @@ export class TmuxMux implements MuxAdapter {
     return result.ok ? muxAck() : result;
   }
 
-  /** Set or clear the operator's label. tmux's one title slot — see the header. `null` clears it. */
+  /**
+   * Set or clear the operator's label. tmux's one title slot — see the header. `null` clears it.
+   *
+   * The label is REMEMBERED here and nowhere else, and only after tmux accepted the call: that memory
+   * is the whole of what tells an operator's label from a program's title on the next listing. It is
+   * stored trimmed, because that is how the listing will report it back.
+   */
   async renamePane(paneId: string, label: string | null): Promise<MuxAck> {
     const result = await this.attemptRun(["select-pane", "-t", paneId, "-T", label ?? ""]);
-    return result.ok ? muxAck() : result;
+    if (!result.ok) return result;
+    const kept = label === null ? "" : label.trim();
+    if (kept.length === 0) this.ownLabels.delete(paneId);
+    else this.ownLabels.set(paneId, kept);
+    return muxAck();
   }
 
   async closePane(paneId: string): Promise<MuxAck> {
     const result = await this.attemptRun(["kill-pane", "-t", paneId]);
+    return result.ok ? muxAck() : result;
+  }
+
+  /**
+   * Show this pane on the operator's own screen — the window first, then the pane inside it.
+   *
+   * Both halves are needed and they are ONE invocation: `select-pane` alone leaves the operator
+   * looking at another window, and two spawns would leave the screen half-moved if the second failed.
+   * `%N` and `@N` are server-wide, so neither target needs its session named. Probed 2026-08-25
+   * against the test server: `select-window -t @4 ; select-pane -t %9` moved `window_active` and
+   * `pane_active` together; a stale id answers `can't find window: @999` / `can't find pane: %999`,
+   * which {@link refusalFor} reads as the contract's `gone`.
+   *
+   * The window id is not passed in — the caller has a PANE id and nothing else — so it is read out of
+   * the same listing the snapshot uses. A pane the listing no longer carries is `gone` before
+   * anything is spawned, which is the answer the contract wants anyway.
+   *
+   * AND THE SESSION, WHICH IS THE HALF THAT WAS MISSING. tmux's current window is a property of the
+   * SESSION, so those two commands move the target session's own screen and NOTHING ELSE: a terminal
+   * attached to a different session keeps showing that session, and the operator who tapped "Show in
+   * terminal" sees nothing move (live evidence 2026-08-25 — a `{ok:true}` for a pane of `collie-tmux`
+   * while the attached client sat on `ss-wp`). So every NON-control client on another session is
+   * carried over with `switch-client -c <tty> -t <session>`, in the SAME invocation — the clients are
+   * already in the listing taken above, and a client is addressed by its tty and by nothing else.
+   * With no client attached nothing is switched, and that is the right answer rather than a gap: the
+   * window/pane selection stands and the next attach lands on it.
+   */
+  async setFocus(paneId: string): Promise<MuxAck> {
+    const listing = await this.listing();
+    const pane = listing.panes.find((candidate) => candidate.id === paneId);
+    if (pane === undefined) return muxGone(`can't find pane: ${paneId}`);
+    const args = ["select-window", "-t", pane.windowId, ";", "select-pane", "-t", paneId];
+    for (const client of clientsToSwitch(listing, pane.sessionId)) {
+      args.push(";", "switch-client", "-c", client.tty, "-t", pane.sessionId);
+    }
+    const result = await this.attemptRun(args);
     return result.ok ? muxAck() : result;
   }
 
@@ -342,12 +485,52 @@ export class TmuxMux implements MuxAdapter {
   /** The contract's watch over control mode plus a bounded listing. All of it lives in watch.ts. */
   watch(options: MuxWatchOptions): MuxSubscription {
     const subscription = new TmuxWatch(this.exec, options);
+    this.watches.add(subscription);
     subscription.start();
-    return subscription;
+    // The handle the caller holds is a WRAPPER, so closing it also drops this adapter's own reference
+    // — `close()` on the watch alone would leave a dead object in the set forever. It stays
+    // idempotent, which is what the contract asks of a subscription.
+    return {
+      close: () => {
+        this.watches.delete(subscription);
+        subscription.close();
+      },
+    };
   }
 
-  /** Run a create verb and read the identity it printed. */
+  /**
+   * Look now: every live watch resyncs its listing and re-arms its backstop from zero.
+   *
+   * With no watch running this resolves having done nothing, and that is correct rather than lazy —
+   * {@link snapshot} is a fresh invocation every time, so the contract's "the next snapshot reflects
+   * the current topology" needs no help. What refresh buys on tmux is the CENSUS being pulled
+   * forward, and a census only exists inside a watch.
+   *
+   * Watches that ended on their own are pruned here rather than tracked with a callback: the poker
+   * drops a dead stream without closing it (event-poker.ts § onDown), so a set that only shrank on
+   * `close()` would grow one entry per reconnect for the life of the process.
+   */
+  async refresh(): Promise<void> {
+    for (const watch of this.watches) {
+      if (watch.ended) this.watches.delete(watch);
+    }
+    await Promise.all([...this.watches].map((watch) => watch.refresh()));
+  }
+
+  /**
+   * Run a create verb and read the identity it printed — after the one thing that must be asked
+   * first.
+   *
+   * Both create verbs funnel through here, so the #4849 guard sits here once rather than twice. It
+   * REFUSES; it never repairs. Collie could make the spawn safe by setting `window-size` itself, and
+   * that option is the operator's own configuration — a phone tap must not rewrite the setting that
+   * governs every window on their desktop, and a Collie that silently "fixed" it would leave a server
+   * behaving differently from the `.tmux.conf` that describes it. So the operator is told the exact
+   * command instead, and stays the one who runs it.
+   */
   private async created(args: readonly string[]): Promise<MuxOutcome<MuxCreatedPane>> {
+    const guard = await this.refuseFatalSpawn();
+    if (guard !== null) return guard;
     const result = await this.attemptRun(args);
     if (!result.ok) return result;
     const created = parseCreated(result.value.stdout);
@@ -359,6 +542,33 @@ export class TmuxMux implements MuxAdapter {
       tabId: created.windowId,
       cwd: created.cwd,
     });
+  }
+
+  /**
+   * The refusal that stops a create from segfaulting the operator's whole tmux server, or `null`.
+   *
+   * Two facts decide it, both read in one invocation: the EFFECTIVE global `window-size` (which the
+   * operator can change at any moment, so it is asked every time) and the version (asked once —
+   * {@link tmuxVersion}). Only `manual` on a tmux that predates the fix refuses; every other
+   * combination spawns exactly as before, with no extra branch in the argv.
+   *
+   * A probe that does not come back is NOT a refusal. tmux gained `window-size` in 2.9, so a binary
+   * that answers `unknown option` has no hazard to guard against, and a probe that failed because the
+   * server is gone is answered honestly by the create's own outcome one line later. The guard only
+   * ever fires on a positive reading.
+   */
+  private async refuseFatalSpawn(): Promise<MuxRefusalOutcome | null> {
+    const args =
+      this.tmuxVersion === null ? [...WINDOW_SIZE_ARGS, ";", ...TMUX_VERSION_ARGS] : [...WINDOW_SIZE_ARGS];
+    const probe = await this.attemptRun(args);
+    if (!probe.ok) return null;
+    const lines = probe.value.stdout.split("\n");
+    const windowSize = (lines.at(0) ?? "").trim();
+    const version = this.tmuxVersion ?? readVersion(lines.at(1));
+    if (version !== null) this.tmuxVersion = version;
+    if (windowSize !== FATAL_WINDOW_SIZE) return null;
+    if (spawnSurvivesManualWindowSize(version)) return null;
+    return muxRefused(fatalWindowSizeDetail(version));
   }
 
   /** One tmux command, as the contract's outcome-or-refusal. A throw is `unreachable`, never a crash. */
@@ -408,6 +618,37 @@ function refusalFor(result: TmuxRunResult): MuxRefusalOutcome {
   return muxRefused(detail);
 }
 
+/** What `display-message -p -F '#{version}'` said, trimmed, or `null` when it said nothing usable. */
+function readVersion(reported: string | undefined): string | null {
+  const version = (reported ?? "").trim();
+  return version.length > 0 ? version : null;
+}
+
+/**
+ * Whether this tmux carries the #4849 fix — i.e. whether it survives spawning under `window-size
+ * manual`.
+ *
+ * `3.7` and later, and an unreadable version reads as UNSAFE. That asymmetry is deliberate: guessing
+ * "probably fine" costs the operator every session on the server, and guessing "probably not" costs
+ * them one refusal carrying the command that clears it. tmux spells its version `3.6b` / `3.7` /
+ * `next-3.7`, so the first `<major>.<minor>` in the string is the answer and the letter suffix — a
+ * patch level, never a feature — is ignored.
+ */
+function spawnSurvivesManualWindowSize(version: string | null): boolean {
+  if (version === null) return false;
+  const match = /(\d+)\.(\d+)/u.exec(version);
+  if (match === null) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && minor >= 7);
+}
+
+/** What the operator is told, and it ends in the exact command that clears the refusal. */
+function fatalWindowSizeDetail(version: string | null): string {
+  const named = version === null ? "this tmux" : `tmux ${version}`;
+  return `${named} crashes when it spawns a window while window-size is manual (tmux #4849, fixed in 3.7) — run: tmux set -g window-size latest`;
+}
+
 /** A cheap, stable content fingerprint. FNV-1a — this is a change detector, never a security check. */
 function contentDigest(text: string): string {
   let hash = 0x811c9dc5;
@@ -419,17 +660,25 @@ function contentDigest(text: string): string {
 }
 
 /** One listing, in the port's words. */
-function toSnapshot(listing: TmuxListing): MuxSnapshot {
+function toSnapshot(listing: TmuxListing, ownLabels: ReadonlyMap<string, string>): MuxSnapshot {
   const sessionById = new Map(listing.sessions.map((session) => [session.id, session]));
   const windowById = new Map(listing.windows.map((window) => [window.id, window]));
   const numberById = new Map(listing.sessions.map((session, index) => [session.id, index + 1]));
-  // tmux orders sessions by name and gives them no index of their own, so "focused" cannot be read
-  // off an attached client — this watch's own control clients are attached clients, and counting
-  // them would report every session as focused. Last activity is the one ordering tmux does keep.
-  const liveliest = listing.sessions.reduce<TmuxSession | null>(
-    (best, session) => (best === null || session.activity > best.activity ? session : best),
-    null,
-  );
+  // WHICH SESSION IS THE OPERATOR LOOKING AT. The listing's fourth section answers it directly: the
+  // session a NON-control client is attached to is a session somebody's terminal is showing, and
+  // `client_control_mode` is what keeps this adapter's own watch out of the answer (protocol.ts §
+  // TmuxClient). With two real terminals the most recently active one wins.
+  //
+  // The fallback is the old rule and it stays, because "no client attached" is ordinary — a server
+  // full of detached sessions still has to render somewhere sensible, and last activity is the one
+  // ordering tmux keeps over sessions.
+  const watched = watchedSession(listing);
+  const liveliest =
+    watched ??
+    listing.sessions.reduce<TmuxSession | null>(
+      (best, session) => (best === null || session.activity > best.activity ? session : best),
+      null,
+    );
   const activeTabBySession = new Map<string, string>();
   for (const window of listing.windows) {
     if (window.active || !activeTabBySession.has(window.sessionId)) activeTabBySession.set(window.sessionId, window.id);
@@ -461,8 +710,52 @@ function toSnapshot(listing: TmuxListing): MuxSnapshot {
   // are in the snapshot, and a half-listed pane would fail the whole herd's consistency check.
   const panes: MuxPane[] = listing.panes
     .filter((pane) => sessionById.has(pane.sessionId) && windowById.has(pane.windowId))
-    .map((pane) => toMuxPane(pane, sessionById, windowById, numberById));
+    .map((pane) => toMuxPane(pane, sessionById, windowById, numberById, ownLabels));
   return { panes, spaces, tabs };
+}
+
+/**
+ * The session a real terminal is attached to, or null when only Collie's own watch is.
+ *
+ * `client_session` prints a session NAME rather than a `$N` id (probed 2026-08-25), so the match is
+ * against either — a name today, an id if tmux ever changes its mind, and no re-derivation either
+ * way. A client naming a session this listing does not carry is ignored rather than guessed at.
+ */
+function watchedSession(listing: TmuxListing): TmuxSession | null {
+  const attached = listing.clients.filter((client) => !client.control);
+  let best: { session: TmuxSession; activity: number } | null = null;
+  for (const client of attached) {
+    const session = sessionOfClient(listing, client);
+    if (session === undefined) continue;
+    if (best === null || client.activity > best.activity) best = { session, activity: client.activity };
+  }
+  return best?.session ?? null;
+}
+
+/**
+ * The session one client is showing, or undefined when it names a session this listing does not have.
+ *
+ * `client_session` prints a session NAME rather than a `$N` id (probed 2026-08-25), so the match is
+ * against either — a name today, an id if tmux ever changes its mind, and no re-derivation either way.
+ */
+function sessionOfClient(listing: TmuxListing, client: TmuxClient): TmuxSession | undefined {
+  return listing.sessions.find((candidate) => candidate.id === client.sessionId || candidate.name === client.sessionId);
+}
+
+/**
+ * The real terminals that must be CARRIED to `sessionId`, because they are looking somewhere else.
+ *
+ * A control client is excluded for the same reason it is excluded from `watchedSession` — it is
+ * nobody's screen, and switching it would only move this adapter's own watch. A client already on the
+ * session is excluded because switching it would be a spawn that changes nothing. A client with no
+ * tty cannot be addressed at all (`switch-client -c` takes a tty and nothing else), so it is left
+ * alone rather than guessed at.
+ */
+function clientsToSwitch(listing: TmuxListing, sessionId: string): TmuxClient[] {
+  return listing.clients.filter((client) => {
+    if (client.control || client.tty.length === 0) return false;
+    return sessionOfClient(listing, client)?.id !== sessionId;
+  });
 }
 
 type MutableMuxPane = { -readonly [K in keyof MuxPane]: MuxPane[K] };
@@ -473,6 +766,7 @@ function toMuxPane(
   sessionById: ReadonlyMap<string, TmuxSession>,
   windowById: ReadonlyMap<string, TmuxWindow>,
   numberById: ReadonlyMap<string, number>,
+  ownLabels: ReadonlyMap<string, string>,
 ): MuxPane {
   const session = sessionById.get(raw.sessionId);
   const window = windowById.get(raw.windowId);
@@ -483,8 +777,11 @@ function toMuxPane(
     spaceNumber: numberById.get(raw.sessionId) ?? 0,
     tabId: raw.windowId,
     cwd: raw.cwd,
-    // tmux's focus is per-client and Collie never sets it; the pane tmux would type into is the
-    // active pane of the active window.
+    // The pane a terminal attached to this session is showing: the active pane of the active window.
+    // tmux's current window is a property of the SESSION, not of a client, so every client on one
+    // session sees the same pane — which is why this needs no client lookup, while WHICH SESSION is
+    // in front does (see `watchedSession`). A detached session keeps its active pane, and reporting
+    // it is the contract's stated fallback.
     focused: raw.active && raw.windowActive,
     // `pane_dead` is 1 only where the operator set `remain-on-exit`; everywhere else the record is
     // simply gone from the listing, and the next write answers `can't find pane`.
@@ -494,8 +791,17 @@ function toMuxPane(
     status: "unknown",
   };
   // Assigned, never conditionally spread, so absent stays absent (the Herdr adapter's rule).
-  const label = operatorLabel(raw);
-  if (label !== null) pane.paneLabel = label;
+  //
+  // tmux's ONE title slot, split by memory (the header). A title equal to the label this adapter set
+  // on this pane is the operator's; anything else in the slot is whatever the pane's program printed,
+  // which is `terminalTitle` — including a label an earlier bridge process set and no longer
+  // remembers. The two are never both reported: the slot holds one string.
+  const title = raw.title.trim();
+  if (title.length > 0 && title === ownLabels.get(raw.id)) pane.paneLabel = title;
+  else {
+    const printed = programTitle(raw);
+    if (printed !== null) pane.terminalTitle = printed;
+  }
   const tabLabel = meaningfulWindowName(window, session);
   if (tabLabel !== null) pane.tabLabel = tabLabel;
   // What a `recent` read can yield: the history tmux kept, plus the viewport it sits behind. This is
@@ -509,13 +815,14 @@ function toMuxPane(
 }
 
 /**
- * The operator's own label for this pane, or null when the slot still holds tmux's default.
+ * What the pane's program printed into the title slot, or null when the slot says nothing.
  *
  * tmux seeds `pane_title` with the host name (probed: `bluefin` on an untouched pane), so a title
- * equal to the host is tmux's and not the operator's. It is a heuristic and it is the honest one
- * available: the alternative is showing every pane a label nobody chose.
+ * equal to the host is tmux's own default and not anybody's statement. Everything else is reported,
+ * verbatim: the glyphs an agent puts in its own title (`✳ …`) are that agent's text, and trimming
+ * them here would be Collie editing what a program said about itself.
  */
-function operatorLabel(raw: TmuxPaneRecord): string | null {
+function programTitle(raw: TmuxPaneRecord): string | null {
   const title = raw.title.trim();
   if (title.length === 0) return null;
   if (title === raw.host || title === raw.host.split(".").at(0)) return null;
@@ -559,6 +866,7 @@ export const tmuxMuxFactory: MuxAdapterFactory = {
   beaconMatcher(target: MuxTarget) {
     return tmuxBeaconMatcher(TMUX_MUX, execFor(target));
   },
+  describeTarget: tmuxServerLabel,
 };
 
 /** The transport for one target. Stateless configuration, so the matcher may build its own. */

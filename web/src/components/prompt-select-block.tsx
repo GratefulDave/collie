@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Loader2, MessageSquarePlus } from "lucide-react";
 
-import type { PromptFamily, PromptModel, PromptOption } from "@/lib/blocks";
+import type { PromptFamily, PromptFeedbackPurpose, PromptModel, PromptOption } from "@/lib/blocks";
 import { FEEDBACK_MAX_LENGTH } from "@/lib/prompt-action";
 import { OptionButton, OptionGroupCaption, PromptPanel } from "@/components/option-button";
+import { useLocale } from "@/hooks/use-locale";
+import { t } from "@/lib/i18n";
 
 /** What a tap on this block asks for: an option's keystroke plan, or feedback typed on the phone. */
 export type PromptBlockAction =
@@ -26,12 +28,60 @@ export interface PromptSelectBlockProps {
 
 // Family-aware caption above the options — orients the reader ("the terminal is asking you
 // something") without repeating the question, which stays in the raw scrollback just above.
-const FAMILY_CAPTION = {
-  select: "Choose an option",
-  permission: "Permission required",
-  trust: "Trust this folder?",
-  plan: "Review the plan",
-} satisfies Record<PromptFamily, string>;
+// A function, not a module-level object, so it re-reads the current locale on every call — a
+// component that calls `useLocale()` re-renders on a language switch and this is called fresh.
+function familyCaption(family: PromptFamily): string {
+  switch (family) {
+    case "select":
+      return t("prompt.family.select");
+    case "permission":
+      return t("prompt.family.permission");
+    case "trust":
+      return t("prompt.family.trust");
+    case "plan":
+      return t("prompt.family.plan");
+  }
+}
+
+interface FeedbackCopy {
+  offer: string | null;
+  editorLabel: string;
+  placeholder: string;
+  help: string;
+  send: string;
+  sending: string;
+  focused: string;
+  typedPrefix: string;
+}
+
+// Copy is purpose-aware: Claude's plan-approval input is deny-with-feedback; Grok's `z` row is
+// a custom answer. Missing purpose is Claude (the only row submitPromptFeedback will type into).
+// A function (not a module-level object) for the same locale-freshness reason as familyCaption.
+function feedbackCopyFor(purpose: PromptFeedbackPurpose): FeedbackCopy {
+  if (purpose === "free-text") {
+    // No phone composer: the Claude plan-feedback send path is the wrong recipe for this row.
+    return {
+      offer: null,
+      editorLabel: "",
+      placeholder: "",
+      help: "",
+      send: "",
+      sending: "",
+      focused: t("prompt.feedback.freeText.focused"),
+      typedPrefix: t("prompt.feedback.freeText.typedPrefix"),
+    };
+  }
+  return {
+    offer: t("prompt.feedback.planChange.offer"),
+    editorLabel: t("prompt.feedback.planChange.editorLabel"),
+    placeholder: t("prompt.feedback.planChange.placeholder"),
+    help: t("prompt.feedback.planChange.help"),
+    send: t("prompt.feedback.planChange.send"),
+    sending: t("prompt.feedback.planChange.sending"),
+    focused: t("prompt.feedback.planChange.focused"),
+    typedPrefix: t("prompt.feedback.planChange.typedPrefix"),
+  };
+}
 
 // Native, tappable rendering of a Claude single-choice dialog. Every visible string — the option
 // label and its description — is a React text node (the XSS boundary is unchanged; nothing is ever
@@ -55,6 +105,7 @@ const FAMILY_CAPTION = {
 // Only the empty, unfocused state offers the composer, whose Send drives digit → focus → type →
 // Enter and lands as DENY-with-feedback (the agent re-plans) — which is what the button says.
 export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBlockProps) {
+  useLocale();
   const [sending, setSending] = useState<string | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
   // Focused from an effect rather than with `autoFocus`: the attribute only acts on the very first
@@ -69,6 +120,9 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
   const feedback = prompt.feedback;
   const terminalFocused = feedback?.focused ?? false;
   const locked = Boolean(disabled) || sending !== null || terminalFocused;
+  const feedbackCopy = feedback
+    ? feedbackCopyFor(feedback.purpose === "free-text" ? "free-text" : "plan-change")
+    : null;
 
   async function press(id: string, action: PromptBlockAction): Promise<boolean> {
     if (locked) return false;
@@ -92,12 +146,12 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
   }
 
   const busyIcon = (
-    <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" aria-label="Sending" />
+    <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" aria-label={t("prompt.sendingAria")} />
   );
 
   return (
     <PromptPanel ariaLabel={prompt.question}>
-      <OptionGroupCaption>{FAMILY_CAPTION[prompt.family]}</OptionGroupCaption>
+      <OptionGroupCaption>{familyCaption(prompt.family)}</OptionGroupCaption>
       <div className="flex flex-col gap-1">
         {prompt.options.map((option, index) => {
           const id = `opt-${index}`;
@@ -106,7 +160,7 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
             <OptionButton
               key={index}
               tone={busy ? "busy" : "default"}
-              keyLabel={option.keys[0]}
+              keyLabel={option.keyLabel ?? option.keys[0]}
               label={option.label}
               description={option.description}
               disabled={locked}
@@ -115,7 +169,7 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
                 busy ? (
                   <Loader2
                     className="mt-0.5 size-4 shrink-0 animate-spin text-muted-foreground"
-                    aria-label="Sending"
+                    aria-label={t("prompt.sendingAria")}
                   />
                 ) : null
               }
@@ -128,35 +182,35 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
           first: the choreography focuses the row and fills it, so from the moment Send is pressed the
           screen is briefly indistinguishable from "someone at the terminal is typing" — and saying
           that to the person who just pressed the button would be a lie about their own action. */}
-      {feedback && sending === "feedback" ? (
+      {feedback && feedbackCopy && sending === "feedback" ? (
         <div className="flex items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
           {busyIcon}
-          Sending feedback…
+          {feedbackCopy.sending}
         </div>
-      ) : feedback && terminalFocused ? (
+      ) : feedback && feedbackCopy && terminalFocused ? (
         <div className="rounded-lg border border-dashed border-status-working/50 px-3 py-2 text-xs text-status-working">
-          The feedback box has the keyboard in the terminal — these buttons would type into it
-          instead of answering. They resume when it closes.
+          {feedbackCopy.focused}
           {feedback.text ? <span className="text-muted-foreground"> ({feedback.text})</span> : null}
         </div>
-      ) : feedback && feedback.text !== "" ? (
+      ) : feedback && feedbackCopy && feedback.text !== "" ? (
         <div className="flex items-start gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2">
           <MessageSquarePlus
             className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
-            aria-label="Feedback in the terminal"
+            aria-label={t("prompt.feedback.typedAria")}
           />
           <span className="min-w-0 flex-1 text-xs text-foreground/90">
-            Feedback is being written in the terminal: {feedback.text}
+            {feedbackCopy.typedPrefix}
+            {feedback.text}
           </span>
         </div>
-      ) : feedback && editorOpen ? (
+      ) : feedback && feedbackCopy && feedbackCopy.offer && editorOpen ? (
         <div className="flex flex-col gap-1.5 rounded-lg border border-border/70 bg-muted/30 px-3 py-2">
           <label
             htmlFor="plan-feedback-text"
             className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground"
           >
             <MessageSquarePlus className="size-3.5 shrink-0" />
-            What should Claude change?
+            {feedbackCopy.editorLabel}
           </label>
           <textarea
             id="plan-feedback-text"
@@ -165,13 +219,11 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
             onChange={(e) => setDraft(e.target.value)}
             maxLength={FEEDBACK_MAX_LENGTH}
             rows={3}
-            aria-label="Feedback text"
-            placeholder="Say what to do differently…"
+            aria-label={t("prompt.feedback.planChange.textAria")}
+            placeholder={feedbackCopy.placeholder}
             className="w-full resize-none rounded-md border border-border/60 bg-background px-2 py-1.5 text-sm text-foreground outline-none focus:border-primary/60"
           />
-          <p className="text-[11px] leading-snug text-muted-foreground">
-            Sends the plan back with your notes — Claude keeps planning instead of starting work.
-          </p>
+          <p className="text-[11px] leading-snug text-muted-foreground">{feedbackCopy.help}</p>
           <div className="flex items-center justify-end gap-1.5">
             <button
               type="button"
@@ -179,7 +231,7 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
               onClick={() => setEditorOpen(false)}
               className="rounded-md px-2.5 py-1.5 text-xs text-muted-foreground transition-colors active:bg-muted disabled:opacity-60"
             >
-              Cancel
+              {t("prompt.feedback.cancel")}
             </button>
             <button
               type="button"
@@ -188,11 +240,11 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
               className="flex items-center gap-1.5 rounded-md border border-primary/60 bg-primary/15 px-2.5 py-1.5 text-xs font-medium text-foreground transition-colors active:bg-primary/25 disabled:opacity-60"
             >
               {sending === "feedback" ? busyIcon : null}
-              Send feedback
+              {feedbackCopy.send}
             </button>
           </div>
         </div>
-      ) : feedback ? (
+      ) : feedback && feedbackCopy && feedbackCopy.offer ? (
         <button
           type="button"
           disabled={locked}
@@ -203,7 +255,7 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
           className="flex w-full items-center gap-2 rounded-lg border border-dashed border-border/60 px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors active:bg-muted disabled:opacity-60"
         >
           <MessageSquarePlus className="size-3.5 shrink-0" />
-          Tell Claude what to change
+          {feedbackCopy.offer}
         </button>
       ) : null}
     </PromptPanel>

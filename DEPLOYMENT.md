@@ -9,7 +9,10 @@ four shapes here are for everything else. Pick one.
 - [Variant C — reverse proxy as the only front door (no Tailscale)](#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)
 - [Variant D — off-host identity proxy over the tailnet](#variant-d--off-host-identity-proxy-over-the-tailnet)
 - [Variant E — any other mesh or tunnel](#variant-e--any-other-mesh-or-tunnel-netbird-zerotier-cloudflare-tunnel)
+- [Several Collies on one host](#several-collies-on-one-host) — a URL per developer on a shared box
 - [The standby door — a pack's failover path](#the-standby-door--a-packs-failover-path) (packs only)
+
+Not a variant, but it crosses all of them: [Several Collies on one host](#several-collies-on-one-host).
 
 The security rules in [README → Security](./README.md#%EF%B8%8F-security--read-before-you-run-it)
 are not relaxed by any of them. None of these is a prerequisite for authorising individual devices —
@@ -30,7 +33,10 @@ COLLIE_HOST=127.0.0.1                       # keep loopback (default)
 COLLIE_DEVICE_HEADER=X-Device-Id            # the header your proxy injects
 COLLIE_DEVICE_ALLOWLIST=my-phone,my-laptop  # ids allowed to drive agents; others → read-only
 # COLLIE_ALLOWED_ORIGINS=https://collie.example.com   # only if the proxy does NOT forward the public Host
+# COLLIE_PUBLIC_HOSTS=collie.example.com    # REQUIRED unless the proxy forwards a Host Collie already knows
+# COLLIE_ALLOW_ANY_HOST=1                   # opt out of Host validation entirely (re-opens DNS rebinding)
 # COLLIE_TRUSTED_USER still composes on top if your ingress also injects Tailscale-User-Login
+# COLLIE_TRUSTED_USER_OPTIONAL=1            # accept a request carrying no Tailscale-User-Login at all
 ```
 
 Your fronting proxy **must**:
@@ -139,7 +145,9 @@ Required env (`.env`):
 
 ```bash
 COLLIE_SKIP_SERVE=1                                 # proxy is ingress; never run tailscale serve
-COLLIE_PUBLIC_HOSTS=collie.example.com              # Host allowlist — blocks DNS rebinding
+COLLIE_PUBLIC_HOSTS=collie.example.com              # REQUIRED — Host validation fails closed, and
+                                                    # `collie start` discovers no tailnet name here
+# COLLIE_ALLOW_ANY_HOST=1                           # opt out of Host validation (re-opens DNS rebinding)
 COLLIE_ALLOWED_ORIGINS=https://collie.example.com   # exact public origin for the same-origin gate
 COLLIE_DEVICE_HEADER=X-Device-Id                    # the header your proxy injects…
 COLLIE_DEVICE_ALLOWLIST=my-phone,my-laptop          # …and the ids allowed to drive; others → read-only
@@ -288,7 +296,10 @@ COLLIE_SERVE_MODE=http                                # proxy terminates TLS; th
 COLLIE_HOST=127.0.0.1                                 # keep loopback (default)
 COLLIE_DEVICE_HEADER=X-Tailnet-Device                 # header your forward-auth injects — REQUIRED here
 COLLIE_DEVICE_ALLOWLIST=my-phone,my-laptop            # ids allowed to drive; others + header-less → read-only
-COLLIE_PUBLIC_HOSTS=host:8787,host.your-tailnet.ts.net:8787   # the Host the proxy forwards
+COLLIE_PUBLIC_HOSTS=host:8787,host.your-tailnet.ts.net:8787   # REQUIRED — the Host the proxy forwards.
+                                                      # COLLIE_TAILSCALE_HOSTS carries the bare tailnet
+                                                      # name `collie start` found; a rewritten Host is
+                                                      # yours to list. COLLIE_ALLOW_ANY_HOST=1 opts out.
 COLLIE_ALLOWED_ORIGINS=https://collie.example.com     # the public origin the browser actually uses
 ```
 
@@ -346,7 +357,8 @@ other tunnel you own the ingress and Collie stays out of the way:
 
 ```bash
 COLLIE_SKIP_SERVE=1                                 # never run tailscale serve
-COLLIE_PUBLIC_HOSTS=collie.example.com              # exact public host — blocks DNS rebinding
+COLLIE_PUBLIC_HOSTS=collie.example.com              # REQUIRED — exact public host; Host validation
+                                                    # fails closed and finds no tailnet name here
 COLLIE_ALLOWED_ORIGINS=https://collie.example.com   # exact public origin for the same-origin gate
 ```
 
@@ -378,6 +390,52 @@ Three things to get right, none of them Collie-specific:
 > the auth in front of it is the only thing between a stranger and that shell, so treat a shared PIN
 > the way you'd treat a root password — and prefer a tunnel scoped to your own devices over a public
 > URL with a gate on it.
+
+## Several Collies on one host
+
+A tailnet name belongs to the **machine**, not to a person on it. So when a team shares one VPS and
+each developer wants their own Collie, they are all reaching for the same `https://<host>.<tailnet>.ts.net`
+— and `tailscale serve` has exactly one root mount on :443 to give. `COLLIE_SERVE_PORT` hands each
+Collie a listener port of its own, and the URL a port suffix to match:
+
+```bash
+# ~/.config/herdr/plugins/config/herdr.collie/.env — one per Unix user
+COLLIE_PORT=8801                       # this user's loopback bridge port — unique per user
+COLLIE_SERVE_PORT=8443                 # this user's tailnet https listener — unique per user
+COLLIE_TRUSTED_USER=dev-a@example.com  # only this tailnet login may drive these agents
+```
+
+`collie url` then prints `https://<host>.<tailnet>.ts.net:8443`, the next developer gets `:8444`, and
+each door is still Collie's one managed front door — same certificate, same identity header, same
+teardown rule ([ADR 0001](./.adr/0001-one-managed-front-door.md)). Only the port is yours to pick.
+
+Three things to get right:
+
+1. **One Unix user per developer, each running their own `herdr` and their own Collie.** Collie
+   drives whatever panes its herdr can see; two developers sharing one herdr share one set of
+   terminals, which is not what anyone means by "my own Collie".
+2. **Set `COLLIE_TRUSTED_USER`.** Every developer on the tailnet can reach every port on the host,
+   and without it each Collie accepts all of them. It is the only thing making `:8443` yours rather
+   than the team's, and Collie warns at startup while it is unset.
+3. **The serve step needs privilege the developer may not have.** `tailscale serve` requires root or
+   the single Tailscale operator user (`tailscale set --operator=<user>` names exactly one). So an
+   admin runs `collie serve` once per user account — the mapping is `--bg` and persists across
+   reboots, and each developer's own `collie start`/`restart` then leaves it alone. If a developer
+   sees `access denied` from `tailscale serve`, that is this, not a Collie problem.
+
+**`COLLIE_SERVE_PORT` is not `COLLIE_INSTANCE`, and they answer different questions.**
+`COLLIE_SERVE_PORT` gives *one* Collie a front-door port of its own — same install, same state dir,
+same service unit, only the tailnet listener moves off :443. `COLLIE_INSTANCE` makes a **second,
+fully separate Collie** on the host: its own config dir, its own service unit (`collie-<name>`), its
+own pidfile and log, and a state dir you give it — sharing nothing with the first. Each developer
+above wants the first, because
+they already have their own Unix user; one operator running v1 beside their live 0.x wants the second
+([README → Side by side](./README.md#side-by-side-if-the-herd-is-real)). A named instance still needs
+a `COLLIE_SERVE_PORT` of its own if it is to have a front door on the same machine name.
+
+Ports are free-form here: `tailscale serve --https=<port>` takes any port. Only `funnel` — which
+Collie never runs — is restricted to 443/8443/10000. An unusable `COLLIE_SERVE_PORT` makes
+`collie serve` refuse before it touches anything, rather than quietly falling back to :443.
 
 ## The standby door — a pack's failover path
 

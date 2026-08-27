@@ -37,11 +37,20 @@
 // ── ONE TITLE SLOT, AND WHO GETS IT ──────────────────────────────────────────────────────────────
 //
 // zellij has exactly one per-pane label — the listing's `title` — where the contract has two
-// (`paneLabel`, the operator's, and `terminalTitle`, the program's). Collie spends it on the
-// OPERATOR, as it does on tmux: `renamePane` writes it and it comes back as `paneLabel`.
-// `terminalTitle` is therefore never reported on zellij; reporting the same string twice under two
-// names would tell the UI that a program said something it did not. zellij's own default for the slot
-// is `Pane #N`, which is why {@link operatorLabel} drops it — an untouched pane has no label.
+// (`paneLabel`, the operator's, and `terminalTitle`, the program's). The probe found THREE things
+// writing that one slot: `rename-pane`, the pane's launch command, and the pane's own printed title
+// ("whatever the pane was last named or last printed"). Read as `paneLabel`, the last two are Collie
+// telling the operator they named a pane they never touched.
+//
+// So the slot is split by MEMORY, exactly as tmux's is and for the same reason (MUX_CONTRACT.md
+// § Contract-owned rules, *Pane naming*): {@link ZellijMux.ownLabels} holds the labels THIS adapter
+// set through `renamePane`, and a title equal to the pane's remembered label comes back as
+// `paneLabel`. Everything else in the slot comes back as `terminalTitle`. The memory is in-process,
+// so a bridge restart degrades an operator's label to `terminalTitle` — visible, less prominent, and
+// never a claim about who wrote it.
+//
+// zellij's own default for the slot is `Pane #N`, which is why {@link programTitle} drops it: an
+// untouched pane says nothing at all.
 //
 // ── WHY EVERY WRITE TAKES A LISTING FIRST ────────────────────────────────────────────────────────
 //
@@ -98,7 +107,7 @@ import {
   type ZellijTabRecord,
 } from "./protocol.ts";
 import { ZellijSessionBinding, type ZellijCall } from "./session.ts";
-import { ZellijWatch } from "./watch.ts";
+import { ZELLIJ_CENSUS_MAX_MS, ZellijWatch } from "./watch.ts";
 
 /** The registry name this adapter answers to, and the value of {@link ZellijMux.mux}. */
 export const ZELLIJ_MUX = "zellij";
@@ -177,6 +186,13 @@ const ZELLIJ_CAPABILITIES = declareCapabilities({
     "pushPaneEvents",
   ],
   unsupportedKeys: ZELLIJ_UNSENDABLE_KEYS,
+  // The only `bounded` declaration in this build, and the number is the census CEILING — the longest
+  // a change nobody announced can sit unseen. Not the floor: an adaptive census runs faster than its
+  // ceiling most of the time, and a bound that only holds when the herd happens to be busy is not a
+  // bound. Not the watched ceiling either: attention is something the bridge observes, never
+  // something a caller can promise, so the declaration states the cadence that always holds
+  // (watch.ts § the cadence).
+  topologyLatency: { kind: "bounded", ms: ZELLIJ_CENSUS_MAX_MS },
   notes: {
     agentDetection:
       "zellij does not know what an agent is. It can say what a pane is called and which command it was launched with, and neither is the same question — so every pane reads as a shell rather than as a guess that would pick the wrong grammar.",
@@ -192,7 +208,13 @@ const ZELLIJ_CAPABILITIES = declareCapabilities({
       "Nothing in zellij's command line announces a pane or tab appearing, closing or being renamed — the plugin API is where such an event lives, and that is not a command line. A bounded census, 3 s after any change and relaxing to 12 s while nothing moves, is what keeps the promise instead.",
     pushPaneEvents:
       "`zellij subscribe` follows several panes at once and pushes a frame on every repaint, so a pane the operator is watching is reported without waiting for the census.",
+    setFocus:
+      "zellij can bring a TAB to the front, but nothing on its command line reliably focuses a pane inside one: `action focus-pane-id` exits 0 and moves nothing. Showing a tab and hoping the right pane is in front would put a neighbouring pane on the operator's screen, so Collie does not offer the button rather than half-keep the promise.",
   },
+  // A Collie on zellij drives exactly ONE zellij session and that session is its one space — the
+  // same fact that declines `createSpace`, read the other way round. So the phone drops the space
+  // strip entirely and the tab strip is the top level.
+  spaces: "one",
 });
 
 /** One pane's derived revision, and the reads it was derived from. */
@@ -219,6 +241,18 @@ export class ZellijMux implements MuxAdapter {
    * change (../types.ts § MuxGrid.revision).
    */
   private readonly revisions = new Map<string, PaneRevision>();
+
+  /**
+   * The label this adapter set on each pane, keyed by pane id — the split of zellij's ONE title slot
+   * (see the header, and MUX_CONTRACT.md § Contract-owned rules, *Pane naming*).
+   *
+   * Written only by {@link renamePane}, on a call zellij accepted. Cleared by a `renamePane(null)`
+   * and by {@link forgetGonePanes} when the pane leaves the listing, so a memory can never outlive
+   * the pane it described. It holds at most one short string per live pane.
+   */
+  private readonly ownLabels = new Map<string, string>();
+  /** The watches this adapter has handed out and that are still live — {@link refresh}'s subjects. */
+  private readonly watches = new Set<ZellijWatch>();
 
   constructor(private readonly session: ZellijSessionBinding) {}
 
@@ -248,7 +282,19 @@ export class ZellijMux implements MuxAdapter {
     if (panes === null || tabs === null) {
       throw new Error(`zellij: could not read the session's listing: ${paneCall.result.stderr.trim() || "not JSON"}`);
     }
-    return toSnapshot(panes, tabs, this.session.label());
+    this.forgetGonePanes(panes);
+    return toSnapshot(panes, tabs, this.session.label(), this.ownLabels);
+  }
+
+  /** Drop the remembered label of every pane zellij no longer lists. The map's only shrink path. */
+  private forgetGonePanes(panes: readonly ZellijPaneRecord[]): void {
+    if (this.ownLabels.size === 0) return;
+    const live = new Set(panes.map((pane) => pane.paneId));
+    // Deleting through a Map's own key iterator is defined behaviour — an entry removed before it is
+    // reached is simply not visited — so no copy of the keys is taken.
+    for (const paneId of this.ownLabels.keys()) {
+      if (!live.has(paneId)) this.ownLabels.delete(paneId);
+    }
   }
 
   /**
@@ -331,11 +377,22 @@ export class ZellijMux implements MuxAdapter {
     return this.ack(sendKeysArgs(paneId, translated));
   }
 
-  /** Set or clear the operator's label. zellij's one title slot — see the header. `null` clears it. */
+  /**
+   * Set or clear the operator's label. zellij's one title slot — see the header. `null` clears it.
+   *
+   * The label is REMEMBERED here and nowhere else, and only after zellij accepted the call: that
+   * memory is the whole of what tells an operator's label from a title the pane's program printed on
+   * the next listing. Stored trimmed, because that is how the listing reports it back.
+   */
   async renamePane(paneId: string, label: string | null): Promise<MuxAck> {
     const gone = await this.livePane(paneId);
     if (gone !== null) return gone;
-    return this.ack(renamePaneArgs(paneId, label ?? ""));
+    const result = await this.ack(renamePaneArgs(paneId, label ?? ""));
+    if (!result.ok) return result;
+    const kept = label === null ? "" : label.trim();
+    if (kept.length === 0) this.ownLabels.delete(paneId);
+    else this.ownLabels.set(paneId, kept);
+    return result;
   }
 
   async closePane(paneId: string): Promise<MuxAck> {
@@ -391,6 +448,30 @@ export class ZellijMux implements MuxAdapter {
     return this.ack(closeTabArgs(tabNumber));
   }
 
+  /**
+   * Declined, and it is the one refusal here that was probed twice before being believed.
+   *
+   * zellij 0.44.2 ships `action focus-pane-id <id>`, which is exactly the verb this capability wants
+   * — and it does nothing. Probed 2026-08-25 against the live test session, with a client attached
+   * and two panes in one tab: `focus-pane-id terminal_3` and the bare `focus-pane-id 3` both exited 0
+   * and `action list-clients` still reported the client on `terminal_0`; `focus-next-pane` moved it,
+   * so the client and the session were live. Across tabs it is the same silence — `focus-pane-id`
+   * aimed at another tab's pane left the active tab where it was.
+   *
+   * `go-to-tab <n>` DOES work (probed: 1-based over tab position), so a tab-level approximation is
+   * available and is deliberately not taken. The promise is "this pane is now on the operator's
+   * screen", and a tab whose focus sits on a neighbouring pane is not that — it is the quiet lie the
+   * conformance suite exists to catch, told to somebody who is not looking at the screen it moved.
+   */
+  setFocus(_paneId: string): Promise<MuxAck> {
+    return Promise.resolve(
+      muxUnsupported(
+        "setFocus",
+        "zellij's `focus-pane-id` exits 0 and moves nothing (probed on 0.44.2), so Collie cannot promise a pane is in front",
+      ),
+    );
+  }
+
   /** A zellij collie drives one zellij session, so there is no second space to make — see the header. */
   createSpace(_request: MuxSpaceRequest): Promise<MuxOutcome<MuxCreatedPane>> {
     return Promise.resolve(
@@ -404,8 +485,33 @@ export class ZellijMux implements MuxAdapter {
   /** The contract's watch over the pane stream plus a bounded census. All of it lives in watch.ts. */
   watch(options: MuxWatchOptions): MuxSubscription {
     const subscription = new ZellijWatch(this.session, options);
+    this.watches.add(subscription);
     subscription.start();
-    return subscription;
+    // A WRAPPER, so closing the handle also drops this adapter's own reference — see tmux's, which
+    // carries the same note for the same reason.
+    return {
+      close: () => {
+        this.watches.delete(subscription);
+        subscription.close();
+      },
+    };
+  }
+
+  /**
+   * Look now: every live watch censuses at once and drops its interval back to the floor.
+   *
+   * This is the adapter where `refresh()` earns its place on the floor of the port. zellij announces
+   * no structure change at all, so without it a tab the operator renamed in their own terminal waits
+   * out whatever the census had relaxed to — up to the twelve seconds this adapter declares.
+   *
+   * Watches that ended on their own are pruned rather than tracked with a callback; tmux's carries
+   * the argument.
+   */
+  async refresh(): Promise<void> {
+    for (const watch of this.watches) {
+      if (watch.ended) this.watches.delete(watch);
+    }
+    await Promise.all([...this.watches].map((watch) => watch.refresh()));
   }
 
   /**
@@ -490,6 +596,7 @@ function toSnapshot(
   paneRecords: readonly ZellijPaneRecord[],
   tabRecords: readonly ZellijTabRecord[],
   sessionLabel: string,
+  ownLabels: ReadonlyMap<string, string>,
 ): MuxSnapshot {
   const tabByNumber = new Map(tabRecords.map((tab) => [tab.tabNumber, tab]));
   const activeTab = tabRecords.find((tab) => tab.active) ?? tabRecords.at(0);
@@ -519,7 +626,7 @@ function toSnapshot(
   // half-listed pane would fail the whole herd's consistency check.
   const panes: MuxPane[] = paneRecords
     .filter((pane) => tabByNumber.has(pane.tabNumber))
-    .map((pane) => toMuxPane(pane, tabByNumber.get(pane.tabNumber), sessionLabel, tabRecords.length));
+    .map((pane) => toMuxPane(pane, tabByNumber.get(pane.tabNumber), sessionLabel, tabRecords.length, ownLabels));
   return { panes, spaces, tabs };
 }
 
@@ -529,6 +636,7 @@ function toMuxPane(
   tab: ZellijTabRecord | undefined,
   sessionLabel: string,
   tabCount: number,
+  ownLabels: ReadonlyMap<string, string>,
 ): MuxPane {
   const pane: MutableMuxPane = {
     paneId: raw.paneId,
@@ -538,8 +646,11 @@ function toMuxPane(
     tabId: tabId(raw.tabNumber),
     // zellij reports no working directory for a pane, in any of `list-panes`' field groups.
     cwd: "",
-    // zellij's focus is per-tab: a pane is the one zellij would type into only when its tab is also
-    // the active one. Collie never sets focus either way.
+    // The pane the operator's terminal is showing, and it takes BOTH flags. `is_focused` is a
+    // property of the TAB — every tab remembers its own focused pane, so several report it at once
+    // (probed: two panes in one tab both read `is_focused` after a split) — and `active` is the tab
+    // the attached client is on. A DETACHED session marks no tab active, so no pane is focused, which
+    // is the honest answer: nobody's screen is showing one (probed 2026-08-25).
     focused: raw.focused && tab?.active === true,
     alive: !raw.exited,
     // The header's decision: zellij knows of no agent, so every pane is a shell of unknown status.
@@ -552,8 +663,18 @@ function toMuxPane(
   // NOT who runs here (the header, and ../types.ts § MuxPane.agent). `agent` above stays `"shell"`.
   if (raw.command.length > 0) pane.foregroundCommand = raw.command;
   // Assigned, never conditionally spread, so absent stays absent (the Herdr adapter's rule).
-  const label = operatorLabel(raw.title);
-  if (label !== null) pane.paneLabel = label;
+  //
+  // zellij's ONE title slot, split by memory (the header). A title equal to the label this adapter
+  // set on this pane is the operator's; anything else in the slot was printed by the pane's program
+  // or put there by its launch command, which is `terminalTitle` — including a label an earlier
+  // bridge process set and no longer remembers. The two are never both reported: the slot holds one
+  // string.
+  const title = raw.title.trim();
+  if (title.length > 0 && title === ownLabels.get(raw.paneId)) pane.paneLabel = title;
+  else {
+    const printed = programTitle(raw.title);
+    if (printed !== null) pane.terminalTitle = printed;
+  }
   const tabLabel = meaningfulTabName(tab, tabCount);
   if (tabLabel !== null) pane.tabLabel = tabLabel;
   return pane;
@@ -563,13 +684,14 @@ function toMuxPane(
 const DEFAULT_PANE_TITLE = /^Pane #\d+$/u;
 
 /**
- * The operator's own label for this pane, or null when the slot still holds zellij's default.
+ * What the pane itself put in the title slot, or null when the slot still holds zellij's default.
  *
- * It is a heuristic and it is the honest one available: the alternative is showing every pane a label
- * nobody chose. A pane launched with a command carries that command's name here instead, which IS
- * information the operator put there — `zellij run` and `new-pane --name` are both their doing.
+ * `Pane #N` is zellij's own placeholder and says nothing. Everything else is reported verbatim: a
+ * pane launched with a command carries that command's name here, a running program can overwrite it
+ * with an OSC title, and the glyphs an agent writes into its own title are that agent's text —
+ * trimming them here would be Collie editing what a program said about itself.
  */
-function operatorLabel(title: string): string | null {
+function programTitle(title: string): string | null {
   const trimmed = title.trim();
   if (trimmed.length === 0 || DEFAULT_PANE_TITLE.test(trimmed)) return null;
   return trimmed;
@@ -613,6 +735,10 @@ export const zellijMuxFactory: MuxAdapterFactory = {
    */
   beaconMatcher(target: MuxTarget) {
     return zellijBeaconMatcher(ZELLIJ_MUX, bindingFor(target));
+  },
+  describeTarget(endpoint: string) {
+    const named = endpoint.trim();
+    return named === "" ? "the single running session" : `session ${named}`;
   },
 };
 

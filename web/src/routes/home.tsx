@@ -4,6 +4,7 @@ import { useNavigate } from "react-router";
 import { AppHeader, SettingsGear } from "@/components/app-header";
 import { SessionSwitcher } from "@/components/session-switcher";
 import { ServerSwitcher } from "@/components/server-switcher";
+import { PullToRefresh } from "@/components/pull-to-refresh";
 import { ReadOnlyBanner } from "@/components/read-only-banner";
 import { AgentList } from "@/components/agent-list";
 import { SpaceOverview } from "@/components/space-overview";
@@ -72,8 +73,9 @@ export function HomeRoute() {
         rightTrail={<SettingsGear scope={data.scope} />}
       />
 
-      {/* Content region below the header: a viewport-clipped internal scroller. */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+      {/* Content region below the header: a viewport-clipped internal scroller, with the pull
+          gesture on it — one thumb asking the bridge to look at its multiplexer now. */}
+      <PullToRefresh scope={data.scope} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
         <ReadOnlyBanner device={data.device} />
 
         <main className="flex-1">
@@ -107,7 +109,7 @@ export function HomeRoute() {
             running, with a stale-cache nudge). */}
         <UpdateBanner className="px-3 pt-3" />
         <BuildStamp className="px-3 pt-3 pb-[calc(env(safe-area-inset-bottom)_+_0.5rem)]" />
-      </div>
+      </PullToRefresh>
 
       {/* Status overlay, anchored to the bottom of the viewport (no input here) — same slim line,
           floating so it never shifts the list. Stays outside the scroller so it never scrolls away. */}

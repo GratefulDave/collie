@@ -8,7 +8,7 @@ import { AuditLog, fileAuditAppender } from "./audit.ts";
 import { beaconReader, hooksInstalledProbe } from "./beacon-io.ts";
 import { withAgentBeacons } from "./beacon/decorate.ts";
 import { withAgentHints } from "./beacon/hint.ts";
-import { loadConfig, resolveConfigDir } from "./config.ts";
+import { loadConfig, nonLoopbackBindRefusal, resolveConfigDir, type Config } from "./config.ts";
 import type { PackMode } from "./types.ts";
 import { EventPoker } from "./event-poker.ts";
 import {
@@ -21,13 +21,21 @@ import {
 } from "./front-door.ts";
 import { HERDR_DIAL_MODE_OPTION } from "./mux/herdr/adapter.ts";
 import { DEFAULT_TIMEOUT_MS } from "./mux/herdr/client.ts";
-import { buildMuxRegistry, createMux, DEFAULT_MUX, factoryFor, type MuxTarget } from "./mux/registry.ts";
+import {
+  buildMuxRegistry,
+  createMux,
+  DEFAULT_MUX,
+  describeMux,
+  factoryFor,
+  type MuxTarget,
+} from "./mux/registry.ts";
 import { TMUX_BINARY_OPTION } from "./mux/tmux/adapter.ts";
 import type { MuxAdapter } from "./mux/types.ts";
 import { ZELLIJ_BINARY_OPTION } from "./mux/zellij/adapter.ts";
 import { NotificationCoordinator, makeNotifySink, type NotifyClock } from "./notifications.ts";
 import { NotifyPrefsStore } from "./notify-prefs.ts";
 import { filePairingIo, PairingStore } from "./pairing.ts";
+import { createSttGate } from "./stt/index.ts";
 import { runBootGate } from "./pack/boot-gate.ts";
 import { PEER_BROWSER_ENV, resolvePackRuntime, warnsOnWildcardBind } from "./pack/config.ts";
 import { deposedAnswer, deposedStateFrom, outcomeNow, selfHeal, type DeposedState } from "./pack/deposed.ts";
@@ -113,7 +121,16 @@ const UPDATE_FIRST_DELAY_MS = 90_000;
 const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 // Entry point: resolve config, wire the pieces, start polling and serving.
-const cfg = loadConfig();
+// loadConfig throws on config it cannot parse at all. Print the reason alone — a stack trace here
+// buries the one line the operator needs. (The bind refusal is NOT here; it needs the pack mode,
+// which is not known until the trust store below has been read.)
+let cfg: Config;
+try {
+  cfg = loadConfig();
+} catch (err) {
+  console.error(`[bridge] FATAL: ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+}
 
 // The pack mode, resolved BEFORE anything is wired, because a peer wires fewer things than a lead
 // (PACK_PROTOCOL.md §3) and a mode discovered halfway through startup would already have opened
@@ -328,6 +345,33 @@ const pack = resolvePackRuntime(enrollment);
 if (pack.conflict) console.warn(`[pack] ${pack.conflict}`);
 if (pack.mode !== "solo") console.log(`[pack] mode: ${pack.mode}`);
 
+// The bind refusal, taken HERE rather than in loadConfig because the mode is what decides it.
+//
+// A solo instance and a lead are browser front doors: every write gate they own is a header a client
+// can set, so a wide bind hands write access to anything that can reach the port and the bridge
+// refuses to start. A collie IN A PACK is exempt, and by construction rather than by indulgence — its
+// lead dials it across a machine boundary, and `/pack/v1/*` is admitted by pinned mutual TLS plus the
+// pack secret, neither of which the bind bounds (PACK_PROTOCOL.md §3, ADR 0013). A peer already gets
+// the wildcard warning below; a LEAD is exempt too, because the machine that took over from a deputy
+// keeps the peer's wide COLLIE_HOST and would otherwise refuse to boot into the crown it just won
+// (ADR 0027/0028) — the worst possible moment to discover a config gate.
+{
+  const refusal = nonLoopbackBindRefusal(cfg);
+  if (refusal !== null) {
+    if (pack.mode === "solo") {
+      console.error(`[bridge] FATAL: ${refusal}`);
+      process.exit(1);
+    }
+    console.warn(
+      `[pack] this ${pack.mode} binds ${cfg.host.trim() === "" ? "every interface" : cfg.host}, not ` +
+        "loopback. Allowed because a pack member is dialled across a machine boundary and " +
+        "/pack/v1/* carries its own two factors — but the browser gates (Tailscale-User-Login, " +
+        "COLLIE_DEVICE_HEADER, same-origin) are client-settable here and bound nothing. Whatever " +
+        "fronts this port is the only control on /api/*.",
+    );
+  }
+}
+
 // A peer publishes nothing (§3, ADR 0013) — including a mapping it published back when it was a
 // lead. BEFORE any listener binds: tailscaled holds the serve port until this returns, and the peer
 // listener that tried to bind it first is what crash-looped in the drill.
@@ -417,6 +461,15 @@ await notifyPrefs.load();
 // needs. An empty registry — the state every existing install starts in — enforces nothing.
 const pairing = new PairingStore(filePairingIo(cfg.stateDir));
 
+// Speech-to-text (bridge/stt/). Constructed unconditionally and holding no settings of its own, for
+// exactly pairing's reason: it re-reads `<stateDir>/stt.json` per request (cached on mtime) and the
+// environment on top of it, so `collie stt setup` lands on the RUNNING service. No provider
+// resolving — the state every existing install is in — is the feature being off.
+const stt = createSttGate({
+  stateDir: cfg.stateDir,
+  warn: (message) => console.warn(`[stt] ${message}`),
+});
+
 // When each pane last moved, and when you last looked at it — the two numbers the dashboard sorts
 // and triages by (see activity.ts). Process-global and keyed by session name, because pane ids are
 // session-scoped and collide across sessions.
@@ -482,6 +535,11 @@ updateTimer.unref();
 // name, so a key can never drift from the adapter it resolves to.
 const muxRegistry = buildMuxRegistry();
 
+// Say what this collie drives, once, before anything dials it. A reachable multiplexer used to be
+// silent — the log named one only when it could not be reached — so `collie logs` could not answer
+// the first question a tmux or zellij operator asks (README → "Did it work?").
+console.log(`[bridge] mux: ${describeMux(muxRegistry, cfg.mux, cfg.muxEndpoint)}`);
+
 // Are the agent's own hooks installed (M11/02)? Probed through `cli/hooks.ts`'s definition of
 // "installed", cached for a few seconds, and shared by every session: it is a property of this HOST,
 // not of one herd. It is what decides whether a blind adapter's beacon capabilities are lifted —
@@ -534,7 +592,11 @@ const makeSession: SessionFactory = (name, socketPath, isPrimary) => {
   // herd change, and while it's healthy the interval relaxes to the safety-net cadence. Events are
   // ONLY a poke — the snapshot poll stays the source of truth — so a missed one costs one interval,
   // not correctness. The fresh snapshot after any pane lifecycle change re-scopes the watch.
-  const poker = new EventPoker(herdr);
+  // `attention` rides through the poker to the adapter's watch: an adapter that CENSUSES for topology
+  // (zellij) tightens its cadence while a phone is plainly reading this collie, and one that pushes
+  // ignores it entirely. The bridge's own poll cadence is NOT touched by this — that stays the
+  // event-health question two lines below.
+  const poker = new EventPoker(herdr, { attention: () => engine.attention() });
   poker.onPoke(() => engine.pokeNow());
   poker.onHealth((h) => engine.setCadence(h ? cfg.pollIdleMs : cfg.pollMs));
   engine.onUpdate((s) => poker.setAgentPanes(s.agents.map((a) => a.paneId)));
@@ -1089,6 +1151,14 @@ const standbyDoor = standbyStore === null ? null : createStandbyDoor({
  * can still be taken over from a keyboard by §14's promotion. Collie BINDS this; it publishes
  * nothing — no `tailscale serve`, never `funnel`, no ownership record (ADR 0001 untouched).
  *
+ * **This is its OWN listener on its OWN address (`COLLIE_STANDBY_HOST`), and that is why neither
+ * loopback gate reaches it.** The bind refusal above reads `COLLIE_HOST`, and the peer-address check
+ * lives in `server.ts`'s `fetch`; this door binds elsewhere and answers here. It is meant to be
+ * dialled from off-box — a failover proxy is the whole point (ADR 0028) — and what admits its one
+ * action is the operator's own pairing credential, not the address it arrived from. Don't route it
+ * through the front door's `fetch` to "share" those gates: that would refuse the very caller it exists
+ * for.
+ *
  * **A LEAD with the key set binds it too, and answers only the health check.** That is not an
  * oversight in the other direction: a failover proxy's fallback backend points at THIS port
  * (RFC §14.2), so a deputy that took over and came back up as the lead would leave the proxy
@@ -1140,6 +1210,7 @@ const server = startServer({
   activity,
   pack,
   pairing,
+  stt,
   packLead,
   peerNotifier,
   // Registered on the EXISTENCE of a trust store, not on the mode: a lead answering its very first
@@ -1217,6 +1288,9 @@ const shutdown = async () => {
   await server.stop();
   clearInterval(refreshTimer);
   registry.disposeAll();
+  // The codex speech-to-text provider owns a `codex app-server` child (bridge/stt/codex-auth.ts).
+  // A no-op when speech-to-text is off, or configured to a provider that holds nothing open.
+  stt.close();
   // Writes are debounced, so the last few seconds of "you looked at this" live only in memory —
   // persist them before exiting, or every restart quietly resurrects alerts you'd already cleared.
   activity.stop();

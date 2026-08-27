@@ -6,6 +6,126 @@ All notable changes to Collie are recorded here. The format follows
 `version` in `herdr-plugin.toml`, `package.json`, and `web/package.json` (enforced by
 `scripts/check-version.sh`). See [`CLAUDE.md`](./CLAUDE.md) → *Versioning* for the bump policy.
 
+## [1.0.0-beta.26] - 2026-08-26
+
+### Fixed
+
+- **A cold zellij start no longer reads as an empty herd for 13 seconds** — a watch that just came up now reconciles, because a stream that was dark cannot report what changed while it was dark (41d9317)
+- **Relaxing the poll cadence is earned by a connected poll, not granted by the event watch's ack** — the ack proves a census answered, never that a snapshot succeeded (498d23f)
+- **A poll that fails before the bridge ever connected now says so** — the warn was gated on being connected, so the first poll's failure, the one that matters most, was the one that logged nothing (c56c87a)
+
+## [1.0.0-beta.25] - 2026-08-26
+
+**Merges Collie 0.35.0 into the v1 line.** Its two fail-closed gates apply here too — read 0.35.0's
+BREAKING note below. One v1-only exemption: a collie **in a pack** may bind off loopback, and
+`/pack/v1/*` is not subject to the peer-address check ([ADR 0013](./.adr/0013-a-peer-listens-without-becoming-a-front-door.md)).
+
+### Added
+
+- **`quick-replies.toml`: your own Quick-dock groups** — the third operator file, same reader and
+  same scope ladder as `commands.toml` and `keys.toml` (0.35.0, #131 — thanks @fucx)
+- **`doctor` reports the multiplexer as a finding of its own** — a missing beacon emitter costs what the adapter says it costs (ee3d288)
+- **`doctor` reports a wide bind on a solo collie as an error** — the bridge now refuses to start on one, so the check says the same thing (7c98cfd)
+
+### Changed
+
+- **Host validation, identity and bind now fail closed** — `COLLIE_ALLOW_ANY_HOST=1`,
+  `COLLIE_TRUSTED_USER_OPTIONAL=1` and `COLLIE_ALLOW_NON_LOOPBACK_BIND=1` are the three opt-outs
+  (0.35.0, #129 — thanks @bartholomewtj)
+- **`collie start` discovers this node's tailnet hosts into the unit** — a normal tailnet install
+  configures nothing; the operator's own `COLLIE_TAILSCALE_HOSTS` wins, and a failed probe keeps the
+  allowlist the unit already had rather than locking the phone out (7c98cfd)
+- **`.env` is held to owner-only** — tightened in place on read, warned about either way, never a refusal to start (7c98cfd)
+- **An unversioned managed checkout pins `update` to the newest release tag**, never to `origin HEAD` (7c98cfd)
+- **Uploads are typed by magic bytes**, not the client's Content-Type (0.35.0)
+- **The startup log names the multiplexer it drives**, not only the one it cannot reach (4abfc82)
+
+### Fixed
+
+- **A Claude is a Claude from SessionStart** — the pane no longer reads as a shell until its first prompt (766e34c)
+- **Every beacon hook entry carries `timeout 10`** — a hung emit never stalls the agent for Claude's default minute (f1e3a21)
+- **The sync stamp lives in the header** — the chrome no longer changes height between the dashboard and a space (ea7e543)
+
+## [1.0.0-beta.24] - 2026-08-25
+
+### Removed
+
+- **"Follow terminal" setting removed** — unnecessary; the phone never follows the terminal, only "Show in terminal" moves it (eef261b)
+
+## [1.0.0-beta.23] - 2026-08-25
+
+### Fixed
+
+- **No second scrollbar beside the dashboard list** — the list and settings scrollers are now the containing block for their `sr-only` labels, which used to escape the clip and stretch the whole page (09974b8)
+
+## [1.0.0-beta.22] - 2026-08-25
+
+### Fixed
+
+- **"Follow terminal" now follows a multi-space server** — the focused space is resolved first, then its one focused pane; every space has an active pane, so the old herd-wide read called a two-session tmux ambiguous and moved nothing (c57888c)
+- **"Show in terminal" reaches the screen across tmux sessions** — an attached terminal sitting on another session is carried over with `switch-client`, instead of an `ok` that moved nothing (c57888c)
+
+## [1.0.0-beta.21] - 2026-08-25
+
+**The phone keeps up with the terminal.** Freshness, focus and how many spaces a multiplexer can hold are now declared by each mux adapter and rendered from the declaration — [ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md).
+
+### Added
+
+- **`refresh()` on the mux floor + declared topology latency** — "look now" for every adapter; `/api/config` says `push` or `bounded` (zellij: 12 s) (ed2e18e)
+- **Attention-coupled census + `POST /api/refresh`** — zellij checks every 1.5–3 s while a phone watches; every phone-initiated create/rename/close/focus re-reads before it answers (2584603)
+- **Pull-to-refresh, refresh on foreground, "synced Ns ago"** on a bounded mux (244409c, 2be919d)
+- **`setFocus` capability + `POST /api/pane/:id/focus`** — Herdr and tmux; zellij declines (its `focus-pane-id` is a no-op, probed) (034de50, 682bf7d)
+- **"Show in terminal"** row in the pane actions and a **"Follow terminal"** setting (off by default; held by a draft, an armed Type, or an open sheet) (e935fec)
+- **`spaces: one | many`** declared per mux — the space strip disappears on zellij (ee32e97, e935fec)
+- Conformance: `pokeTopologyOutOfBand`, `focusOutOfBand`, and four new read-only live checks (698f006, 77b04e1)
+
+## [1.0.0-beta.20] - 2026-08-25
+
+### Fixed
+
+- **tmux/zellij: a program's terminal title is no longer shown as a name you chose** — both multiplexers have one title slot and any program can write it, so the adapters now report only what Collie's own rename set as `paneLabel` and everything else as the terminal title; a title left behind by an exited program is marked stale, never leads a row, and is never deleted (e8d5782)
+
+## [1.0.0-beta.19] - 2026-08-24
+
+### Fixed
+
+- **tmux: a new tab no longer kills the tmux server** — creating a tab or space on tmux < 3.7 while the global `window-size` is `manual` segfaults the whole server (tmux [#4849](https://github.com/tmux/tmux/issues/4849), fixed in 3.7); Collie now reads the option first and refuses with the `tmux set -g window-size latest` that clears it, never setting it itself (a6e9aa5)
+- **tmux: a server that dies mid-call reads as disconnected** — `server exited unexpectedly` / `lost server` now raise the disconnected banner and its retry instead of a red refusal (a6e9aa5)
+
+## [1.0.0-beta.18] - 2026-08-24
+
+### Added
+
+- **Language setting** — Collie's UI in English, Deutsch, Español, 한국어, 日本語 and 中文, picked in Settings by native name and remembered per device; the terminal mirror, agent output, quick replies and screen-printed menu labels stay untranslated ([ADR 0030](./.adr/0030-the-ui-is-translated-by-a-typed-dictionary-not-a-library.md)) (012e8c3)
+- **Bridge error codes** — every displayable refusal carries a stable `code` plus named `detail` beside its unchanged English sentence, so the phone renders it in its own language; additive on the pack link (§7.1), version stays 1 (8fea793)
+
+## [1.0.0-beta.17] - 2026-08-24
+
+### Added
+
+- **`COLLIE_SERVE_PORT`** — publish the managed https front door on a tailnet port other than 443, so several developers sharing one host get a URL each; unset stays byte-identical to before ([#98](https://github.com/AltanS/collie/issues/98)) (8d74d02)
+
+## [1.0.0-beta.16] - 2026-08-23
+
+**Voice input** — a microphone in the composer, off until you run `collie stt setup`. Ports the work
+of [#91](https://github.com/AltanS/collie/pull/91) (@en-ver) and
+[#115](https://github.com/AltanS/collie/pull/115) (@ardaaltinors), both previously declined;
+[ADR 0029](./.adr/0029-speech-to-text-is-a-provider-seam-collie-owns.md) records what changed, and
+[`README.md`](./README.md#voice-input-optional) has the setup.
+
+### Added
+
+- **ADR 0029 + the provider seam** — `bridge/stt/`, registered not special-cased, absent until configured; the `openai-compatible` provider covers the public API, the cloud clones and a local whisper.cpp / parakeet.cpp server (the zero-egress choice) (58e3783)
+- **The `codex` provider** — a short-lived token from the operator's own `codex app-server` over `getAuthStatus`, never `~/.codex/auth.json`; the wire identity is probed honest-first, the fallback needs typed consent, and whichever won is written into the config (0c8e49a)
+- **The microphone, and hands-free** — a record button beside the composer's attach control, drawn only when the bridge published a provider *and* the browser can actually record; the hands-free toggle sends through the guarded reply path, never around it (84799f9)
+- `collie stt setup | test | status | off` — interactive or fully by flag, writes `stt.json` at 0600, live with no restart; `test` is one real round trip, `status` names the source of every field (7565189)
+
+## [1.0.0-beta.15] - 2026-08-23
+
+### Fixed
+- `url`/`status`/`serve`/`qr` now defer to `COLLIE_PUBLIC_URL` wherever it's set, instead of printing
+  the bare tailnet name when `tailscale serve` isn't on :443 (#122) (c6d6220)
+
 ## [1.0.0-beta.14] - 2026-08-20
 
 **The deputy and the takeover** — a pack can now name a standby peer ahead of time and let the
@@ -381,6 +501,57 @@ Merges `main` 0.31.0 + 0.31.1 into v1 (entries below). v1-specific on top of the
 
 - **`PACK_PROTOCOL.md` §11's files-written row omitted `update-state.json`** — the baseline found it;
   the row now lists the real set
+
+## [0.35.0] - 2026-08-26
+
+**BREAKING — read before updating.**
+
+- `COLLIE_PUBLIC_HOSTS` is now **required** on every reverse-proxy or tunnel install (Variant C/E) — Host validation fails closed.
+- With `COLLIE_TRUSTED_USER` set, a request carrying no `Tailscale-User-Login` is now rejected; tagged nodes used to pass.
+- A non-loopback `COLLIE_HOST` refuses to start.
+- Opt-outs, one per gate: `COLLIE_ALLOW_ANY_HOST=1`, `COLLIE_TRUSTED_USER_OPTIONAL=1`, `COLLIE_ALLOW_NON_LOOPBACK_BIND=1`.
+
+### Added
+
+- **`quick-replies.toml`: your own Quick-dock groups** (title + items + optional `scope`), live-reloaded, replacing the shipped phrases on the panes they address per ADR 0018, shell panes reachable via `scope = "shell"` (eb1e92f) — thanks @fucx (#131)
+
+### Changed
+
+- Host-header validation is on by default and fails closed; `collie-ctl.sh` injects the tailnet name and IPs, `COLLIE_ALLOW_ANY_HOST=1` opts out (5f01bf7) — thanks @bartholomewtj (#129)
+- `COLLIE_TRUSTED_USER` rejects a missing `Tailscale-User-Login` as well as a mismatch; `COLLIE_TRUSTED_USER_OPTIONAL=1` restores the old pass (5f01bf7)
+- A non-loopback `COLLIE_HOST` refuses to start unless `COLLIE_ALLOW_NON_LOOPBACK_BIND=1`; non-loopback TCP peers are rejected (5f01bf7)
+
+### Fixed
+
+- Uploads are typed by magic bytes, not the client-supplied Content-Type — `__proto__` and `constructor` used to pass the MIME lookup (5f01bf7)
+- `collie-ctl.sh` parses `.env` as key=value instead of sourcing it — a `.env` with `$(…)` or backticks ran as the operator on every verb; an unquoted trailing `# comment` is now stripped (5f01bf7, 9195e00)
+- An unversioned managed checkout pins `update` to the newest release tag, never origin HEAD (5f01bf7, 4440c05)
+- A failed `tailscale status` no longer writes an empty host allowlist into the unit — the unit keeps the hosts it had, and says so (9195e00)
+
+## [0.34.0] - 2026-08-24
+
+### Added
+
+- `COLLIE_SERVE_PORT`: publish the https front door on a chosen tailnet port — several Collies per host (#98) (c02e3ea)
+
+## [0.33.0] - 2026-08-24
+
+### Added
+
+- **Codex CLI first-class harness adapter** — boxless composer chrome stripped with the status row re-surfaced, folder-trust prompt, exec approvals and `request_user_input` question cards lifted into native buttons (by @kennymcavoy) (e5fab3a)
+- **Grok Build first-class harness adapter** — composer chrome stripped with the status strip re-surfaced, permission cards, `ask_user_question` radios/wizards and plan approval lifted into native buttons, plus a Grok session-journal adapter (by @kennymcavoy) (bd01e51)
+
+### Fixed
+
+- **omp replies no longer stall on an inline completion suggestion** — the ghost omp paints after the typed text is dropped from the draft the send guard verifies (by @enieuwy) (bdfac02)
+- **Codex adapter review fixes** — drafts wrapping past 8 rows keep the composer, and the persistent "don't ask again" approval row stays visible in the mirror (d469507)
+- **`journal-probe` checks each root on its own** — a populated healthy root can no longer hide a broken sibling (by @kennymcavoy) (6f68677)
+
+## [0.32.1] - 2026-08-23
+
+### Fixed
+
+- **`url` (and `status`/`qr`) honour `COLLIE_PUBLIC_URL`** instead of always inferring the bare tailnet name with no port (#122) (859610d)
 
 ## [0.32.0] - 2026-08-19
 

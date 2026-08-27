@@ -15,10 +15,15 @@ it" is not an adapter.
 ## Architecture in one paragraph
 
 An adapter is a [`MuxAdapter`](./bridge/mux/types.ts), registered by its own name in
-[`bridge/mux/registry.ts`](./bridge/mux/registry.ts). Two of its methods are the **floor** —
-`reachable()` and `snapshot()`; an adapter that cannot answer those has nothing for Collie to render.
-Everything else is a **declared capability** ([`capabilities.ts`](./bridge/mux/capabilities.ts)): the
-adapter says yes or no, and a route asks the capability, never the name. Three things the contract
+[`bridge/mux/registry.ts`](./bridge/mux/registry.ts). Three of its methods are the **floor** —
+`reachable()`, `snapshot()` and `refresh()`; an adapter that cannot answer the first two has nothing
+for Collie to render, and the third ("look now") asks for nothing you do not already do on your own
+schedule. Everything else is a **declared capability**
+([`capabilities.ts`](./bridge/mux/capabilities.ts)): the adapter says yes or no, and a route asks the
+capability, never the name. Beside the capabilities sit the declared **facts** — `topologyLatency`
+(how soon you see a change nobody announced) is one, and it is required, because an unstated bound is
+one the operator gets told about by being surprised
+([ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md)). Three things the contract
 owns outright and you do not get to redecide: the **refusal shape**
 ([`types.ts`](./bridge/mux/types.ts) — four reasons, and `unsupported` is not a failure), **identity**
 ([`identity.ts`](./bridge/mux/identity.ts) — five rules), and the **neutral key spelling**
@@ -47,6 +52,14 @@ visibly (M10/06) and a wrong `true` fails in the operator's hands.
 
 Declare less than you can build. An adapter that reads and types is a real adapter; the contract is
 what makes the rest addable later without a rewrite.
+
+**Two answers are not capabilities and you owe both anyway.** `MuxPane.focused` — the pane the
+operator's own terminal is showing — is on the floor, because every multiplexer knows it; only
+CHANGING it is a capability (`setFocus`), and a multiplexer that can bring a pane's container forward
+but cannot say which pane inside it ends up focused declares that ABSENT rather than half-keeping the
+promise (zellij is exactly that case). And `spaces: "one" | "many"` says how many spaces your
+multiplexer can hold — not how many exist today — so the UI can drop a level it does not have.
+Omitting it declares `"many"`, which is the harmless direction.
 
 ## What conformance demands
 
@@ -91,6 +104,7 @@ A fixture is a `MuxConformanceFixture`: `create()` hands back a **world** — yo
 | `renameOutOfBand()` | someone renames a pane in the multiplexer's own UI, not through Collie |
 | `changePane()` | the pane paints something new |
 | `endPane()` | the pane's process ends and the multiplexer forgets it |
+| `pokeTopologyOutOfBand()` | the herd's shape changes and **nothing announces it** — rename a tab in your fake world, emit no event. This is what proves `refresh()` |
 | `pokeTopology()` / `pokePane()` | announce a change on the event channel — **required if** you declare `pushTopologyEvents` / `pushPaneEvents` |
 | `close()` | tear it down; idempotent |
 

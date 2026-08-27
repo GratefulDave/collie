@@ -30,7 +30,12 @@ import type { AgentStatus } from "../types.ts";
 import type { MuxCapability, MuxCapabilityDeclaration } from "./capabilities.ts";
 import type { MuxIdentity } from "./identity.ts";
 
-export type { MuxCapability, MuxCapabilityDeclaration } from "./capabilities.ts";
+export type {
+  MuxCapability,
+  MuxCapabilityDeclaration,
+  MuxSpaceCapacity,
+  MuxTopologyLatency,
+} from "./capabilities.ts";
 export { declareCapabilities, MUX_CAPABILITIES, supportsCapability } from "./capabilities.ts";
 export type { MuxIdentity, MuxIdentityProblem } from "./identity.ts";
 export { checkIdentitySet, idsLostBetween, isValidMuxId } from "./identity.ts";
@@ -131,7 +136,19 @@ export interface MuxPane extends MuxIdentity {
   readonly tabLabel?: string;
   /** The pane's working directory. Empty when the multiplexer does not report one. */
   readonly cwd: string;
-  /** Whether the multiplexer's own UI has this pane focused. Read-only — Collie never sets focus. */
+  /**
+   * **The pane the operator's own terminal is showing.** Not "the pane Collie is showing", and not a
+   * pane Collie chose — it is a FACT about the multiplexer, read every snapshot.
+   *
+   * The phone never moves it as a side effect of navigation: a pane is focused because a human, or a
+   * named tap on the `setFocus` row, put it there. Every adapter answers this on the floor, because
+   * every multiplexer knows it; only *changing* it is a capability
+   * ({@link MuxAdapter.setFocus}).
+   *
+   * Focus is per-CLIENT on every multiplexer here, so "no client attached" is a real answer and the
+   * honest one is `false` on every pane. What each adapter reads it off is in MUX_CONTRACT.md
+   * § Contract-owned rules, with the probe.
+   */
   readonly focused: boolean;
   /** False once the pane's process has ended but its record survives. A send to it answers `gone`. */
   readonly alive: boolean;
@@ -145,9 +162,23 @@ export interface MuxPane extends MuxIdentity {
   readonly agent: string;
   /** How that agent is doing. `"unknown"` is the honest answer without `agentDetection`. */
   readonly status: AgentStatus;
-  /** The operator's own label for this pane, when set (`renamePane`). */
+  /**
+   * The operator's own label for this pane — ONLY a name given through Collie's {@link
+   * MuxAdapter.renamePane}, and never a title the pane's program printed.
+   *
+   * A multiplexer with one title slot (tmux, zellij) cannot tell the two apart from its listing, so
+   * its adapter remembers the labels it set itself and reports everything else as {@link
+   * terminalTitle}. The rule and what it costs after a restart: MUX_CONTRACT.md § Contract-owned
+   * rules, *Pane naming*.
+   */
   readonly paneLabel?: string;
-  /** What the pane's process says it is doing — its terminal title, when it says anything useful. */
+  /**
+   * What the pane's process says it is doing — its terminal title, when it says anything useful.
+   *
+   * The DEFAULT reading of a one-slot multiplexer's title: anything the adapter did not itself put
+   * there is the program's, because that is the honest way round. It may also be left over from a
+   * program that has since exited — see {@link foregroundCommand} and the bridge's staleness rule.
+   */
   readonly terminalTitle?: string;
   /**
    * The session the agent in this pane named, when it named one — the journal's key, and the reason
@@ -165,9 +196,18 @@ export interface MuxPane extends MuxIdentity {
    * The command name the multiplexer says is in this pane's foreground right now — tmux's
    * `pane_current_command`, zellij's `terminal_command`. Absent when the multiplexer reports none.
    *
-   * It is the RAW FACT the adapter already holds, reported as a raw fact. Exactly one module in the
-   * tree reads it (`bridge/beacon/hint.ts`), where it may become a sentence for the operator and
-   * nothing else: it never reaches {@link agent}, {@link status}, the session ref or the triage sort.
+   * It is the RAW FACT the adapter already holds, reported as a raw fact. Exactly TWO modules in the
+   * tree read it, and both spend it on presentation only — it never reaches {@link agent}, {@link
+   * status}, the session ref or the triage sort:
+   *
+   *  • `bridge/beacon/hint.ts`, where it may become a sentence for the operator.
+   *  • `bridge/state-engine.ts`, where "a shell in the foreground under a non-empty {@link
+   *    terminalTitle}" marks that title STALE — the title outlived the program that printed it
+   *    (MUX_CONTRACT.md § traps). The pane's name and status are unchanged by that mark; the phone
+   *    merely renders the title quietly instead of as the pane's name.
+   *
+   * It stops there. It does not go on the wire, because a process name arriving on the phone is the
+   * identity this field is not.
    *
    * **IT IS NOT IDENTITY, AND NOTHING MAY TREAT IT AS ONE.** {@link MuxPane.agent} carries the whole
    * reason: a wrong agent name picks a wrong harness grammar AND a wrong journal adapter, so the
@@ -286,6 +326,15 @@ export interface MuxSpaceRequest {
 // ── Learning that something changed ───────────────────────────────────────────
 
 /**
+ * Whether a phone is watching this collie right now.
+ *
+ * `watched` means a read arrived recently enough that somebody is plainly looking at the screen;
+ * `idle` means nobody is. The bridge decides which (bridge/state-engine.ts), and it is the ONLY
+ * thing the port carries about attention — not a device, not a count, not a session.
+ */
+export type MuxAttention = "watched" | "idle";
+
+/**
  * How a watcher is told to look again.
  *
  * THE PROMISE IS THE CONTRACT'S AND IT IS SMALL, on purpose: *after something changes, a callback
@@ -304,6 +353,19 @@ export interface MuxSpaceRequest {
 export interface MuxWatchOptions {
   /** Panes whose content/status to watch. Empty = topology only. */
   readonly panes: readonly string[];
+  /**
+   * Is somebody looking right now? Read by an adapter that CENSUSES, and ignored by one that pushes.
+   *
+   * A census costs a process and a round trip, so its cadence is a trade between an idle host and a
+   * watching operator — and the bridge is the only party that knows which of the two it is (a request
+   * arrived within the last few seconds). The port carries the fact, never the numbers: how much
+   * faster `watched` runs is the adapter's own decision, stated in its `topologyLatency` ceiling.
+   *
+   * A GETTER, not a value, and not a setter on the handle: the watch reads it exactly when it
+   * re-arms, so nothing has to be pushed at a subscription and no second lifecycle appears beside
+   * the one `close()` already owns. Absent ⇒ the adapter behaves as it did before attention existed.
+   */
+  attention?(): MuxAttention;
   /** Something about the pane/tab/space structure changed. Re-read the snapshot. */
   onTopologyChange(): void;
   /** This pane's content or status changed. Re-read it. */
@@ -358,6 +420,26 @@ export interface MuxAdapter {
   /** Every pane, space and tab of the configured target. The floor. */
   snapshot(): Promise<MuxSnapshot>;
 
+  /**
+   * **Look now.** Take one fresh listing and, if this adapter's watch is a census, reset it to its
+   * floor. After the returned promise resolves, the very next {@link snapshot} reflects the
+   * multiplexer's CURRENT topology.
+   *
+   * ON THE FLOOR, NOT A CAPABILITY, and the reason is that every multiplexer can already do it: it
+   * asks for nothing the adapter does not do on its own schedule anyway. What it buys is the
+   * schedule — an operator who just tapped, or just came back to the app, should not wait out a
+   * census interval to see a tab they renamed in their own terminal (ADR 0031).
+   *
+   * It CHANGES NOTHING. That is what lets `POST /api/refresh` be gated as a read and lets the live
+   * conformance probe call it against somebody's real session.
+   *
+   * It never throws for a multiplexer that is simply not answering — a refresh that could not happen
+   * is one stale interval, exactly like the poll it was trying to short-cut, and the disconnected
+   * banner already carries that news. An adapter whose snapshot is always a fresh round trip (Herdr)
+   * keeps this promise by resolving immediately, and says so in its own doc comment.
+   */
+  refresh(): Promise<void>;
+
   /** One pane's rendered screen. Needs `paneGrid`; `recent` past the viewport needs `gridScrollback`. */
   readGrid(paneId: string, request: MuxGridRequest): Promise<MuxOutcome<MuxGrid>>;
 
@@ -377,6 +459,23 @@ export interface MuxAdapter {
 
   /** Close a pane, ending what runs in it. Needs `closePane`. */
   closePane(paneId: string): Promise<MuxAck>;
+
+  /**
+   * Show this pane in the OPERATOR's terminal — after it resolves, {@link MuxPane.focused} is this
+   * pane. Needs `setFocus`.
+   *
+   * The one place the phone may move a human's screen, and it exists only behind a named tap ("Show
+   * in terminal"). Nothing else in the bridge or the web app may call it: navigating on the phone
+   * must never drag the desktop along ([ADR 0031](../../.adr/)).
+   *
+   * The promise is the WHOLE act. A multiplexer that can bring the pane's tab forward but cannot say
+   * which pane inside it ends up focused declares this ABSENT — a half-kept promise silently shows a
+   * neighbouring pane, which is the "degrade rather than lie" failure conformance exists to catch
+   * (zellij is exactly that case; see MUX_CONTRACT.md).
+   *
+   * A pane that has gone away answers `gone`, like every other pane-addressed call.
+   */
+  setFocus(paneId: string): Promise<MuxAck>;
 
   /** New tab in a space, opening a fresh shell. Needs `createTab`. */
   createTab(request: MuxTabRequest): Promise<MuxOutcome<MuxCreatedPane>>;

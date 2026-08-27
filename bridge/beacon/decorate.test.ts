@@ -58,6 +58,7 @@ class StubAdapter implements MuxAdapter {
   capabilities = declareCapabilities({
     supports: ["paneGrid", "typeText", "sendKeys"],
     notes: { agentDetection: "the adapter's own note", closePane: "untouched" },
+    topologyLatency: { kind: "push" },
   });
   readonly calls: RecordedCall[] = [];
   panes: MuxPane[] = [shellPane("%1"), shellPane("%2")];
@@ -70,6 +71,11 @@ class StubAdapter implements MuxAdapter {
   reachable(): Promise<boolean> {
     this.note("reachable");
     return Promise.resolve(true);
+  }
+
+  refresh(): Promise<void> {
+    this.note("refresh");
+    return Promise.resolve();
   }
 
   snapshot(): Promise<MuxSnapshot> {
@@ -100,6 +106,11 @@ class StubAdapter implements MuxAdapter {
   closePane(paneId: string) {
     this.note("closePane", paneId);
     return Promise.resolve(muxGone("gone"));
+  }
+
+  setFocus(paneId: string) {
+    this.note("setFocus", paneId);
+    return Promise.resolve(muxAck());
   }
 
   createTab(request: MuxTabRequest) {
@@ -179,13 +190,13 @@ async function paneOf(adapter: MuxAdapter, paneId: string): Promise<MuxPane> {
 describe("withAgentBeacons refuses an adapter that already sees", () => {
   test("an adapter declaring agentDetection is refused at construction", () => {
     const adapter = new StubAdapter();
-    adapter.capabilities = declareCapabilities({ supports: ["agentDetection"] });
+    adapter.capabilities = declareCapabilities({ supports: ["agentDetection"], topologyLatency: { kind: "push" } });
     expect(() => decorate(adapter, [])).toThrow(/already declares agentDetection/u);
   });
 
   test("an adapter declaring agentSessionRef is refused at construction", () => {
     const adapter = new StubAdapter();
-    adapter.capabilities = declareCapabilities({ supports: ["agentSessionRef"] });
+    adapter.capabilities = declareCapabilities({ supports: ["agentSessionRef"], topologyLatency: { kind: "push" } });
     expect(() => decorate(adapter, [])).toThrow(/already declares agentSessionRef/u);
   });
 });
@@ -216,11 +227,13 @@ describe("a decorator preserves the adapter's whole surface", () => {
     logo: true,
     reachable: true,
     snapshot: true,
+    refresh: true,
     readGrid: true,
     typeText: true,
     sendKeys: true,
     renamePane: true,
     closePane: true,
+    setFocus: true,
     createTab: true,
     renameTab: true,
     closeTab: true,
@@ -299,6 +312,7 @@ describe("everything but capabilities and snapshot is a pass-through", () => {
     await decorated.sendKeys("%1", ["ctrl+c"]);
     await decorated.renamePane("%1", null);
     await decorated.closePane("%1");
+    await decorated.setFocus("%1");
     await decorated.createTab({ spaceId: "space" });
     await decorated.renameTab("tab", "label");
     await decorated.closeTab("tab");
@@ -312,6 +326,7 @@ describe("everything but capabilities and snapshot is a pass-through", () => {
       { method: "sendKeys", args: ["%1", ["ctrl+c"]] },
       { method: "renamePane", args: ["%1", null] },
       { method: "closePane", args: ["%1"] },
+      { method: "setFocus", args: ["%1"] },
       { method: "createTab", args: [{ spaceId: "space" }] },
       { method: "renameTab", args: ["tab", "label"] },
       { method: "closeTab", args: ["tab"] },

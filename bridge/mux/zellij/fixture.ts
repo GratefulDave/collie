@@ -150,6 +150,33 @@ export class FakeZellij implements ZellijExec {
     await Promise.resolve();
   }
 
+  /**
+   * The PROGRAM in a pane prints a title. The same one slot `rename-pane` writes — which is the whole
+   * hazard, and why the adapter has to remember what it set rather than read the slot.
+   */
+  async setProgramTitle(paneId: string, title: string): Promise<void> {
+    const pane = this.paneAt(paneId);
+    if (pane !== undefined) pane.title = title;
+    await Promise.resolve();
+  }
+
+  /**
+   * The OPERATOR moves their own focus, in zellij itself.
+   *
+   * Two levels, because zellij reports two: the pane becomes its TAB's focused one (each tab keeps
+   * its own), and that tab becomes the active one — which is what an attached client's view is. The
+   * pair is exactly what the adapter ANDs together to answer `MuxPane.focused`.
+   */
+  async focusOutOfBand(paneId: string): Promise<void> {
+    await Promise.resolve();
+    const target = this.paneAt(paneId);
+    if (target === undefined) return;
+    for (const pane of this.panes) {
+      if (pane.tabNumber === target.tabNumber) pane.focused = pane.paneId === target.paneId;
+    }
+    for (const tab of this.tabs) tab.active = tab.tabNumber === target.tabNumber;
+  }
+
   /** The pane paints another line. What a keystroke landing would have done. */
   async changePane(paneId: string): Promise<void> {
     this.repaint(paneId);
@@ -169,6 +196,18 @@ export class FakeZellij implements ZellijExec {
     for (const stream of this.streams) {
       if (stream.paneIds.includes(paneId)) this.emitTo(stream, { event: "pane_closed", pane_id: paneId });
     }
+    await Promise.resolve();
+  }
+
+  /**
+   * The operator renames a tab in zellij itself.
+   *
+   * On zellij EVERY topology change is out of band — the CLI announces none of them — so this is not
+   * a special case here, it is the only case. It is what `refresh()` exists for on this adapter.
+   */
+  async pokeTopologyOutOfBand(): Promise<void> {
+    const tab = this.tabs[0];
+    if (tab !== undefined) tab.name = `out-of-band-${String(this.tabs.length)}`;
     await Promise.resolve();
   }
 
@@ -471,8 +510,11 @@ export function zellijWorld(fake: FakeZellij): ZellijFixtureWorld {
       reconnect: () => fake.reconnect(),
       restartMux: () => fake.restartMux(),
       renameOutOfBand: (paneId, label) => fake.renameOutOfBand(paneId, label),
+      setProgramTitle: (paneId, title) => fake.setProgramTitle(paneId, title),
+      focusOutOfBand: (paneId) => fake.focusOutOfBand(paneId),
       changePane: (paneId) => fake.changePane(paneId),
       endPane: (paneId) => fake.endPane(paneId),
+      pokeTopologyOutOfBand: () => fake.pokeTopologyOutOfBand(),
       pokePane: (paneId) => fake.pokePane(paneId),
       close: () => {
         fake.shutdown();

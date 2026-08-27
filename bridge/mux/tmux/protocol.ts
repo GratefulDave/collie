@@ -25,6 +25,7 @@ export const SEP = "\u001f";
 const SESSION_TAG = "S";
 const WINDOW_TAG = "W";
 const PANE_TAG = "P";
+const CLIENT_TAG = "C";
 
 /**
  * One tmux session — what Collie calls a SPACE (adapter.ts documents the mapping).
@@ -75,11 +76,37 @@ export interface TmuxPaneRecord {
   readonly currentCommand: string;
 }
 
+/**
+ * One client attached to the server — a terminal somebody is (or is not) looking at.
+ *
+ * Listed for exactly one question: WHICH SESSION IS THE OPERATOR'S SCREEN SHOWING. tmux's own
+ * `session_attached` cannot answer it, because this adapter's watch attaches control clients of its
+ * own and they would count as an operator. `client_control_mode` is what tells the two apart —
+ * probed 2026-08-25 against the live test server, where Collie's own watcher reported `1` and the
+ * two real terminals reported `0`.
+ */
+export interface TmuxClient {
+  readonly sessionId: string;
+  /** A `tmux -C` client — Collie's own watch is one of these, and it is nobody's screen. */
+  readonly control: boolean;
+  /** tmux's last-activity stamp for this client. Orders two real terminals; nothing more. */
+  readonly activity: number;
+  /**
+   * `client_tty` — the terminal this client is, e.g. `/dev/pts/3`. tmux's own name for a client, and
+   * the ONLY way to address one: `switch-client -c <tty>`. Read because a client attached to another
+   * session keeps showing that session however the target session's own current window moves
+   * (adapter.ts § setFocus).
+   */
+  readonly tty: string;
+}
+
 /** Everything one listing call returned. */
 export interface TmuxListing {
   readonly sessions: readonly TmuxSession[];
   readonly windows: readonly TmuxWindow[];
   readonly panes: readonly TmuxPaneRecord[];
+  /** Attached clients. EMPTY is a real answer: a detached server nobody is looking at. */
+  readonly clients: readonly TmuxClient[];
 }
 
 const SESSION_FORMAT = [SESSION_TAG, "#{session_id}", "#{session_windows}", "#{session_activity}", "#{session_name}"].join(SEP);
@@ -108,6 +135,9 @@ const PANE_FORMAT = [
   "#{pane_current_command}",
   "#{pane_title}",
 ].join(SEP);
+const CLIENT_FORMAT = [CLIENT_TAG, "#{client_session}", "#{client_control_mode}", "#{client_activity}", "#{client_tty}"].join(
+  SEP,
+);
 
 /**
  * The one invocation that answers `snapshot()`.
@@ -133,6 +163,13 @@ export const LISTING_ARGS: readonly string[] = [
   "-a",
   "-F",
   PANE_FORMAT,
+  ";",
+  // The fourth section, and it costs nothing: the same spawn now also says which sessions a REAL
+  // terminal is attached to, which is the only way "focused" can mean the operator's screen rather
+  // than this adapter's own control clients (see {@link TmuxClient}).
+  "list-clients",
+  "-F",
+  CLIENT_FORMAT,
 ];
 
 /** The `-F` a create call asks for, so a fresh pane's identity comes back on the same round trip. */
@@ -176,6 +213,7 @@ export function parseListing(stdout: string): TmuxListing {
   const sessions: TmuxSession[] = [];
   const windows: TmuxWindow[] = [];
   const panes: TmuxPaneRecord[] = [];
+  const clients: TmuxClient[] = [];
   for (const line of stdout.split("\n")) {
     if (line.length === 0) continue;
     if (line.startsWith(SESSION_TAG + SEP)) {
@@ -196,6 +234,15 @@ export function parseListing(stdout: string): TmuxListing {
         autoNamed: flag(auto),
         name: name ?? "",
       });
+      continue;
+    }
+    if (line.startsWith(CLIENT_TAG + SEP)) {
+      // `client_session` is the session's NAME on tmux 3.6b, not its `$N` id — probed 2026-08-25,
+      // where it read `collie-tmux`. The caller resolves it against the sessions of this same
+      // listing rather than assuming either shape.
+      const [, session, control, activity, tty] = fields(line, 5);
+      if (session === undefined || session.length === 0) continue;
+      clients.push({ sessionId: session, control: flag(control), activity: num(activity), tty: tty ?? "" });
       continue;
     }
     if (!line.startsWith(PANE_TAG + SEP)) continue;
@@ -219,7 +266,7 @@ export function parseListing(stdout: string): TmuxListing {
       title: title ?? "",
     });
   }
-  return { sessions, windows, panes };
+  return { sessions, windows, panes, clients };
 }
 
 /** Parse the one line a `-P -F` create call prints, or null when tmux printed something else. */
@@ -240,10 +287,20 @@ export function parseCreated(stdout: string): TmuxCreated | null {
 const MISSING_TARGET = /can't find (?:pane|window|session|client)|(?:pane|window|session) not found/iu;
 
 /**
- * tmux is not answering at all: no server on that socket, or no binary to ask with. The contract's
- * `unreachable` — the only refusal worth retrying, and what drives the connected banner.
+ * tmux is not answering at all: no server on that socket, no binary to ask with — or a server that
+ * was answering when the call started and DIED while it ran. The contract's `unreachable` — the only
+ * refusal worth retrying, and what drives the connected banner.
+ *
+ * `server exited unexpectedly` and `lost server` are that last case, and they are the reason this
+ * list is not only about a server that was already absent: the client prints them when the socket
+ * goes away mid-command (a segfaulted server — see the #4849 guard in adapter.ts — or an operator's
+ * `kill-server`). Read as `refused` they would put a red "the tab couldn't be created" in front of an
+ * operator whose whole tmux is gone; read as `unreachable` they raise the disconnected banner and its
+ * retry, which is the true story. The contract owns this rule for every adapter (MUX_CONTRACT.md
+ * § Contract-owned rules).
  */
-const NO_SERVER = /no server running|error connecting|no such file or directory|failed to connect|no tmux binary/iu;
+const NO_SERVER =
+  /no server running|error connecting|no such file or directory|failed to connect|no tmux binary|server exited unexpectedly|lost server/iu;
 
 /** Whether this stderr says the addressed pane/window/session has gone away. */
 export function saysMissing(stderr: string): boolean {

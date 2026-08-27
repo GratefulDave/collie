@@ -128,6 +128,17 @@ export class FakeHerdr implements HerdrRpc {
     await Promise.resolve();
   }
 
+  /**
+   * The PROGRAM in a pane prints an OSC title. Herdr keeps it in its OWN field, so this fixture is
+   * the one that shows what a two-slot multiplexer gets for free: the operator's `label` is not
+   * touched, and the adapter needs no memory to keep the two apart.
+   */
+  async setProgramTitle(paneId: string, title: string): Promise<void> {
+    const pane = this.panes.find((candidate) => candidate.pane_id === paneId);
+    if (pane !== undefined) pane.terminal_title = title;
+    await Promise.resolve();
+  }
+
   /** The pane paints another line. What a keystroke landing would have done. */
   async changePane(paneId: string): Promise<void> {
     const pane = this.panes.find((candidate) => candidate.pane_id === paneId);
@@ -143,6 +154,13 @@ export class FakeHerdr implements HerdrRpc {
   async endPane(paneId: string): Promise<void> {
     this.panes = this.panes.filter((pane) => pane.pane_id !== paneId);
     this.screens.delete(paneId);
+    await Promise.resolve();
+  }
+
+  /** The operator renames a tab in Herdr's own TUI, with the event stream saying nothing. */
+  async pokeTopologyOutOfBand(): Promise<void> {
+    const tab = this.tabs[0];
+    if (tab !== undefined) tab.label = `out-of-band-${String(this.tabs.length)}`;
     await Promise.resolve();
   }
 
@@ -230,6 +248,20 @@ export class FakeHerdr implements HerdrRpc {
   async closePane(paneId: string): Promise<void> {
     this.pane("pane.close", paneId);
     await this.endPane(paneId);
+  }
+
+  /**
+   * Focus one pane — and exactly one, across the whole herd.
+   *
+   * The real server moves the tab and the workspace with the pane (client.ts § focusPane), and the
+   * fixture's tabs and workspaces carry their own `focused` flags, so both are moved here too. Anything
+   * less would let an adapter pass conformance while leaving two panes claiming the operator's screen.
+   */
+  async focusPane(paneId: string): Promise<void> {
+    const target = this.pane("pane.focus", paneId);
+    for (const pane of this.panes) pane.focused = pane.pane_id === target.pane_id;
+    for (const tab of this.tabs) tab.focused = tab.tab_id === target.tab_id;
+    for (const workspace of this.workspaces) workspace.focused = workspace.workspace_id === target.workspace_id;
   }
 
   async createTab(workspaceId: string, opts: { label?: string; cwd?: string } = {}): Promise<CreatedShell> {
@@ -414,8 +446,13 @@ export const herdrConformanceFixture: MuxConformanceFixture = {
       reconnect: () => fake.reconnect(),
       restartMux: () => fake.restartMux(),
       renameOutOfBand: (paneId, label) => fake.renameOutOfBand(paneId, label),
+      setProgramTitle: (paneId, title) => fake.setProgramTitle(paneId, title),
+      // The operator moves focus in their own TUI. Herdr's own `pane.focus` does exactly this, so the
+      // perturbation is the same state change arriving without Collie having asked for it.
+      focusOutOfBand: (paneId) => fake.focusPane(paneId),
       changePane: (paneId) => fake.changePane(paneId),
       endPane: (paneId) => fake.endPane(paneId),
+      pokeTopologyOutOfBand: () => fake.pokeTopologyOutOfBand(),
       pokeTopology: () => fake.pokeTopology(),
       pokePane: (paneId) => fake.pokePane(paneId),
       close: () => {

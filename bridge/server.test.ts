@@ -13,6 +13,7 @@ import {
   guard,
   historyParams,
   isHostAllowed,
+  isLoopbackPeer,
   isReservedAuthPath,
   keysPane,
   normalizeTabLabel,
@@ -76,16 +77,24 @@ function cfg(overrides: Partial<Config> = {}): Config {
       codex: ["/nope/codex"],
       pi: ["/nope/pi"],
       opencode: ["/nope/opencode"],
+      grok: ["/nope/grok"],
     },
     submitKeys: ["Enter"],
     commandsFile: "/nope/commands.toml",
     keysFile: "/nope/keys.toml",
+    quickRepliesFile: "/nope/quick-replies.toml",
     trustedUser: "",
+    trustedUserOptional: false,
     auditContent: "preview",
     deviceHeader: "",
     deviceAllowlist: [],
     allowedOrigins: [],
     publicHosts: [],
+    tailscaleHosts: [],
+    // Test default is permissive Host so CSRF/identity cases are not also host-rejected.
+    // Product default is allowAnyHost: false (fail-closed).
+    allowAnyHost: true,
+    allowNonLoopbackBind: false,
     vapidPublic: "",
     vapidPrivate: "",
     vapidSubject: "mailto:admin@example.com",
@@ -172,10 +181,20 @@ describe("checkAccess — Tailscale identity gate", () => {
       reason: "identity required",
     });
   });
+
+  test("missing header is accepted when skipServe (no injector)", () => {
+    const c = cfg({ trustedUser: "me@example.com", skipServe: true });
+    expect(checkAccess(req({ host: "h" }), c)).toEqual({ ok: true });
+  });
+
+  test("missing header is accepted when trustedUserOptional", () => {
+    const c = cfg({ trustedUser: "me@example.com", trustedUserOptional: true });
+    expect(checkAccess(req({ host: "h" }), c)).toEqual({ ok: true });
+  });
 });
 
 describe("checkAccess — Host-header validation (COLLIE_PUBLIC_HOSTS)", () => {
-  const c = cfg({ publicHosts: ["collie.example.ts.net"] });
+  const c = cfg({ allowAnyHost: false, publicHosts: ["collie.example.ts.net"] });
 
   test("DNS-rebinding: Origin==Host==evil host is rejected once publicHosts is set", () => {
     expect(
@@ -211,11 +230,52 @@ describe("checkAccess — Host-header validation (COLLIE_PUBLIC_HOSTS)", () => {
     ).toEqual({ ok: true });
   });
 
-  test("empty publicHosts keeps legacy behaviour (Host==Origin==evil still passes reads)", () => {
-    // Without opting in, an evil host that also sets a matching Origin passes the bare same-origin
-    // check — the documented legacy hole COLLIE_PUBLIC_HOSTS closes. Proves the default is unchanged.
+  test("empty publicHosts is fail-closed: Host==Origin==evil is rejected", () => {
+    const defaultCfg = cfg({ allowAnyHost: false });
     expect(
-      checkAccess(req({ origin: "https://evil.example.com", host: "evil.example.com" }), cfg()),
+      checkAccess(req({ origin: "https://evil.example.com", host: "evil.example.com" }), defaultCfg),
+    ).toEqual({ ok: false, reason: "host not allowed" });
+  });
+
+  test("allowAnyHost opt-out restores permissive Host validation", () => {
+    expect(
+      checkAccess(
+        req({ origin: "https://evil.example.com", host: "evil.example.com" }),
+        cfg({ allowAnyHost: true }),
+      ),
+    ).toEqual({ ok: true });
+  });
+
+  // The gate the product actually ships: allowAnyHost off, and the whole way through guard() at
+  // write level — a Host check that passes checkAccess but is not wired into the write path would
+  // pass every test above and still let a rebound name type into a terminal.
+  test("the shipped fail-closed default rejects an unlisted Host and admits an allowed one", () => {
+    const shipped = cfg({ allowAnyHost: false, tailscaleHosts: ["collie.example.ts.net"] });
+    const denied = guard(
+      req({ origin: "https://evil.example.com", host: "evil.example.com" }),
+      shipped,
+      "write",
+    );
+    expect(denied?.status).toBe(403);
+    expect(
+      guard(
+        req({ origin: "https://collie.example.ts.net", host: "collie.example.ts.net" }),
+        shipped,
+        "write",
+      ),
+    ).toBeNull();
+  });
+
+  test("a discovered Tailscale host is allowed without COLLIE_PUBLIC_HOSTS", () => {
+    const c2 = cfg({
+      allowAnyHost: false,
+      tailscaleHosts: ["collie.example.ts.net"],
+    });
+    expect(
+      checkAccess(
+        req({ origin: "https://collie.example.ts.net", host: "collie.example.ts.net" }),
+        c2,
+      ),
     ).toEqual({ ok: true });
   });
 });
@@ -323,6 +383,7 @@ describe("sendReplySteps — two-step send & partial-failure clarity", () => {
       ok: false,
       textDelivered: true,
       error: "typed into the pane but not submitted — check the pane before resending",
+      code: "reply.not_submitted",
     });
     expect(client.calls).toEqual(["text", "keys"]);
   });
@@ -330,14 +391,28 @@ describe("sendReplySteps — two-step send & partial-failure clarity", () => {
   test("text step fails → nothing delivered, surfaces Herdr's message (safe to resend)", async () => {
     const client = new FakeClient("text");
     const out = await sendReplySteps(client, "p1", "hello", true, ["Enter"], noSleep);
-    expect(out).toEqual({ ok: false, textDelivered: false, error: "text rejected" });
+    // The English is byte-for-byte the multiplexer's own words, as it always was; `code` and
+    // `detail.reason` are the machine half the phone translates against (bridge/error-codes.ts).
+    expect(out).toEqual({
+      ok: false,
+      textDelivered: false,
+      error: "text rejected",
+      code: "reply.send_failed",
+      detail: { reason: "text rejected" },
+    });
     expect(client.calls).toEqual(["text"]); // never reached the keys step
   });
 
   test("submit-only (empty text) failure is a plain failure, not the partial-delivery message", async () => {
     const client = new FakeClient("keys");
     const out = await sendReplySteps(client, "p1", "", true, ["Enter"], noSleep);
-    expect(out).toEqual({ ok: false, textDelivered: false, error: "keys rejected" });
+    expect(out).toEqual({
+      ok: false,
+      textDelivered: false,
+      error: "keys rejected",
+      code: "reply.send_failed",
+      detail: { reason: "keys rejected" },
+    });
     expect(client.calls).toEqual(["keys"]); // no text typed
   });
 
@@ -576,6 +651,24 @@ describe("pane write prompt binding", () => {
     expect(await res.json()).toMatchObject({ ok: false, code: "prompt_changed" });
     expect(client.keys).toEqual([]);
     expect(client.texts).toEqual([]);
+  });
+
+  test("a refused key batch carries the multiplexer's words AND a code the phone can translate", async () => {
+    // The refusal an operator actually meets: the words are the multiplexer's, so they stay byte for
+    // byte what they were, and the machine half rides beside them (bridge/error-codes.ts). A client
+    // with no translation shows `error`; one with a translation reads `code` and quotes
+    // `detail.reason`.
+    const client = new FakePaneClient();
+    client.sendPaneKeys = () => Promise.reject(new Error("no such pane"));
+    const { audit } = auditEntries();
+    const res = await keysPane(asMux(client), cfg(), "w1:p1", request({ keys: ["1"] }), audit, null, "default");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: false,
+      error: "no such pane",
+      code: "keys.send_failed",
+      detail: { reason: "no such pane" },
+    });
   });
 
   test("rejects oversized and non-string expected_prompt before a keys write", async () => {
@@ -997,9 +1090,9 @@ describe("parseSnoozeRequest — absence is not null", () => {
 describe("startupWarnings — security-posture nags", () => {
   const has = (ws: string[], needle: string) => ws.some((w) => w.includes(needle));
 
-  test("skipServe + trustedUser: warns the proxy must inject the mandatory identity", () => {
+  test("skipServe + trustedUser: warns the identity gate is inert and points at the device header", () => {
     const ws = startupWarnings(cfg({ skipServe: true, trustedUser: "me@example.com" }));
-    expect(has(ws, "requires the reverse proxy to inject")).toBe(true);
+    expect(has(ws, "COLLIE_TRUSTED_USER has no effect")).toBe(true);
     expect(has(ws, "COLLIE_DEVICE_HEADER")).toBe(true);
     // The pointer must name the doc the variant actually lives in — B–E moved to DEPLOYMENT.md in
     // 0.31.0, while Variant A stayed in the README (pinned in the empty-trustedUser test below).
@@ -1024,16 +1117,62 @@ describe("startupWarnings — security-posture nags", () => {
     expect(has(ws, "COLLIE_TRUSTED_USER")).toBe(false);
   });
 
-  test("empty publicHosts: the Host-validation warning fires and no longer names COLLIE_SERVE_MODE", () => {
-    const ws = startupWarnings(cfg({ publicHosts: [] }));
-    expect(has(ws, "COLLIE_PUBLIC_HOSTS is empty")).toBe(true);
-    // The reworded clause must not reference the script-only COLLIE_SERVE_MODE var.
+  test("empty publicHosts and no discovered hosts: warns that only loopback Host is allowed", () => {
+    const ws = startupWarnings(
+      cfg({ allowAnyHost: false, publicHosts: [], tailscaleHosts: [], allowedOrigins: [] }),
+    );
+    expect(has(ws, "no non-loopback Host is allowed")).toBe(true);
     expect(has(ws, "COLLIE_SERVE_MODE")).toBe(false);
   });
 
-  test("populated publicHosts: no Host-validation warning", () => {
-    const ws = startupWarnings(cfg({ publicHosts: ["collie.example.ts.net"] }));
-    expect(has(ws, "COLLIE_PUBLIC_HOSTS")).toBe(false);
+  test("populated publicHosts: no empty-allowlist Host warning", () => {
+    const ws = startupWarnings(cfg({ allowAnyHost: false, publicHosts: ["collie.example.ts.net"] }));
+    expect(has(ws, "no non-loopback Host is allowed")).toBe(false);
+  });
+
+  test("allowAnyHost: warns that Host validation is OFF", () => {
+    const ws = startupWarnings(cfg({ allowAnyHost: true }));
+    expect(has(ws, "COLLIE_ALLOW_ANY_HOST=1")).toBe(true);
+  });
+
+  test("trustedUserOptional: warns the identity gate accepts an absent header", () => {
+    const ws = startupWarnings(cfg({ trustedUser: "me@example.com", trustedUserOptional: true }));
+    expect(has(ws, "COLLIE_TRUSTED_USER_OPTIONAL=1")).toBe(true);
+  });
+
+  test("wide bind via the escape hatch: warns the gates are client-settable", () => {
+    const ws = startupWarnings(cfg({ host: "0.0.0.0", allowNonLoopbackBind: true }));
+    expect(has(ws, "COLLIE_ALLOW_NON_LOOPBACK_BIND")).toBe(true);
+  });
+});
+
+describe("isLoopbackPeer", () => {
+  test("loopback IPv4, IPv6, and v4-mapped forms pass; LAN and public fail", () => {
+    expect(isLoopbackPeer("127.0.0.1")).toBe(true);
+    expect(isLoopbackPeer("127.5.5.5")).toBe(true);
+    expect(isLoopbackPeer("::1")).toBe(true);
+    expect(isLoopbackPeer("::ffff:127.0.0.1")).toBe(true);
+    expect(isLoopbackPeer(null)).toBe(true);
+    expect(isLoopbackPeer("10.0.0.1")).toBe(false);
+    expect(isLoopbackPeer("192.168.1.1")).toBe(false);
+    expect(isLoopbackPeer("8.8.8.8")).toBe(false);
+  });
+
+  // The check's POSITION is the carve-out, and position is not something a pure function can carry.
+  // `bun test` cannot stand up `Bun.serve` (CLAUDE.md), so the ordering is pinned by reading the one
+  // source that registers it — the same idiom solo-baseline.test.ts uses for the route table.
+  //
+  // Why it matters: a pack peer binds off loopback by construction and its lead dials it from
+  // another machine (PACK_PROTOCOL.md §3, ADR 0013). Were this check first, every `/pack/v1/*` call
+  // would be refused before the surface that actually admits it — pinned mutual TLS plus the pack
+  // secret — ever ran, and the pack link would be dead on a peer.
+  test("the peer check runs AFTER the federated surface, so /pack/v1/* is never refused by it", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const dispatch = src.indexOf("const packed = await packHandler(req, url);");
+    const peerCheck = src.indexOf("isLoopbackPeer(server.requestIP(req)?.address)");
+    expect(dispatch).toBeGreaterThan(-1);
+    expect(peerCheck).toBeGreaterThan(-1);
+    expect(peerCheck).toBeGreaterThan(dispatch);
   });
 });
 
@@ -1202,6 +1341,7 @@ describe("muxConfigBody — the capability declaration, as the phone reads it", 
     supports: [...MUX_CAPABILITIES],
     unsupportedKeys: ["PageUp", "End"],
     notes: { gridScrollback: "developer prose about a capability this adapter HAS" },
+    topologyLatency: { kind: "push" },
   });
   const partial = declareCapabilities({
     supports: ["paneGrid", "typeText", "sendKeys"],
@@ -1209,6 +1349,7 @@ describe("muxConfigBody — the capability declaration, as the phone reads it", 
       agentSessionRef: "a multiplexer keeps no agent session log for Collie to read.",
       createSpace: "one collie drives one session here, so a new one would not appear at all.",
     },
+    topologyLatency: { kind: "bounded", ms: 12_000 },
   });
 
   test("capabilities are TOTAL — every name answered, so nothing reads as absent by omission", () => {
@@ -1229,6 +1370,18 @@ describe("muxConfigBody — the capability declaration, as the phone reads it", 
     expect(muxConfigBody({ mux: "reference", capabilities: everything }).notes).toEqual({});
     const notes = muxConfigBody({ mux: "partial", capabilities: partial }).notes;
     expect(Object.keys(notes).toSorted()).toEqual(["agentSessionRef", "createSpace"]);
+  });
+
+  test("how many spaces the multiplexer can hold rides too, and defaults to `many`", () => {
+    // `partial` declares nothing about spaces, and the wire says `many` — the fail-open direction,
+    // where at worst a space strip shows one chip instead of hiding navigation that exists.
+    expect(muxConfigBody({ mux: "partial", capabilities: partial }).spaces).toBe("many");
+    const single = declareCapabilities({
+      supports: ["paneGrid"],
+      spaces: "one",
+      topologyLatency: { kind: "push" },
+    });
+    expect(muxConfigBody({ mux: "single", capabilities: single }).spaces).toBe("one");
   });
 
   test("the name and the refused keys ride verbatim", () => {
@@ -1324,7 +1477,7 @@ describe("muxLogoResponse — serving an adapter's mark", () => {
 
 describe("bridgeConfigBody — the mux block is appended, never reordering what came before", () => {
   const base = { push: true, vapidPublicKey: "BKey", build: "abc123", mode: "solo" } as const;
-  const mux = { mux: "reference", capabilities: declareCapabilities({ supports: ["paneGrid"] }) };
+  const mux = { mux: "reference", capabilities: declareCapabilities({ supports: ["paneGrid"], topologyLatency: { kind: "push" } }) };
 
   test("no adapter in hand: no key at all, which a client reads as an older bridge", () => {
     expect("mux" in bridgeConfigBody({ ...base })).toBe(false);
@@ -1449,21 +1602,27 @@ describe("the host gate — `?host=` selects among enrolled members and nothing 
     // The load-bearing claim: `?h=laptop` + `w1:p1` must never be served the DESK's `w1:p1`, and
     // pane ids collide across machines, so a fall-through here is a cross-host write.
     //
-    // All four session-scoped routes (tab create, workspace create, tab action, the pane family)
-    // reach their runtime through the caller's resolver and nothing else.
-    expect([...src.matchAll(/await caller\.resolve\(\);/g)]).toHaveLength(4);
-    // Exactly four `registry.get(` calls remain, and each is a sanctioned one, named here rather
+    // All FIVE session-scoped routes (tab create, workspace create, tab action, the pane family,
+    // and "look now") reach their runtime through the caller's resolver and nothing else.
+    expect([...src.matchAll(/await caller\.resolve\(\);/g)]).toHaveLength(5);
+    // Exactly five `registry.get(` calls remain, and each is a sanctioned one, named here rather
     // than exempted: assembling THIS collie's own snapshot body; `localRuntime`, the single
     // "(session) → runtime, or 404" helper both callers share; `/api/config`, which reports THIS
-    // collie's own multiplexer (M10/06) and is not session-scoped at all; and `/api/mux/logo.svg`,
+    // collie's own multiplexer (M10/06) and is not session-scoped at all; `/api/mux/logo.svg`,
     // which serves that same local multiplexer's mark and is session-scoped no more than the config
-    // that publishes its URL. A fifth would be a route reaching past the gate.
-    expect([...src.matchAll(/registry\.get\(/g)]).toHaveLength(4);
+    // that publishes its URL; and the attention stamp on `/api/snapshot`, which is a fact about
+    // THIS collie's own engine on a route that is already local-body-then-merge and has no `?h=`
+    // branch to fall through. A sixth would be a route reaching past the gate.
+    expect([...src.matchAll(/registry\.get\(/g)]).toHaveLength(5);
     // The mux read is a read of the LOCAL primary — never `?host=`, because a peer's capabilities
     // are its own business and reach the lead over the pack API, never out of this registry.
     expect(src).toContain("const activeMux = registry.get();");
-    // An unknown or ill-formed host is a 404, mirroring unknownSession() (§4)…
-    expect(src).toMatch(/`unknown host: \$\{host\.kind === "member" \? host\.id : host\.raw\}`/);
+    // An unknown or ill-formed host is a 404, mirroring unknownSession() (§4)… The words now come
+    // from the error catalogue (bridge/error-codes.ts), so what this pins is the SELECTION — that
+    // both host shapes still name themselves in the refusal, and both still land on `host.unknown`.
+    expect(src).toContain(
+      'apiError("host.unknown", { host: host.kind === "member" ? host.id : host.raw })',
+    );
     // …and a KNOWN peer is forwarded, with the peer's own response handed back (§5, §9.1). The
     // forward is the gate's own branch — no route may grow a second one.
     expect([...src.matchAll(/packLead!\.forward\(/g)]).toHaveLength(1);
