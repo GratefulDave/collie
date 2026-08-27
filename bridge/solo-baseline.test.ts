@@ -285,6 +285,10 @@ const PANE_WIRE_KEYS = {
   // carries a host: like the fields above it is optional-and-absent when the pane has no meaningful
   // title, and no golden byte moved.
   terminalTitle: true,
+  // Also not a pack dimension: a presentation flag on the field above, set only when the title
+  // outlived the program that printed it. Absent on every pane in this baseline, so no golden byte
+  // moved.
+  terminalTitleStale: true,
   // Also not a pack dimension: an optional sentence the bridge composes for one kind of pane
   // (M11/05). Absent on every pane in this baseline, so no golden byte moved.
   hint: true,
@@ -374,6 +378,7 @@ describe("solo zero-tax — wire shapes carry no pack dimension", () => {
       "tabId",
       "tabLabel",
       "terminalTitle",
+      "terminalTitleStale",
       "workspaceId",
       "workspaceLabel",
       "workspaceNumber",
@@ -498,7 +503,9 @@ describe("solo zero-tax — routes", () => {
   test("server.ts registers exactly today's routes", () => {
     expect(declaredRoutes()).toEqual([
       "/",
-      "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history))?$/",
+      // `focus` is the pane action that moves the OPERATOR's own terminal, and it is named here for
+      // the reason every other one is: a route arrives on purpose or it does not arrive.
+      "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history|focus))?$/",
       "/^\\/api\\/tab\\/([^/]+)\\/(rename|close)$/",
       "/api/config",
       // Device pairing (bridge/pairing.ts) — a SOLO feature that legitimately extends this list.
@@ -508,7 +515,15 @@ describe("solo zero-tax — routes", () => {
       "/api/notifications/prefs",
       "/api/notifications/snooze",
       "/api/pair",
+      // "Look now" (ADR 0031) — a SOLO route that legitimately extends this list, named here rather
+      // than exempted. It is session-scoped and read-gated, and it registers no pack route of its
+      // own: a lead reaches a peer's through the peer's existing `/pack/v1/*` dispatch.
+      "/api/refresh",
       "/api/snapshot",
+      // Speech-to-text (bridge/stt/) — a SOLO feature that legitimately extends this list, named
+      // here rather than exempted, exactly as device pairing is. It is off until an operator
+      // configures a provider, and it registers no pack route.
+      "/api/stt",
       "/api/subscribe",
       "/api/tab",
       "/api/update/check",
@@ -536,6 +551,7 @@ const CONFIG_KEYS = {
   auditContent: true,
   commandsFile: true,
   keysFile: true,
+  quickRepliesFile: true,
   port: true,
   host: true,
   unixSocket: true,
@@ -547,10 +563,14 @@ const CONFIG_KEYS = {
   journalRoots: true,
   submitKeys: true,
   trustedUser: true,
+  trustedUserOptional: true,
   deviceHeader: true,
   deviceAllowlist: true,
   allowedOrigins: true,
   publicHosts: true,
+  tailscaleHosts: true,
+  allowAnyHost: true,
+  allowNonLoopbackBind: true,
   vapidPublic: true,
   vapidPrivate: true,
   vapidSubject: true,
@@ -563,6 +583,8 @@ describe("solo zero-tax — config", () => {
   test("Config carries no pack/peer/lead key", () => {
     const keys = Object.keys(CONFIG_KEYS).toSorted();
     expect(keys).toEqual([
+      "allowAnyHost",
+      "allowNonLoopbackBind",
       "allowedOrigins",
       "auditContent",
       "commandsFile",
@@ -580,14 +602,17 @@ describe("solo zero-tax — config", () => {
       "pollMs",
       "port",
       "publicHosts",
+      "quickRepliesFile",
       "readLines",
       "skipServe",
       "socketPath",
       "stateDir",
       "submitKeys",
+      "tailscaleHosts",
       "tmuxBin",
       "transcript",
       "trustedUser",
+      "trustedUserOptional",
       "unixSocket",
       "vapidPrivate",
       "vapidPublic",
@@ -618,10 +643,13 @@ describe("solo zero-tax — config", () => {
     const keys = [...new Set([...src.matchAll(/COLLIE_[A-Z0-9_]+/g)].map((m) => m[0]))].toSorted();
     expect(keys).toEqual([
       "COLLIE_ALLOWED_ORIGINS",
+      "COLLIE_ALLOW_ANY_HOST",
+      "COLLIE_ALLOW_NON_LOOPBACK_BIND",
       "COLLIE_AUDIT_CONTENT",
       "COLLIE_CODEX_ROOT",
       "COLLIE_DEVICE_ALLOWLIST",
       "COLLIE_DEVICE_HEADER",
+      "COLLIE_GROK_ROOT",
       "COLLIE_HERDR_DIAL",
       "COLLIE_HOST",
       "COLLIE_MULTI_SESSION",
@@ -635,14 +663,15 @@ describe("solo zero-tax — config", () => {
       "COLLIE_PORT",
       "COLLIE_PUBLIC_HOSTS",
       "COLLIE_READ_LINES",
-      "COLLIE_SERVE_MODE",
       "COLLIE_SKIP_SERVE",
       "COLLIE_STATE_DIR",
       "COLLIE_SUBMIT_KEYS",
+      "COLLIE_TAILSCALE_HOSTS",
       "COLLIE_TMUX_BIN",
       "COLLIE_TRANSCRIPT",
       "COLLIE_TRANSCRIPT_ROOT",
       "COLLIE_TRUSTED_USER",
+      "COLLIE_TRUSTED_USER_OPTIONAL",
       "COLLIE_UNIX_SOCKET",
       "COLLIE_VAPID_PRIVATE",
       "COLLIE_VAPID_PUBLIC",
@@ -672,6 +701,9 @@ const STATE_DIR_ENTRIES = [
   "pairing-pending.json",
   "push-subscriptions.json",
   "snooze.json",
+  // Speech-to-text settings. Absent until the operator runs `collie stt setup`, and READ ONLY by
+  // the bridge — `bridge/stt/config.ts` names this path and never writes it.
+  "stt.json",
   "update-state.json",
   "uploads",
 ];

@@ -1,5 +1,6 @@
 import type { JsonValue } from "../bridge/json.ts";
-import type { ServeMode } from "./context.ts";
+import type { CliContext, Environment, ServeMode } from "./context.ts";
+import { DEFAULT_SERVE_PORT } from "./context.ts";
 import type { Exec } from "./sys.ts";
 
 // `tailscale status --json` → this host's name. The shell piped that JSON through an inline
@@ -24,13 +25,84 @@ export function selfDnsName(statusJson: string): string | null {
 }
 
 /**
+ * Every name this node answers to on the tailnet: its MagicDNS name plus its own Tailscale IPs, in
+ * that order. IPv6 addresses come back bracketed, because that is the form a `Host` header carries.
+ *
+ * This is what fills `COLLIE_TAILSCALE_HOSTS`, and it exists because the bridge's Host allowlist
+ * fails closed: without it, every normal tailnet install would have to set `COLLIE_PUBLIC_HOSTS` by
+ * hand before it answered a single request. Discovery is not a relaxation of the gate — it is the
+ * gate being told the truth nobody should have to type.
+ *
+ * Pure over the JSON so the shapes (no `Self`, no `DNSName`, an empty IP list, garbage) are pinned
+ * without a tailnet. Anything it cannot read is simply not a host, and the list comes back shorter.
+ */
+export function selfHosts(statusJson: string): string[] {
+  const out: string[] = [];
+  const name = selfDnsName(statusJson);
+  if (name !== null) out.push(name);
+  try {
+    // SAFETY: the shape `tailscale status --json` documents, and nothing here trusts it further
+    // than the `catch` below — every path off `TailscaleIPs` is an array iteration and a string
+    // method, so a record that disagrees (missing key, numbers, an object) throws inside this `try`
+    // and reads as "this node named no addresses". The MagicDNS name is already in `out` by then, so
+    // a malformed IP list costs the addresses and never the name.
+    const data = JSON.parse(statusJson) as { Self?: { TailscaleIPs?: string[] } };
+    // `Array.isArray` and not merely `?? []`: a STRING is iterable, so a record that names one
+    // address instead of a list would otherwise contribute one host per character.
+    const ips = data.Self?.TailscaleIPs;
+    for (const raw of Array.isArray(ips) ? ips : []) {
+      const ip = raw.trim();
+      if (ip === "") continue;
+      // A `Host` header spells an IPv6 address bracketed, and this list is compared against one.
+      out.push(ip.includes(":") ? `[${ip}]` : ip);
+    }
+  } catch {
+    // Unreadable JSON says nothing about this node, exactly as it does for the name above.
+  }
+  return out;
+}
+
+/** {@link selfHosts} over a live `tailscale status --json`. A missing or down CLI reads as no hosts. */
+export function tailnetHosts(exec: Exec): string[] {
+  const r = exec.capture("tailscale", ["status", "--json"]);
+  if (!r.found || r.code !== 0) return [];
+  return selfHosts(r.stdout);
+}
+
+/**
+ * The operator's own answer to "what do I type on my phone", or null when they haven't given one.
+ * `COLLIE_PUBLIC_URL` is the only truth about the front door whenever Collie didn't publish it —
+ * a reverse proxy (Variants C/E), or a `tailscale serve` the operator runs by hand. Collie's own
+ * record (`tailscale-managed-handler`) can't answer that: `cmdServe` publishes only the one door it
+ * manages — https on 443, or on `COLLIE_SERVE_PORT` — and under `COLLIE_SKIP_SERVE=1` it publishes,
+ * and records, nothing at all.
+ *
+ * A trailing slash is dropped so this reads the same as every URL Collie builds itself.
+ */
+export function configuredPublicUrl(env: Environment): string | null {
+  const raw = env.COLLIE_PUBLIC_URL?.trim();
+  if (raw === undefined || raw === "") return null;
+  return raw.replace(/\/+$/, "");
+}
+
+/**
  * The URL to open. `https://<name>` in https mode (tailscale terminates TLS on 443),
  * `http://<name>:<port>` in http mode, and a loopback URL that SAYS why when the tailnet name is
  * unavailable — an operator on Headscale reads that line to find out their setup isn't published.
+ *
+ * `servePort` is the https listener (`COLLIE_SERVE_PORT`, default 443) and only ever shows up as a
+ * suffix when it is not 443: an https URL carrying `:443` would be the same address typed longer,
+ * and every line Collie prints for a default install must read as it always did.
  */
-export function bridgeUrlFrom(name: string | null, mode: ServeMode, port: number): string {
+export function bridgeUrlFrom(
+  name: string | null,
+  mode: ServeMode,
+  port: number,
+  servePort: number,
+): string {
   if (name === null) return `http://127.0.0.1:${port} (Tailscale name unavailable)`;
-  return mode === "http" ? `http://${name}:${port}` : `https://${name}`;
+  if (mode === "http") return `http://${name}:${port}`;
+  return servePort === DEFAULT_SERVE_PORT ? `https://${name}` : `https://${name}:${servePort}`;
 }
 
 /** {@link selfDnsName} over a live `tailscale status --json`. A missing CLI reads as no name. */
@@ -40,8 +112,16 @@ export function tailnetName(exec: Exec): string | null {
   return selfDnsName(r.stdout);
 }
 
-export function bridgeUrl(exec: Exec, mode: ServeMode, port: number): string {
-  return bridgeUrlFrom(tailnetName(exec), mode, port);
+/**
+ * The one resolver behind every "where is it" answer — `url`, the `status` banner, `serve`'s `open:`
+ * line and the `qr` code. An explicit `COLLIE_PUBLIC_URL` wins, because it is the operator telling
+ * Collie something Collie cannot observe; only without one is the tailnet name inferred.
+ */
+export function bridgeUrl(exec: Exec, ctx: CliContext): string {
+  return (
+    configuredPublicUrl(ctx.env) ??
+    bridgeUrlFrom(tailnetName(exec), ctx.serveMode, ctx.port, ctx.servePort)
+  );
 }
 
 // ── Is anyone allowed in? ────────────────────────────────────────────────────

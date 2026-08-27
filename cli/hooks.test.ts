@@ -96,7 +96,7 @@ describe("the command it writes", () => {
 });
 
 describe("the merge", () => {
-  test("adds exactly the four registrations, matcher included", () => {
+  test("adds exactly the registered events, matcher included", () => {
     const outcome = installDocument(null, COMMAND);
     expect(outcome.kind).toBe("document");
     const text = outcome.kind === "document" ? serializeSettings(outcome.document) : "";
@@ -105,7 +105,7 @@ describe("the merge", () => {
     expect(hooks.Notification[0].matcher).toBe("idle_prompt");
     // A registration with no matcher writes no `matcher` key at all — not `null`, not `""`.
     expect(Object.keys(hooks.UserPromptSubmit[0])).toEqual(["hooks"]);
-    expect(hooks.Stop[0].hooks).toEqual([{ type: "command", command: COMMAND }]);
+    expect(hooks.Stop[0].hooks).toEqual([{ type: "command", command: COMMAND, timeout: 10 }]);
   });
 
   test("never clobbers an unmarked entry, and never reorders one", () => {
@@ -187,6 +187,60 @@ describe("install", () => {
     d.files.ops.length = 0;
     expect(cmdHooksInstall(d, ["claude"])).toBe(EXIT.OK);
     expect(d.files.entries.get(SETTINGS)!.text).toBe(after);
+    expect(d.files.ops).toEqual([]);
+    expect(d.io.stdout.join("\n")).toContain("no bytes changed");
+  });
+
+  test("adds an event an OLDER build never registered, and leaves the ones it did where they are", () => {
+    // What `~/.claude/settings.json` looks like after an install from a build whose BEACON_HOOKS was
+    // missing today's first row — the `SessionStart` case, expressed so it survives the next row too.
+    const [missing, ...older] = BEACON_HOOKS;
+    const previous = serializeSettings({
+      hooks: Object.fromEntries(
+        older.map((r) => [r.event, [THEIRS, { matcher: r.matcher, hooks: [{ type: "command", command: COMMAND }] }]]),
+      ),
+    });
+    const d = deps({ files: { [SETTINGS]: previous } });
+
+    expect(cmdHooksInstall(d, ["claude"])).toBe(EXIT.OK);
+    const hooks = JSON.parse(d.files.entries.get(SETTINGS)!.text).hooks;
+    expect(markedCommandIn(hooks[missing!.event][0])).toBe(COMMAND);
+    for (const r of older) {
+      expect(hooks[r.event][0]).toEqual(THEIRS);
+      expect(markedCommandIn(hooks[r.event][1])).toBe(COMMAND);
+      expect(hooks[r.event]).toHaveLength(2);
+    }
+    // Reconciled, not re-installed: the marker version never moved, and a second run changes nothing.
+    expect(d.files.entries.get(SETTINGS)!.text).toContain(HOOK_MARKER);
+    d.files.ops.length = 0;
+    expect(cmdHooksInstall(d, ["claude"])).toBe(EXIT.OK);
+    expect(d.files.ops).toEqual([]);
+    expect(d.io.stdout.join("\n")).toContain("no bytes changed");
+  });
+
+  test("heals an installed v1 entry that predates `timeout` — the command did not change, only the sibling field", () => {
+    // Every event carries a v1 entry with no `timeout`, exactly what an older build wrote, plus one
+    // operator row that must survive untouched.
+    const previous = serializeSettings({
+      hooks: Object.fromEntries(
+        BEACON_HOOKS.map((r) => [r.event, [THEIRS, { matcher: r.matcher, hooks: [{ type: "command", command: COMMAND }] }]]),
+      ),
+    });
+    const d = deps({ files: { [SETTINGS]: previous } });
+
+    expect(cmdHooksInstall(d, ["claude"])).toBe(EXIT.OK);
+    const hooks = JSON.parse(d.files.entries.get(SETTINGS)!.text).hooks;
+    for (const r of BEACON_HOOKS) {
+      expect(hooks[r.event][0]).toEqual(THEIRS);
+      expect(hooks[r.event][1].hooks[0]).toEqual({ type: "command", command: COMMAND, timeout: 10 });
+      expect(hooks[r.event]).toHaveLength(2);
+    }
+    // Still v1 — the command string is unchanged, so no marker bump was needed to heal this.
+    expect(d.files.entries.get(SETTINGS)!.text).toContain(HOOK_MARKER);
+
+    // A second run changes no bytes.
+    d.files.ops.length = 0;
+    expect(cmdHooksInstall(d, ["claude"])).toBe(EXIT.OK);
     expect(d.files.ops).toEqual([]);
     expect(d.io.stdout.join("\n")).toContain("no bytes changed");
   });
@@ -273,6 +327,18 @@ describe("status", () => {
     const after = deps({ files: { [SETTINGS]: d.files.entries.get(SETTINGS)!.text } });
     cmdHooksStatus(after);
     expect(after.io.stdout.join("\n")).toContain(`${SETTINGS}: installed (v1)`);
+  });
+
+  test("calls a file that carries only some of the events partly installed, and names the remedy", () => {
+    const older = BEACON_HOOKS.slice(1);
+    const document = {
+      hooks: Object.fromEntries(older.map((r) => [r.event, [{ hooks: [{ type: "command", command: COMMAND }] }]])),
+    };
+    const d = deps({ files: { [SETTINGS]: serializeSettings(document) } });
+    cmdHooksStatus(d);
+    const said = d.io.stdout.join("\n");
+    expect(said).toContain(`partly installed (v1, ${older.length}/${BEACON_HOOKS.length} events)`);
+    expect(said).toContain("re-run install to add the rest");
   });
 
   test("names a stale marker version as something install would heal", () => {

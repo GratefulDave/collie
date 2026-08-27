@@ -4,7 +4,8 @@ import { extname, join, normalize, sep } from "node:path";
 import type { JsonObject, JsonValue } from "./json.ts";
 import type { ActivityLedger } from "./activity.ts";
 import { type AuditDetail, type AuditEntry, AuditLog } from "./audit.ts";
-import type { Config } from "./config.ts";
+import { isLoopbackBindHost, type Config } from "./config.ts";
+import { apiError, type ApiErrorBody, type ApiErrorDetail, type ErrorCode } from "./error-codes.ts";
 import { MUX_CAPABILITIES, type MuxCapability, type MuxCapabilityDeclaration } from "./mux/capabilities.ts";
 import type { MuxAdapter, MuxAck, MuxGrid } from "./mux/types.ts";
 import { computeEtag, gzipJsonResponse, notModified } from "./http-cache.ts";
@@ -12,14 +13,17 @@ import { pluginRoot } from "./root.ts";
 import type { NotifyPrefs, NotifyPrefsStore } from "./notify-prefs.ts";
 import { createOperatorCommands } from "./operator-commands.ts";
 import { createOperatorKeys } from "./operator-keys.ts";
+import { createOperatorQuickReplies } from "./operator-quick-replies.ts";
 import {
   DEFAULT_PROMPT_TAIL_LINES,
   verifyExpectedPrompt,
   type PromptBindingResult,
 } from "./prompt-binding.ts";
 import type { Push, PushSubscription } from "./push.ts";
+import { RefreshCoalescer } from "./refresh.ts";
 import { herdTagFor, type SessionRegistry, type SessionRuntime } from "./sessions.ts";
 import type { Snooze } from "./snooze.ts";
+import { imageExtFromBytes, SNIFF_BYTES } from "./uploads.ts";
 import type { UpdateMonitor } from "./update.ts";
 import type { StateEngine } from "./state-engine.ts";
 import { adapterFor, buildJournalRegistry } from "./journal/registry.ts";
@@ -39,6 +43,8 @@ import { packDeviceOf, packGate } from "./pack/peer-gate.ts";
 import { selectHostFrom, type HostSelector } from "./pack/registry.ts";
 import type { PackHandler, PackSurface } from "./pack/router.ts";
 import type { PackTlsOptions } from "./pack/transport.ts";
+import { createSttAdmission, sttCapability, transcribeRequest } from "./stt/http.ts";
+import type { SttProvider } from "./stt/provider.ts";
 import { MAX_UPLOAD_BYTES, uploadTooLarge } from "./uploads.ts";
 import { MUX_LOGO_PATH, toPaneWire } from "./types.ts";
 import type {
@@ -50,9 +56,11 @@ import type {
   OperatorCommand,
   MuxConfig,
   OperatorKeyRow,
+  OperatorQuickReplyRow,
   PaneHistoryResponse,
   PaneReadResponse,
   SnapshotResponse,
+  SttCapability,
   UploadResponse,
 } from "./types.ts";
 
@@ -64,14 +72,7 @@ const MAX_REQUEST_BODY_BYTES = 12 * 1024 * 1024; // 12 MB
 const MAX_READ_LINES = 10_000;
 const MAX_EXPECTED_PROMPT_CHARS = 8192;
 const PROMPT_BINDING_BLANK_LINE_HEADROOM = 6;
-// A Map, not an object literal: the key is a client-supplied MIME string, and a Map lookup can
-// never reach `Object.prototype`. The accepted set is unchanged.
-const IMAGE_EXT = new Map<string, string>([
-  ["image/png", "png"],
-  ["image/jpeg", "jpg"],
-  ["image/webp", "webp"],
-  ["image/gif", "gif"],
-]);
+// Image type is sniffed from magic bytes in uploadPane — never from the client-supplied MIME.
 
 // The built PWA lives in web/dist (Vite output). If it's missing, the bridge still runs the API
 // — only the static UI 503s with a hint to build. Anchored on the resolved checkout root, NOT on
@@ -111,7 +112,39 @@ const SECURITY_HEADERS = {
 // on-host operation; a configured trusted-user identity is still mandatory.
 const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
-const PANE_ROUTE = /^\/api\/pane\/([^/]+)(?:\/(reply|keys|upload|close|rename|history))?$/;
+/**
+ * Whether a TCP peer address is loopback. Unlike the `Host` header — which the client writes —
+ * this comes from the kernel and cannot be forged.
+ *
+ * Bun gives IPv4 peers as `127.0.0.1` and IPv6 peers as `::1`; a dual-stack listener can also report
+ * an IPv4 peer in v4-mapped form (`::ffff:127.0.0.1`). A null/absent address is treated as loopback
+ * (the bind gate in config.ts is the primary control).
+ */
+export function isLoopbackPeer(address: string | null | undefined): boolean {
+  if (!address) return true;
+  const a = address.trim().toLowerCase();
+  if (a === "::1" || a === "0:0:0:0:0:0:0:1") return true;
+  const v4 = a.startsWith("::ffff:") ? a.slice(7) : a;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
+const PANE_ROUTE = /^\/api\/pane\/([^/]+)(?:\/(reply|keys|upload|close|rename|history|focus))?$/;
+
+/**
+ * A pairing claim's refusal, as an error code.
+ *
+ * Pairing has always answered with a machine-readable word rather than a sentence, so this is a
+ * rename and nothing more — each catalogue entry's English IS the word this map's key spells. It is
+ * a total `Record`, so a new {@link ClaimFailure} fails `tsc` here rather than reaching a phone as
+ * an unnamed refusal.
+ */
+const PAIRING_ERROR_CODES = {
+  "no-pending": "pairing.no_pending",
+  expired: "pairing.expired",
+  exhausted: "pairing.exhausted",
+  "bad-code": "pairing.bad_code",
+  "duplicate-label": "pairing.duplicate_label",
+} satisfies Record<ClaimFailure, ErrorCode>;
 
 /**
  * The host selector every request takes when this collie has no trust store — i.e. the only one a
@@ -215,11 +248,17 @@ export function muxConfigBody(mux: MuxPublication): MuxConfig {
     capabilities: { ...decl.supports },
     unsupportedKeys: [...decl.unsupportedKeys],
     notes,
+    // Unconditional, like `capabilities`: the declaration is total, so there is nothing to omit and
+    // an absent key means "a bridge too old to know", which the phone already reads as `"many"`.
+    spaces: decl.spaces,
   };
   // Assigned only when the adapter actually has a mark — the key's ABSENCE is what tells the phone
   // to render its text alone, so a bridge that published `logoUrl` unconditionally would point every
   // header at a 404.
   if (mux.logo !== undefined) wire.logoUrl = MUX_LOGO_PATH;
+  // Unconditional, unlike the mark: every adapter answers this, and it is the whole point of the
+  // field that the phone can tell "this bridge says push" from "this bridge is too old to say".
+  wire.topologyLatency = decl.topologyLatency;
   return wire;
 }
 
@@ -288,10 +327,18 @@ export function bridgeConfigBody(opts: {
   operatorCommands?: readonly OperatorCommand[];
   /** The operator's own Keys-tray rows. Same omit-when-empty rule as `operatorCommands`. */
   operatorKeys?: readonly OperatorKeyRow[];
+  /** The operator's own Quick-dock groups. Same omit-when-empty rule as `operatorCommands`. */
+  operatorQuickReplies?: readonly OperatorQuickReplyRow[];
+  /**
+   * Speech-to-text, when a provider resolved. Omitted entirely otherwise — an operator who
+   * configured none ships the same payload as before, the same rule `mode` follows.
+   */
+  stt?: SttCapability;
 }): BridgeConfig {
   const mode = modeForWire(opts.mode);
   const mine = opts.operatorCommands ?? [];
   const myKeys = opts.operatorKeys ?? [];
+  const myReplies = opts.operatorQuickReplies ?? [];
   const wire: BridgeConfig = {
     push: opts.push,
     vapidPublicKey: opts.vapidPublicKey,
@@ -302,11 +349,15 @@ export function bridgeConfigBody(opts: {
   if (mode !== undefined) wire.mode = mode;
   if (mine.length > 0) wire.operatorCommands = [...mine];
   if (myKeys.length > 0) wire.operatorKeys = [...myKeys];
+  if (myReplies.length > 0) wire.operatorQuickReplies = [...myReplies];
   // Appended last, and unconditional once an adapter is in hand: unlike `mode`, this is not
   // omit-when-default. There is no default to omit — "no mux key" already means something on the
   // phone (an older bridge, read as fully capable), so a Herdr bridge staying silent here would be
   // indistinguishable from one that cannot answer.
   if (opts.mux !== undefined) wire.mux = muxConfigBody(opts.mux);
+  // Appended after the mux block, and omit-when-absent for the reason `mode` is: no key means no
+  // microphone, which is precisely true of a collie with no provider configured.
+  if (opts.stt !== undefined) wire.stt = opts.stt;
   return wire;
 }
 
@@ -386,9 +437,23 @@ export function startServer(opts: {
    * `bridge/pack/standby-devices.ts`.
    */
   pairing?: PairingStore;
+  /**
+   * Speech-to-text, asked for per request rather than resolved once.
+   *
+   * A FUNCTION, not a provider, because the settings behind it are re-read behind an mtime check
+   * (`bridge/stt/config.ts`) — `collie stt setup` must go live without a `systemctl restart`, the
+   * same posture `commands.toml` has. `null` from it is the feature being off, which is also the
+   * whole of what makes this optional here: an instance that never calls it registers the route and
+   * answers 503, and one that was never given it does the same.
+   */
+  stt?: () => Promise<SttProvider | null>;
 }) {
   const { cfg, registry, push, snooze, notifyPrefs, updateMonitor, audit, activity, pack } = opts;
   const pairing = opts.pairing;
+  const stt = opts.stt ?? (async () => null);
+  // One gate per Bun server, not per request: two slow uploads and their two provider calls share
+  // the same bounded process-local capacity (bridge/stt/http.ts).
+  const sttAdmission = createSttAdmission();
   /** Who the requester is, across both device gates — see {@link requestDevice}. */
   const whois = (req: Request): DeviceAuth => requestDevice(req, cfg, pairing);
   const packLead = opts.packLead;
@@ -404,10 +469,35 @@ export function startServer(opts: {
   const operatorCommands = createOperatorCommands(cfg.commandsFile);
   // Its sibling, on the same contract: one reader, one mtime cache, keys.toml off the hot path.
   const operatorKeys = createOperatorKeys(cfg.keysFile);
+  // The third on that contract: the Quick dock's groups, quick-replies.toml off the hot path.
+  const operatorQuickReplies = createOperatorQuickReplies(cfg.quickRepliesFile);
   const journals = cfg.transcript ? buildJournalRegistry(cfg.journalRoots) : null;
   const transcripts = cfg.transcript ? new TranscriptStore() : null;
   /** Does this agent have a journal at all — the snapshot's History-affordance gate. */
   const hasJournal = (agent: string) => adapterFor(journals ?? {}, agent) !== undefined;
+
+  /** One in-flight "look now" per session — see bridge/refresh.ts for why it coalesces. */
+  const refreshes = new RefreshCoalescer();
+
+  /**
+   * Take a fresh look at one session's multiplexer, then make the bridge re-read it.
+   *
+   * TWO STEPS AND BOTH ARE NEEDED. `mux.refresh()` moves the ADAPTER's own clock — the census that
+   * would otherwise discover an out-of-band change up to its declared bound later. `pokeNow()` moves
+   * the BRIDGE's: the snapshot the phone polls is the state engine's, and an adapter that is now
+   * up to date changes nothing the phone can see until the engine has polled it.
+   *
+   * Never throws. A multiplexer that did not answer leaves the herd exactly as stale as it already
+   * was, which the disconnected banner is already saying — a refresh failing is not news.
+   */
+  const lookNow = async (rt: SessionRuntime): Promise<void> => {
+    try {
+      await rt.herdr.refresh();
+    } catch (err) {
+      console.warn(`[refresh] ${rt.name}: ${errorText(err)}`);
+    }
+    rt.engine.pokeNow();
+  };
 
   /**
    * This collie's own snapshot body — the whole of what `/api/snapshot` answered before packs
@@ -462,7 +552,8 @@ export function startServer(opts: {
    * means, and §5 says a peer resolves it with today's exact semantics.
    */
   const localRuntime = (session: string | undefined, acceptEncoding: string | null): SessionRuntime | Response =>
-    registry.get(session) ?? jsonError(`unknown session: ${session ?? ""}`, 404, acceptEncoding);
+    registry.get(session) ??
+    jsonError(apiError("session.unknown", { session: session ?? "" }), 404, acceptEncoding);
 
   /**
    * Everything session-scoped: the pane family, tab create/rename/close, workspace create.
@@ -489,6 +580,22 @@ export function startServer(opts: {
   ): Promise<Response | null> => {
     const { pathname } = url;
 
+    // ── "Look now" ────────────────────────────────────────────────────────
+    // A READ, and gated as one. It changes nothing — `mux.refresh()` takes a listing and moves a
+    // timer (mux/types.ts) — so gating it behind a device would refuse the one thing a read-only
+    // phone most obviously may do: ask for a fresh screen. Coalesced so a burst (foreground +
+    // visibility + a pull, one operator act) costs one listing.
+    if (pathname === "/api/refresh" && req.method === "POST") {
+      const denied = caller.gate("read");
+      if (denied) return denied;
+      const rt = await caller.resolve();
+      if (rt instanceof Response) return rt;
+      // A refresh is a phone asking to be shown something, which is attention by any reading.
+      rt.engine.noteAttention();
+      await refreshes.run(rt.name, () => lookNow(rt));
+      return json({ ok: true } satisfies ActionResponse, req.headers.get("accept-encoding"));
+    }
+
     // ── Structural creates: new tab / new space (each opens a fresh shell pane) ──
     if (pathname === "/api/tab" && req.method === "POST") {
       const denied = caller.gate("write");
@@ -502,7 +609,7 @@ export function startServer(opts: {
       if (denied) return denied;
       const rt = await caller.resolve();
       if (rt instanceof Response) return rt;
-      return createWorkspace(rt.herdr, req, caller.audit, caller.device(), rt.name);
+      return createWorkspace(rt.herdr, rt.engine, req, caller.audit, caller.device(), rt.name);
     }
 
     // ── Tab actions: rename (set its label) / close (kill it + every pane in it) ──
@@ -515,8 +622,8 @@ export function startServer(opts: {
       const tabId = decodeURIComponent(tabMatch[1]!);
       const action = tabMatch[2];
       const device = caller.device();
-      if (action === "close") return closeTab(rt.herdr, tabId, req, caller.audit, device, rt.name);
-      return renameTab(rt.herdr, tabId, req, caller.audit, device, rt.name);
+      if (action === "close") return closeTab(rt.herdr, rt.engine, tabId, req, caller.audit, device, rt.name);
+      return renameTab(rt.herdr, rt.engine, tabId, req, caller.audit, device, rt.name);
     }
 
     // ── Per-pane read / send ─────────────────────────────────────────────
@@ -550,6 +657,11 @@ export function startServer(opts: {
       // machines' guesses, and why the `x-collie-seen` header is forwarded verbatim.
       const routed = isRead ? req.method === "GET" : req.method === "POST";
       if (routed && marksPaneSeen(req, action)) activity.noteSeen(session, paneId);
+      // A pane request means a phone is looking at this collie — the second of the two routes that
+      // stamp attention (state-engine.ts § noteAttention). It is stamped HERE rather than at the
+      // browser's dispatch so that a pane the lead FORWARDED to a peer counts on the peer, where
+      // the census that attention tightens actually runs.
+      if (routed) rt.engine.noteAttention();
       // Every action is a write; attribute it to the authorised device for the audit trail.
       // `history` is a read, so it gets no device attribution (nothing is written to attribute).
       const device = isRead ? null : caller.device();
@@ -561,8 +673,9 @@ export function startServer(opts: {
       if (action === "reply" && req.method === "POST") return replyPane(herdr, cfg, paneId, req, audit_, device, session);
       if (action === "keys" && req.method === "POST") return keysPane(herdr, cfg, paneId, req, audit_, device, session);
       if (action === "upload" && req.method === "POST") return uploadPane(cfg, paneId, req, audit_, device, session);
-      if (action === "close" && req.method === "POST") return closePane(herdr, paneId, req, audit_, device, session);
-      if (action === "rename" && req.method === "POST") return renamePane(herdr, paneId, req, audit_, device, session);
+      if (action === "close" && req.method === "POST") return closePane(herdr, rt.engine, paneId, req, audit_, device, session);
+      if (action === "rename" && req.method === "POST") return renamePane(herdr, rt.engine, paneId, req, audit_, device, session);
+      if (action === "focus" && req.method === "POST") return focusPane(herdr, rt.engine, paneId, req, audit_, device, session);
       return text("method not allowed", 405);
     }
 
@@ -590,7 +703,11 @@ export function startServer(opts: {
         device: () => device,
         audit: audit.scoped({ via: "pack", from }),
       });
-      return routed ?? jsonError("not found", 404, null);
+      // Deliberately UNCODED. This is the pack link's own 404, answered to a LEAD and never to a
+      // browser, and `/pack/v1/*` is a separately-versioned surface (PACK_PROTOCOL.md, ADR 0025) —
+      // it keeps today's body in this release. Error codes are the phone's vocabulary, not the
+      // pack's.
+      return routed ?? jsonError({ error: "not found" }, 404, null);
     },
   });
   // Per-session background notifications live in each session's runtime (built by the factory in
@@ -625,6 +742,21 @@ export function startServer(opts: {
         if (packed) return secure(packed);
       }
 
+      // The peer-address check, and it sits HERE — after the federated surface, before the front
+      // door — so that the exemption is granted by the surface that has its own admission rather
+      // than by a path literal this file must never carry (solo-baseline.test.ts).
+      //
+      // Everything below trusts headers a client writes (`Tailscale-User-Login`,
+      // COLLIE_DEVICE_HEADER, Origin/Host), which are only untamperable while the sole client is the
+      // local front door. A pack request is not that, and does not need to be: it was already
+      // admitted by pinned mutual TLS plus the pack secret and answered above (PACK_PROTOCOL.md §6,
+      // ADR 0013). A pack path the handler DECLINED falls through to here and is refused like any
+      // other remote caller. `COLLIE_ALLOW_NON_LOOPBACK_BIND=1` turns the check off wholesale, which
+      // is what that flag has always meant.
+      if (!cfg.allowNonLoopbackBind && !isLoopbackPeer(server.requestIP(req)?.address)) {
+        return text("non-loopback peer rejected", 403);
+      }
+
       // A DEPOSED collie serves one page and fails its health check (§18.12). It sits AFTER the
       // federated surface on purpose: the machine that just deposed this one must still be able to
       // reach `/pack/v1/*` here — that is how it was told, and how it will be told again — while the
@@ -638,7 +770,11 @@ export function startServer(opts: {
       // never builds a path. An unknown name is a 404. Global routes below ignore the param entirely.
       const sessionName = url.searchParams.get("session") ?? undefined;
       const unknownSession = () =>
-        jsonError(`unknown session: ${sessionName ?? ""}`, 404, req.headers.get("accept-encoding"));
+        jsonError(
+          apiError("session.unknown", { session: sessionName ?? "" }),
+          404,
+          req.headers.get("accept-encoding"),
+        );
 
       // The host dimension of the `(host, session, paneId)` address (§4), read exactly where the
       // session name is and by the same rule: a client-supplied value that is ONLY ever a registry
@@ -664,7 +800,7 @@ export function startServer(opts: {
           const resolved = packLead?.resolve(host, sessionName);
           if (resolved === undefined) {
             return jsonError(
-              `unknown host: ${host.kind === "member" ? host.id : host.raw}`,
+              apiError("host.unknown", { host: host.kind === "member" ? host.id : host.raw }),
               404,
               req.headers.get("accept-encoding"),
             );
@@ -702,6 +838,11 @@ export function startServer(opts: {
         const gate = checkAccess(req, cfg);
         if (!gate.ok) return text(gate.reason, 403);
         const device = whois(req);
+        // A BROWSER poll is a phone looking; the lead's own sweep of a peer is not, which is why
+        // this stamp sits here rather than inside `localSnapshot` (that closure also serves
+        // `/pack/v1/snapshot`, and a lead sweeps on its own clock whether or not anybody is reading
+        // it — stamping there would pin every peer at `watched` for the life of the pack).
+        registry.get(sessionName)?.engine.noteAttention();
         const body = localSnapshot(sessionName, device.enforced ? device : null);
         if (!body) return unknownSession();
         // The ONE place the lead re-serialises (§9.2). With no pack this is the identity function's
@@ -744,11 +885,16 @@ export function startServer(opts: {
         // with no restart. The path is cfg's, never the request's.
         const mine = await operatorCommands();
         const myKeys = await operatorKeys();
+        const myReplies = await operatorQuickReplies();
         // The PRIMARY session's adapter, because one collie drives one multiplexer: every session in
         // the registry is built by the same factory off the same `cfg.mux`, so which runtime answers
         // is not a choice. `?.` only because `get()` is total over a Map — the primary is created
         // eagerly in the constructor and never disposed.
         const activeMux = registry.get();
+        // Re-resolved per request for the same reason `commands.toml` is: `collie stt setup` is
+        // live, and this is where the phone learns whether to draw a microphone at all. `?? undefined`
+        // because "no provider" must OMIT the key, never send a null one (PACK_PROTOCOL.md §11).
+        const sttWire = (await sttCapability(await stt())) ?? undefined;
         return json(
           bridgeConfigBody({
             push: push.enabled,
@@ -757,7 +903,9 @@ export function startServer(opts: {
             mode: pack.mode,
             operatorCommands: mine,
             operatorKeys: myKeys,
+            operatorQuickReplies: myReplies,
             mux: activeMux?.herdr,
+            stt: sttWire,
           }),
           req.headers.get("accept-encoding"),
         );
@@ -869,6 +1017,23 @@ export function startServer(opts: {
         return json(updateMonitor.status(), req.headers.get("accept-encoding"));
       }
 
+      // ── Speech-to-text (bridge/stt/) ─────────────────────────────────────
+      if (pathname === "/api/stt" && req.method === "POST") {
+        // WRITE-gated, exactly like typing into a pane — and for the same reason. This route's whole
+        // purpose is to put words in the composer, and the audio leaves the host for an
+        // operator-configured endpoint. A read-only device watches; it does not speak.
+        const denied = guard(req, cfg, "write", pairing);
+        if (denied) return denied;
+        // Deliberately NOT session- or pane-scoped: the transcript is text handed back to the
+        // phone, which then decides what to do with it. Nothing here touches a terminal, so there is
+        // no pane to attribute it to and no `x-collie-seen` meaning to claim.
+        const { response, attempt } = await transcribeRequest(await stt(), req, sttAdmission);
+        // One line per attempt, and route metadata only: the recording, the transcript and the
+        // provider's own words never reach the audit log.
+        audit.record({ action: "stt", device: whois(req).device, detail: { ...attempt } });
+        return secure(response);
+      }
+
       // ── Device pairing (bridge/pairing.ts) ───────────────────────────────
       if (pathname === "/api/pair" && req.method === "POST") {
         if (!pairing) return text("pairing unavailable", 503);
@@ -888,16 +1053,26 @@ export function startServer(opts: {
           // re-checks every field of it before any of it is used.
           body = (await req.json()) as JsonValue;
         } catch {
-          return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+          return jsonError(apiError("pairing.bad_request"), 400, req.headers.get("accept-encoding"));
         }
         const parsed = parsePairRequest(body);
-        if (!parsed) return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+        if (!parsed) {
+          return jsonError(apiError("pairing.bad_request"), 400, req.headers.get("accept-encoding"));
+        }
         const claimed = await pairing.claim(parsed.code, parsed.label);
         if (!claimed.ok) {
           // Every failure is one status and one machine-readable reason; the client turns the reason
           // into the sentence that says what to do next. No timing or count is leaked back — the
           // attempts remaining are the operator's business, on the operator's terminal.
-          return jsonError(claimed.reason satisfies ClaimFailure, 400, req.headers.get("accept-encoding"));
+          // The `error` string is still the bare reason word it has always been — the catalogue
+          // entry for each pairing code IS that word — so `recoverPairFailure` in the web app keeps
+          // matching it byte for byte while `code` says the same thing the way every other surface
+          // now says it.
+          return jsonError(
+            apiError(PAIRING_ERROR_CODES[claimed.reason]),
+            400,
+            req.headers.get("accept-encoding"),
+          );
         }
         audit.record({ action: "pair", device: parsed.label, detail: { label: parsed.label } });
         // The ONLY time this token exists outside the requesting device. Nothing stores it here.
@@ -928,14 +1103,16 @@ export function startServer(opts: {
         try {
           body = await req.json();
         } catch {
-          return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+          return jsonError(apiError("pairing.bad_request"), 400, req.headers.get("accept-encoding"));
         }
         // SAFETY: `body` is this handler's own `req.json()` output — a JsonValue by construction;
         // `normalizeLabel` refuses anything that is not a usable string.
         const label = normalizeLabel(asJsonRecord(body as JsonValue)?.label);
-        if (label === null) return jsonError("bad-request", 400, req.headers.get("accept-encoding"));
+        if (label === null) {
+          return jsonError(apiError("pairing.bad_request"), 400, req.headers.get("accept-encoding"));
+        }
         if (!(await pairing.revoke(label))) {
-          return jsonError("unknown device", 404, req.headers.get("accept-encoding"));
+          return jsonError(apiError("device.unknown"), 404, req.headers.get("accept-encoding"));
         }
         audit.record({ action: "device.revoke", device: whois(req).device, detail: { label } });
         const current = pairing.resolve(bearerToken(req.headers))?.label ?? null;
@@ -981,9 +1158,9 @@ export function startServer(opts: {
  */
 export function startupWarnings(cfg: Config): string[] {
   const warnings: string[] = [];
-  if (cfg.host !== "127.0.0.1" && cfg.host !== "localhost") {
+  if (!isLoopbackBindHost(cfg.host)) {
     warnings.push(
-      `[bridge] WARNING: bound to ${cfg.host}, not loopback — identity checks may be bypassable`,
+      `[bridge] WARNING: bound to ${cfg.host} via COLLIE_ALLOW_NON_LOOPBACK_BIND — the identity, device and same-origin gates are all client-settable on a wide bind, and the peer-address check is off. Whatever fronts this port is now the only control.`,
     );
   }
   if (cfg.deviceHeader && cfg.deviceAllowlist.length === 0) {
@@ -992,21 +1169,33 @@ export function startupWarnings(cfg: Config): string[] {
     );
   }
   if (cfg.skipServe) {
-    // Reverse-proxy mode: the proxy must inject a matching Tailscale-User-Login if trustedUser is
-    // configured; otherwise the mandatory identity gate denies every API request.
+    // Reverse-proxy mode: no tailscale serve injects Tailscale-User-Login, so checkAccess never has
+    // an identity to enforce — trustedUser is dead config. Only nag when it's set (a likely mistake).
     if (cfg.trustedUser) {
       warnings.push(
-        `[bridge] WARNING: COLLIE_TRUSTED_USER under COLLIE_SKIP_SERVE=1 requires the reverse proxy to inject a matching Tailscale-User-Login; otherwise every API request is denied. Usually leave it empty and use the proxy's access control plus COLLIE_DEVICE_HEADER (see DEPLOYMENT.md → Variant C).`,
+        `[bridge] WARNING: COLLIE_TRUSTED_USER has no effect under COLLIE_SKIP_SERVE=1 — without tailscale serve in front, the Tailscale-User-Login header is never injected. Use COLLIE_DEVICE_HEADER for per-device auth (see DEPLOYMENT.md → Variant C).`,
       );
     }
   } else if (!cfg.trustedUser) {
     warnings.push(
       `[bridge] WARNING: COLLIE_TRUSTED_USER is empty — any tailnet device/user that reaches the bridge gets full write access. Set it to your tailnet login (see README → Variant A).`,
     );
-  }
-  if (cfg.publicHosts.length === 0) {
+  } else if (cfg.trustedUserOptional) {
     warnings.push(
-      `[bridge] WARNING: COLLIE_PUBLIC_HOSTS is empty — Host-header validation is OFF (DNS rebinding not blocked). Set it to your MagicDNS name, especially under plain-HTTP serve mode or behind a reverse proxy.`,
+      `[bridge] WARNING: COLLIE_TRUSTED_USER_OPTIONAL=1 — a request with no Tailscale-User-Login is accepted, so any TAGGED tailnet node (which serve injects no identity for) gets full write access. Unset it outside host-local development.`,
+    );
+  }
+  if (cfg.allowAnyHost) {
+    warnings.push(
+      `[bridge] WARNING: COLLIE_ALLOW_ANY_HOST=1 — Host-header validation is OFF, so a DNS-rebound page can reach this bridge as if it were same-origin. Unset it and set COLLIE_PUBLIC_HOSTS to the host(s) you serve on.`,
+    );
+  } else if (
+    cfg.publicHosts.length === 0 &&
+    cfg.tailscaleHosts.length === 0 &&
+    cfg.allowedOrigins.length === 0
+  ) {
+    warnings.push(
+      `[bridge] WARNING: no non-loopback Host is allowed — every request except one addressed to localhost/127.0.0.1 will be rejected with "host not allowed". Set COLLIE_PUBLIC_HOSTS to the exact host(s) you serve on (required behind your own reverse proxy).`,
     );
   }
   return warnings;
@@ -1142,7 +1331,7 @@ export interface ReplySender {
 /** Outcome of the two-step send. `textDelivered` is only meaningful on the failure branch. */
 export type ReplyOutcome =
   | { ok: true; textDelivered: boolean }
-  | { ok: false; error: string; textDelivered: boolean };
+  | ({ ok: false; textDelivered: boolean } & ApiErrorBody);
 
 /**
  * The reply's two one-shot RPCs — type the text, then send the submit key(s) — as a pure function so
@@ -1167,16 +1356,18 @@ export async function sendReplySteps(
   let textDelivered = false;
   // One shape for both ways a step can fail — a refusal the adapter returned and an exception it
   // let escape — so the partial-delivery branch cannot drift between them.
-  const failed = (error: string): ReplyOutcome =>
+  const failed = (reason: string): ReplyOutcome =>
     textDelivered && submit
       ? {
           // Text is already in the pane — only the submit failed. Tell the operator to check/submit
           // it by hand rather than resend, and flag textDelivered so a resend-on-error UI holds off.
           ok: false,
           textDelivered: true,
-          error: "typed into the pane but not submitted — check the pane before resending",
+          ...apiError("reply.not_submitted"),
         }
-      : { ok: false, textDelivered, error };
+      : // The multiplexer's own words are the sentence, so they ride in `detail.reason` too — a
+        // translated line has no other way to quote them.
+        { ok: false, textDelivered, ...apiError("reply.send_failed", { reason }) };
   try {
     if (txt) {
       const typed = await client.typeText(paneId, txt);
@@ -1261,10 +1452,16 @@ export async function replyPane(
     detail: replyDetail,
   });
   if (outcome.ok) return json({ ok: true } satisfies ActionResponse, ae);
-  return json(
-    { ok: false, error: outcome.error, textDelivered: outcome.textDelivered } satisfies ActionResponse,
-    ae,
-  );
+  const failure: ActionResponse = {
+    ok: false,
+    error: outcome.error,
+    textDelivered: outcome.textDelivered,
+    code: outcome.code,
+  };
+  // Assigned, never conditionally spread: a refusal with nothing to interpolate carries NO `detail`
+  // key rather than an empty object the client would have to tell apart from a real one.
+  if (outcome.detail !== undefined) failure.detail = outcome.detail;
+  return json(failure, ae);
 }
 
 export async function keysPane(
@@ -1327,7 +1524,10 @@ export async function keysPane(
       detail: { keys, sent: false, promptBinding: binding.audit },
     });
   }
-  return json({ ok: false, error: sent.detail } satisfies ActionResponse, ae);
+  return json(
+    { ok: false, ...apiError("keys.send_failed", { reason: sent.detail }) } satisfies ActionResponse,
+    ae,
+  );
 }
 
 type ExpectedPrompt =
@@ -1354,8 +1554,9 @@ type PromptBindingCheck =
   | {
       ok: false;
       error: string;
+      detail?: ApiErrorDetail;
       status: 409 | 502;
-      code?: "prompt_changed";
+      code: ErrorCode;
       audit: {
         checked: true;
         passed: false;
@@ -1375,7 +1576,7 @@ function readFailed(
 ): Extract<PromptBindingCheck, { ok: false }> {
   return {
     ok: false,
-    error: `${herdr.mux} read failed: ${detail}`,
+    ...apiError("prompt.read_failed", { mux: herdr.mux, detail }),
     status: 502,
     audit: { checked: true, passed: false, expected, reason: "read_failed" },
   };
@@ -1420,9 +1621,8 @@ async function checkPromptBinding(
   if (!result.ok) {
     return {
       ok: false,
-      error: "prompt changed",
+      ...apiError("prompt_changed"),
       status: 409,
-      code: "prompt_changed",
       audit: { checked: true, passed: false, expected, reason: result.reason },
     };
   }
@@ -1440,20 +1640,45 @@ function promptBindingFailure(
   result: Extract<PromptBindingCheck, { ok: false }>,
   acceptEncoding: string | null,
 ): Response {
-  const failure: ActionResponse = { ok: false, error: result.error };
-  // Assigned, never conditionally spread: a refusal with no machine-readable code carries no key.
-  if (result.code) failure.code = result.code;
-  return json(
-    failure,
-    acceptEncoding,
-    result.status,
-  );
+  const failure: ActionResponse = { ok: false, error: result.error, code: result.code };
+  // Assigned, never conditionally spread: a refusal with nothing to interpolate carries no `detail`.
+  if (result.detail !== undefined) failure.detail = result.detail;
+  return json(failure, acceptEncoding, result.status);
+}
+
+/**
+ * A phone just changed this herd's shape or its names — take a fresh look before answering.
+ *
+ * WHY EVERY MUTATING ROUTE ENDS HERE. The phone's next act after a tab rename is to revalidate, and
+ * what it revalidates is the STATE ENGINE's snapshot. Without this the engine would still be holding
+ * the pre-change herd, and the strip would keep the old label until the adapter's census caught up —
+ * up to the bound the adapter declares (`topologyLatency`), which on a censusing multiplexer is long
+ * enough for an operator to conclude the rename did not work and do it again.
+ *
+ * The create routes already hand back the identity they created, and that stays: it is what lets the
+ * phone navigate into a new pane at once. This is about the STRIP being right, which no create
+ * response can carry.
+ *
+ * Cheap where it is already fresh — a pushing adapter's `refresh()` resolves immediately (see the
+ * port) — so this costs a listing only on the adapters that actually needed one.
+ */
+async function settleTopology(herdr: MuxAdapter, engine: StateEngine): Promise<void> {
+  try {
+    await herdr.refresh();
+  } catch (err) {
+    // A refresh that could not happen leaves the herd exactly as stale as it already was, and the
+    // write it follows SUCCEEDED — reporting a failure here would tell the operator their rename
+    // did not land when it did.
+    console.warn(`[refresh] after a write: ${errorText(err)}`);
+  }
+  engine.pokeNow();
 }
 
 // Close a pane ("kill the agent"). Structural op — strictly less powerful than the text/keys
 // injection the bridge already allows, so it stays within the existing remote-shell threat model.
 async function closePane(
   herdr: MuxAdapter,
+  engine: StateEngine,
   paneId: string,
   req: Request,
   audit: AuditLog,
@@ -1462,8 +1687,50 @@ async function closePane(
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
   const closed = await herdr.closePane(paneId);
-  if (!closed.ok) return json({ ok: false, error: closed.detail } satisfies ActionResponse, ae);
+  if (!closed.ok) {
+    return json(
+      { ok: false, ...apiError("pane.close_failed", { reason: closed.detail }) } satisfies ActionResponse,
+      ae,
+    );
+  }
   audit.record({ action: "pane.close", paneId, session, device, detail: {} });
+  await settleTopology(herdr, engine);
+  return json({ ok: true } satisfies ActionResponse, ae);
+}
+
+/**
+ * Put a pane on the OPERATOR's own screen — the "Show in terminal" row, and nothing else.
+ *
+ * The only route in the bridge that moves a human's terminal, and it exists because the alternative
+ * — following the phone's navigation automatically — would move it as a side effect of scrolling a
+ * list. It is a write like any other: same device gate, same audit line, no body to validate.
+ *
+ * `unsupported` arrives here as a failure with the adapter's own sentence, and that is correct
+ * BEHIND a UI that hides the row when the capability is absent: the row is gone, so this answer is
+ * only ever seen by a client whose config is stale.
+ */
+async function focusPane(
+  herdr: MuxAdapter,
+  engine: StateEngine,
+  paneId: string,
+  req: Request,
+  audit: AuditLog,
+  device: string | null,
+  session: string,
+): Promise<Response> {
+  const ae = req.headers.get("accept-encoding");
+  const focused = await herdr.setFocus(paneId);
+  if (!focused.ok) {
+    return json(
+      { ok: false, ...apiError("pane.focus_failed", { reason: focused.detail }) } satisfies ActionResponse,
+      ae,
+    );
+  }
+  audit.record({ action: "pane.focus", paneId, session, device, detail: {} });
+  // `focused` is a fact the snapshot reports, so moving it is a change the phone's next poll must
+  // carry — otherwise the pane the operator just showed on their terminal would keep reading as
+  // unfocused for as long as the adapter's declared bound (ADR 0031).
+  await settleTopology(herdr, engine);
   return json({ ok: true } satisfies ActionResponse, ae);
 }
 
@@ -1473,6 +1740,7 @@ async function closePane(
 // saving an empty field), which we send to Herdr as `label: null`.
 async function renamePane(
   herdr: MuxAdapter,
+  engine: StateEngine,
   paneId: string,
   req: Request,
   audit: AuditLog,
@@ -1494,8 +1762,14 @@ async function renamePane(
   const trimmed = typeof fields.label === "string" ? fields.label.trim() : "";
   const label = trimmed.length > 0 ? trimmed : null;
   const renamed = await herdr.renamePane(paneId, label);
-  if (!renamed.ok) return json({ ok: false, error: renamed.detail } satisfies ActionResponse, ae);
+  if (!renamed.ok) {
+    return json(
+      { ok: false, ...apiError("pane.rename_failed", { reason: renamed.detail }) } satisfies ActionResponse,
+      ae,
+    );
+  }
   audit.record({ action: "pane.rename", paneId, session, device, detail: { label } });
+  await settleTopology(herdr, engine);
   return json({ ok: true } satisfies ActionResponse, ae);
 }
 
@@ -1520,6 +1794,7 @@ export function normalizeTabLabel(
 // "clear" (see normalizeTabLabel): a blank label is a 400, not a reset to the tab number.
 async function renameTab(
   herdr: MuxAdapter,
+  engine: StateEngine,
   tabId: string,
   req: Request,
   audit: AuditLog,
@@ -1539,8 +1814,14 @@ async function renameTab(
   const parsed = normalizeTabLabel(asJsonRecord(body)?.label);
   if (!parsed.ok) return text(parsed.error, 400);
   const renamed = await herdr.renameTab(tabId, parsed.label);
-  if (!renamed.ok) return json({ ok: false, error: renamed.detail } satisfies ActionResponse, ae);
+  if (!renamed.ok) {
+    return json(
+      { ok: false, ...apiError("tab.rename_failed", { reason: renamed.detail }) } satisfies ActionResponse,
+      ae,
+    );
+  }
   audit.record({ action: "tab.rename", session, device, detail: { tabId, label: parsed.label } });
+  await settleTopology(herdr, engine);
   return json({ ok: true } satisfies ActionResponse, ae);
 }
 
@@ -1550,6 +1831,7 @@ async function renameTab(
 // model. No body: the tab id is in the path.
 async function closeTab(
   herdr: MuxAdapter,
+  engine: StateEngine,
   tabId: string,
   req: Request,
   audit: AuditLog,
@@ -1558,8 +1840,14 @@ async function closeTab(
 ): Promise<Response> {
   const ae = req.headers.get("accept-encoding");
   const closed = await herdr.closeTab(tabId);
-  if (!closed.ok) return json({ ok: false, error: closed.detail } satisfies ActionResponse, ae);
+  if (!closed.ok) {
+    return json(
+      { ok: false, ...apiError("tab.close_failed", { reason: closed.detail }) } satisfies ActionResponse,
+      ae,
+    );
+  }
   audit.record({ action: "tab.close", session, device, detail: { tabId } });
+  await settleTopology(herdr, engine);
   return json({ ok: true } satisfies ActionResponse, ae);
 }
 
@@ -1590,9 +1878,16 @@ async function createTab(
   const tabLabel = typeof fields.label === "string" ? fields.label : undefined;
   const cwd = typeof fields.cwd === "string" ? fields.cwd : undefined;
   const ae = req.headers.get("accept-encoding");
-  if (!workspaceId) return json({ ok: false, error: "workspaceId required" } satisfies CreateResponse, ae);
+  if (!workspaceId) {
+    return json({ ok: false, ...apiError("tab.workspace_required") } satisfies CreateResponse, ae);
+  }
   const outcome = await herdr.createTab({ spaceId: workspaceId, label: tabLabel, cwd });
-  if (!outcome.ok) return json({ ok: false, error: outcome.detail } satisfies CreateResponse, ae);
+  if (!outcome.ok) {
+    return json(
+      { ok: false, ...apiError("tab.create_failed", { reason: outcome.detail }) } satisfies CreateResponse,
+      ae,
+    );
+  }
   const created = outcome.value;
   // The adapter answers with the space id when the create call doesn't carry a label back; the
   // snapshot we already hold knows the real one, and that lookup is cheaper than a round trip.
@@ -1606,6 +1901,7 @@ async function createTab(
     device,
     detail: { workspaceId, label: tabLabel, cwd },
   });
+  await settleTopology(herdr, engine);
   return json({
     ok: true,
     pane: {
@@ -1623,6 +1919,7 @@ async function createTab(
 // can cd from there. Same structural-only threat model as createTab.
 async function createWorkspace(
   herdr: MuxAdapter,
+  engine: StateEngine,
   req: Request,
   audit: AuditLog,
   device: string | null,
@@ -1643,7 +1940,12 @@ async function createWorkspace(
   const label = typeof fields.label === "string" ? fields.label : undefined;
   const ae = req.headers.get("accept-encoding");
   const outcome = await herdr.createSpace({ cwd, label });
-  if (!outcome.ok) return json({ ok: false, error: outcome.detail } satisfies CreateResponse, ae);
+  if (!outcome.ok) {
+    return json(
+      { ok: false, ...apiError("workspace.create_failed", { reason: outcome.detail }) } satisfies CreateResponse,
+      ae,
+    );
+  }
   const created = outcome.value;
   audit.record({
     action: "workspace.create",
@@ -1652,6 +1954,7 @@ async function createWorkspace(
     device,
     detail: { label, cwd },
   });
+  await settleTopology(herdr, engine);
   return json({
     ok: true,
     pane: {
@@ -1684,7 +1987,7 @@ async function uploadPane(
       new Response(
         JSON.stringify({
           ok: false,
-          error: "image too large (max 10 MB)",
+          ...apiError("upload.too_large", { maxBytes: MAX_UPLOAD_BYTES }),
         } satisfies UploadResponse),
         { status: 413, headers: { "content-type": "application/json; charset=utf-8" } },
       ),
@@ -1698,14 +2001,23 @@ async function uploadPane(
   }
   const file = form.get("file");
   if (!(file instanceof File)) {
-    return json({ ok: false, error: "no file" } satisfies UploadResponse, ae);
+    return json({ ok: false, ...apiError("upload.no_file") } satisfies UploadResponse, ae);
   }
-  const ext = IMAGE_EXT.get(file.type);
+  const head = new Uint8Array(await file.slice(0, SNIFF_BYTES).arrayBuffer());
+  const ext = imageExtFromBytes(head);
   if (!ext) {
-    return json({ ok: false, error: `unsupported type: ${file.type || "unknown"}` } satisfies UploadResponse, ae);
+    // The client's own Content-Type rides along as the DETAIL only — it names what the operator
+    // thought they sent, and the decision above never consulted it.
+    return json(
+      { ok: false, ...apiError("upload.bad_type", { type: file.type || "unknown" }) } satisfies UploadResponse,
+      ae,
+    );
   }
   if (file.size > MAX_UPLOAD_BYTES) {
-    return json({ ok: false, error: "image too large (max 10 MB)" } satisfies UploadResponse, ae);
+    return json(
+      { ok: false, ...apiError("upload.too_large", { maxBytes: MAX_UPLOAD_BYTES }) } satisfies UploadResponse,
+      ae,
+    );
   }
   try {
     const dir = join(cfg.stateDir, "uploads");
@@ -1725,26 +2037,29 @@ async function uploadPane(
     });
     return json({ ok: true, path: fullPath } satisfies UploadResponse, ae);
   } catch (err) {
-    return json({ ok: false, error: errorText(err) } satisfies UploadResponse, ae);
+    return json(
+      { ok: false, ...apiError("upload.write_failed", { reason: errorText(err) }) } satisfies UploadResponse,
+      ae,
+    );
   }
 }
 
 /**
  * Access gate for the API:
- *  - Host allowlist (opt-in): when COLLIE_PUBLIC_HOSTS is set, the request's Host header must be a
- *    loopback form, one of those hosts, or the host of an allowed origin — otherwise rejected,
- *    BEFORE any Origin logic (fail-closed). This defeats DNS rebinding, where a browser is tricked
- *    into sending Host==Origin==evil.example so a bare same-origin check trivially passes — acute
- *    under COLLIE_SERVE_MODE=http (no TLS). Empty COLLIE_PUBLIC_HOSTS keeps the legacy behaviour so
- *    existing deployments don't break (see the startup warning).
+ *  - Host allowlist (fail-closed): the request's Host header must be a loopback form, an explicit
+ *    COLLIE_PUBLIC_HOSTS entry, a ctl-discovered Tailscale host (COLLIE_TAILSCALE_HOSTS), or the
+ *    host of an allowed origin — otherwise rejected, BEFORE any Origin logic. This defeats DNS
+ *    rebinding (Host==Origin==evil.example). COLLIE_ALLOW_ANY_HOST=1 is the explicit opt-out.
  *  - Same-origin only (Origin host must equal Host) — defeats cross-site requests/CSRF. Browsers
  *    omit Origin on same-origin GETs (so the snapshot poll passes); they send it on POSTs.
  *    localhost and explicitly-configured origins are also allowed.
  *  - Origin required for writes: a state-changing (`level === "write"`) request with no Origin is
  *    trusted only from loopback (curl on the host). Browsers always send Origin on fetch/SW POSTs,
  *    so a missing Origin on a remote write is a non-browser or Origin-stripped request — reject it.
- *  - Tailscale identity: when a trusted user is configured, every API request must carry the
- *    matching `Tailscale-User-Login` injected by `tailscale serve`.
+ *  - Tailscale identity: when a trusted user is configured under `tailscale serve`, the request
+ *    must carry a matching `Tailscale-User-Login`. A missing header is rejected too — serve injects
+ *    none for tagged nodes. Under COLLIE_SKIP_SERVE=1 or COLLIE_TRUSTED_USER_OPTIONAL=1, only a
+ *    mismatch is rejected.
  */
 export function checkAccess(
   req: Request,
@@ -1753,9 +2068,9 @@ export function checkAccess(
 ): { ok: true } | { ok: false; reason: string } {
   const host = req.headers.get("host") ?? "";
 
-  // Host-header allowlist — only when the operator opted in (COLLIE_PUBLIC_HOSTS non-empty). Fail
-  // closed, before the Origin logic, so a rebinding request (Host==Origin==evil) never reaches it.
-  if (cfg.publicHosts.length > 0 && !isHostAllowed(host, cfg)) {
+  // Host-header allowlist — ALWAYS ON, before the Origin logic, so a rebinding request
+  // (Host==Origin==evil) never reaches it. COLLIE_ALLOW_ANY_HOST=1 is the operator's explicit opt-out.
+  if (!cfg.allowAnyHost && !isHostAllowed(host, cfg)) {
     return { ok: false, reason: "host not allowed" };
   }
 
@@ -1779,23 +2094,28 @@ export function checkAccess(
 
   if (cfg.trustedUser) {
     const login = req.headers.get("tailscale-user-login");
-    if (!login) return { ok: false, reason: "identity required" };
-    if (login !== cfg.trustedUser) {
-      return { ok: false, reason: "identity not trusted" };
+    if (login) {
+      if (login !== cfg.trustedUser) return { ok: false, reason: "identity not trusted" };
+    } else if (!cfg.skipServe && !cfg.trustedUserOptional) {
+      // Fail closed: `tailscale serve` injects no Tailscale-User-* for TAGGED nodes, so an absent
+      // header is not "a loopback caller" — it is any tagged node on the tailnet.
+      return { ok: false, reason: "identity required" };
     }
   }
   return { ok: true };
 }
 
 /**
- * Whether a Host header is one the bridge will answer to under the opt-in host allowlist: a loopback
- * form, an explicit COLLIE_PUBLIC_HOSTS entry, or the host of a configured allowed origin. Pure +
- * exported for tests.
+ * Whether a Host header is one the bridge will answer to under the fail-closed host allowlist: a
+ * loopback form, an explicit COLLIE_PUBLIC_HOSTS entry, a discovered Tailscale host (bare or with
+ * port), or the host of a configured allowed origin. Pure + exported for tests.
  */
 export function isHostAllowed(host: string, cfg: Config): boolean {
   if (!host) return false;
   if (LOOPBACK_HOST.test(host)) return true;
   if (cfg.publicHosts.includes(host)) return true;
+  const bare = host.replace(/:\d+$/, "");
+  if (cfg.tailscaleHosts.some((h) => h === host || h === bare)) return true;
   return cfg.allowedOrigins.some((o) => {
     try {
       return new URL(o).host === host;
@@ -1922,10 +2242,18 @@ function json<TBody>(data: TBody, acceptEncoding: string | null, status = 200): 
  * A JSON error body with a non-200 status (e.g. an unknown-session 404). The body is tiny (below the
  * gzip threshold), so a plain uncompressed JSON response is the whole story — no need for the gzip
  * path. `acceptEncoding` is accepted for call-site symmetry with {@link json} but not needed here.
+ *
+ * It takes a BODY rather than a message so a caller must have gone through {@link apiError} to get
+ * one — which is what keeps a refusal's English and its code in the catalogue together. The bare
+ * `{ error }` shape stays legal for the one caller that must not carry a code: the pack link's 404.
  */
-function jsonError(message: string, status: number, _acceptEncoding: string | null): Response {
+function jsonError(
+  body: ApiErrorBody | { error: string },
+  status: number,
+  _acceptEncoding: string | null,
+): Response {
   return secure(
-    new Response(JSON.stringify({ error: message }), {
+    new Response(JSON.stringify(body), {
       status,
       headers: { "content-type": "application/json; charset=utf-8" },
     }),

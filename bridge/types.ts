@@ -1,8 +1,9 @@
 // Domain model for the bridge. These are OUR types, decoupled from Herdr's wire shapes
 // (which live only in mux/herdr/client.ts). The rest of the app talks in these terms.
 
+import type { ApiErrorDetail, ErrorCode } from "./error-codes.ts";
 import type { AgentSessionRef, TranscriptEntry } from "./journal/types.ts";
-import type { MuxCapability } from "./mux/capabilities.ts";
+import type { MuxCapability, MuxSpaceCapacity, MuxTopologyLatency } from "./mux/capabilities.ts";
 
 // Re-exported so the wire surface has ONE import site: a consumer of PaneHistoryResponse gets the
 // entry shape from here too, without reaching into an adapter module.
@@ -68,6 +69,17 @@ export interface AgentView {
    * Absent when the title says nothing, and on Herdr servers too old to report it.
    */
   terminalTitle?: string;
+  /**
+   * True when {@link terminalTitle} was left behind by a program that has already EXITED — a
+   * multiplexer keeps a pane's title after the program that printed it is gone, so a bare shell can
+   * sit under a finished agent's sentence for hours (see `terminalTitleIsStale` in state-engine.ts).
+   *
+   * PRESENTATION, and set only when true. The title is still sent, unedited: a stale one is rendered
+   * quietly rather than as the pane's name, because a title is evidence about the past and deleting
+   * it would lose that. It changes no status, no capability and no sort. Absent on every older
+   * bridge, which reads exactly as it did before — as "not known to be stale".
+   */
+  terminalTitleStale?: boolean;
   /**
    * A finished English sentence about this pane, composed in the bridge and rendered as text the
    * client does not interpret. Absent on almost every pane.
@@ -321,6 +333,12 @@ export type PaneHistoryResponse =
  * carries the reason Herdr rejected it. `textDelivered` distinguishes the reply partial-failure case
  * (text was typed but the submit keypress failed) so the client knows NOT to resend — resending would
  * duplicate the already-typed text. Absent/false ⇒ nothing landed, so a resend is safe.
+ *
+ * `error` is English prose and stays the thing a client displays when it has nothing better;
+ * `code` + `detail` are the machine half, so the phone can say the same thing in the operator's
+ * language (bridge/error-codes.ts). `code` was once only ever `"prompt_changed"` — it now names any
+ * catalogued refusal, which is why a client must fall back on a code it does not recognise rather
+ * than treat it as a bug.
  */
 export type ActionResponse =
   | { ok: true }
@@ -328,11 +346,14 @@ export type ActionResponse =
       ok: false;
       error: string;
       textDelivered?: boolean;
-      code?: "prompt_changed";
+      code?: ErrorCode;
+      detail?: ApiErrorDetail;
     };
 
 /** POST /api/pane/:id/upload — image saved to a host file; `path` is the absolute path to ref. */
-export type UploadResponse = { ok: true; path: string } | { ok: false; error: string };
+export type UploadResponse =
+  | { ok: true; path: string }
+  | { ok: false; error: string; code?: ErrorCode; detail?: ApiErrorDetail };
 
 /** A freshly-created shell pane — enough for the client to navigate into before the next poll. */
 export interface CreatedPane {
@@ -347,7 +368,9 @@ export interface CreatedPane {
  * POST /api/tab | /api/workspace — created a new tab/space with a fresh shell. On success `pane`
  * is that shell, so the client can navigate straight into it before the next poll lands.
  */
-export type CreateResponse = { ok: true; pane: CreatedPane } | { ok: false; error: string };
+export type CreateResponse =
+  | { ok: true; pane: CreatedPane }
+  | { ok: false; error: string; code?: ErrorCode; detail?: ApiErrorDetail };
 
 /**
  * Which role this collie plays in a pack (PACK_PROTOCOL.md §3). `solo` is a lead with zero peers —
@@ -432,6 +455,16 @@ export interface MuxConfig {
    */
   notes: Partial<Record<MuxCapability, string>>;
   /**
+   * How many spaces this multiplexer can hold — `"one"` or `"many"`, straight off the adapter's
+   * declaration (bridge/mux/capabilities.ts).
+   *
+   * Not a capability and not a count of what exists right now: it is what the multiplexer CAN have.
+   * The phone drops the space strip on `"one"`, so an ABSENT value (an older bridge) must read as
+   * `"many"` — the fail-open direction, where at worst a strip shows one chip, instead of hiding
+   * navigation the operator needs.
+   */
+  spaces?: MuxSpaceCapacity;
+  /**
    * Where this multiplexer's mark is served — {@link MUX_LOGO_PATH}, or absent.
    *
    * A URL and not the SVG source: the bytes are cacheable, revalidated by ETag, and never touch the
@@ -440,6 +473,16 @@ export interface MuxConfig {
    * which the header answers by rendering exactly the text it always did.
    */
   logoUrl?: string;
+  /**
+   * How soon this bridge sees a topology change nobody announced. Mirrors the adapter's declaration
+   * (bridge/mux/capabilities.ts § MuxTopologyLatency).
+   *
+   * **Absent on any bridge older than the field**, and the phone reads that absence as `push` — the
+   * fail-open direction the whole mux block already uses (web/src/lib/mux-capability.ts). The cost
+   * of guessing wrong that way is one line of reassurance not shown; guessing the other way would
+   * put "synced 4s ago" under a multiplexer that is never stale, which is noise that means nothing.
+   */
+  topologyLatency?: MuxTopologyLatency;
 }
 
 /**
@@ -451,6 +494,24 @@ export interface MuxConfig {
  * question ("this bridge's mux") and the answer changes with the bridge, never with the URL.
  */
 export const MUX_LOGO_PATH = "/api/mux/logo.svg";
+
+/**
+ * One operator-declared Quick-dock group (a `[[replies]]` row in their `quick-replies.toml`). A
+ * pane any of these rows address shows them INSTEAD of the shipped groups; a pane none of them
+ * address keeps the shipped ones (ADR 0018, the same rule `commands.toml` and `keys.toml` follow).
+ *
+ * The shipped phrases are English, which is a content choice rather than a technical one — an
+ * operator working in another language, or one whose harness wants "approve" over "yes", has no
+ * route to that today.
+ */
+export interface OperatorQuickReplyRow {
+  /** Herdr agent name this applies to, lowercased. Omitted = every agent. */
+  agent?: string;
+  /** The group's heading, and its identity within one scope. */
+  title: string;
+  /** The literal strings sent — each is typed into the pane and submitted verbatim. */
+  items: string[];
+}
 
 /** GET /api/config — bridge capabilities and the build id (push setup + stale-cache detection). */
 export interface BridgeConfig {
@@ -469,11 +530,37 @@ export interface BridgeConfig {
   operatorCommands?: OperatorCommand[];
   /** The operator's own Keys-tray presets. Absent/empty when there is no `keys.toml`. */
   operatorKeys?: OperatorKeyRow[];
+  /** The operator's own Quick-dock groups. Absent/empty when there is no `quick-replies.toml`. */
+  operatorQuickReplies?: OperatorQuickReplyRow[];
   /**
    * The multiplexer this collie drives, and what it can do. Absent only on a bridge older than
    * M10/06 — which a client reads as "every capability present", i.e. exactly today's Herdr app.
    */
   mux?: MuxConfig;
+  /**
+   * Speech-to-text, when a provider is configured. **Absent is the feature being off**, which is
+   * also exactly what an older bridge sends — so a client reads "no key" as "no microphone" and a
+   * collie whose operator configured nothing ships the byte-identical body it always did.
+   *
+   * It carries a label and a yes/no, and never the endpoint, the model or the credential: the phone
+   * decides whether to draw a button, not where the audio goes.
+   */
+  stt?: SttCapability;
+}
+
+/**
+ * What `/api/config` says about speech-to-text. The whole of what leaves the bridge on this subject.
+ *
+ * The provider's own status lives behind `SttProvider.status()` (bridge/stt/provider.ts); this is
+ * its wire shape.
+ */
+export interface SttCapability {
+  /** The provider's id — a label the UI may show, e.g. `openai-compatible`. */
+  provider: string;
+  /** Whether it could serve a request right now. */
+  available: boolean;
+  /** Operator-facing prose when it could not. Absent when it could. */
+  reason?: string;
 }
 
 /** Rank for triage ordering — lower sorts first ("NEEDS YOU" at the top). */

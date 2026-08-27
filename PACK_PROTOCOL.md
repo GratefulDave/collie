@@ -189,6 +189,7 @@ the same handlers. There is no second handler set, no second semantic, and no He
 | `POST` | `/pack/v1/pane/:id/upload` | `POST …/upload` (`:281`) | forwarded (§13) |
 | `POST` | `/pack/v1/pane/:id/close` | `POST …/close` (`:282`) | forwarded |
 | `POST` | `/pack/v1/pane/:id/rename` | `POST …/rename` (`:283`) | forwarded |
+| `POST` | `/pack/v1/pane/:id/focus` | `POST …/focus` | forwarded — additive-optional (§7.1). Shows the pane on **the peer machine's** terminal; a lead that predates it never calls it, and a peer that predates it answers 404 to a lead that does |
 | `POST` | `/pack/v1/tab` | `POST /api/tab` (`:218`) | forwarded |
 | `POST` | `/pack/v1/tab/:id/rename\|close` | `TAB_ACTION_ROUTE` (`:102`, matched `:234`) | forwarded |
 | `POST` | `/pack/v1/workspace` | `POST /api/workspace` (`:225`) | forwarded |
@@ -410,6 +411,13 @@ updated machines, so build skew is the steady state (§7), and this section is t
   This is what makes a member running older code **behind, not incompatible**: it declines new
   optional fields, and declining is a closed reading, so there is nothing a newer member must refuse
   it over.
+
+- **The error bodies the shared session routes serve gained optional `code` and `detail`** (added
+  2026-08-24, `bridge/error-codes.ts`): a stable machine name for the refusal and the named values its
+  sentence was built from, beside the English `error` that route always sent. The sentence is
+  unchanged and stays the fallback, so a peer or a lead that ignores both fields behaves exactly as it
+  does today, and a code a reader does not recognise reads as *no code* — which renders that same
+  sentence. `PACK_PROTOCOL_VERSION` stays `1`.
 
 - **Skew is an observation, and it is rendered.** `collie pack status` compares each member's reported
   version against this build's and marks a difference as a `warn:`-class finding naming **both**

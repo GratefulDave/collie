@@ -5,7 +5,10 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ECHO_DONE_MS, useActionEcho } from "@/hooks/use-action-echo";
 import type { EchoPhase } from "@/hooks/use-action-echo";
+import { useOperatorQuickReplies } from "@/lib/operator-config";
 import { quickRepliesFor } from "@/lib/quick-replies";
+import { t as translate } from "@/lib/i18n";
+import { useLocale } from "@/hooks/use-locale";
 
 interface QuickActionsContentProps {
   /** Resolves true once the reply is verified sent — drives the ✓ and the deferred close. */
@@ -15,6 +18,18 @@ interface QuickActionsContentProps {
   agent: string | undefined | null;
   isShell: boolean;
   disabled?: boolean;
+}
+
+/** `quickRepliesFor`'s group titles are catalog identifiers ("confirm"/"common"), not display text —
+ *  translate them here rather than in the data (lib/quick-replies.ts is the sent-verbatim catalog,
+ *  a different content class from a UI label). Unknown ids (a future catalog entry) fall back to the
+ *  raw identifier rather than throwing. */
+function groupTitle(title: string): string {
+  return title === "confirm"
+    ? translate("quickActions.group.confirm")
+    : title === "common"
+      ? translate("quickActions.group.common")
+      : title;
 }
 
 // Module-level so it isn't a fresh component type each render (which would remount the grid).
@@ -84,7 +99,9 @@ export function QuickActionsContent({
   isShell,
   disabled,
 }: QuickActionsContentProps) {
-  const groups = quickRepliesFor(agent, isShell);
+  useLocale();
+  const operatorGroups = useOperatorQuickReplies();
+  const groups = quickRepliesFor(agent, isShell, operatorGroups);
   const echo = useActionEcho();
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -111,7 +128,7 @@ export function QuickActionsContent({
       {groups.map((g) => (
         <Group
           key={g.title}
-          title={g.title}
+          title={groupTitle(g.title)}
           items={g.items}
           cols="grid-cols-2"
           disabled={disabled}

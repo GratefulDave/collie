@@ -32,6 +32,7 @@ export const MUX_CAPABILITIES = [
   "sendKeys",
   "renamePane",
   "closePane",
+  "setFocus",
   "createTab",
   "renameTab",
   "closeTab",
@@ -42,6 +43,28 @@ export const MUX_CAPABILITIES = [
 
 /** One declarable capability. */
 export type MuxCapability = (typeof MUX_CAPABILITIES)[number];
+
+/**
+ * How soon Collie learns about a topology change nobody told it about — a pane opened, a tab renamed
+ * or a window killed **in the multiplexer's own UI**.
+ *
+ * NOT a capability, for the same reason `unsupportedKeys` is not: it answers "how fast", never
+ * "whether". Every adapter keeps `watch()`'s promise; this says what the bound behind that promise
+ * actually is, so a caller can stop guessing it from `pushTopologyEvents`.
+ *
+ *  • `push` — the multiplexer announces it, so the bound is the transport's own latency and there is
+ *    no number to state.
+ *  • `bounded` — the adapter censuses, and `ms` is the LONGEST a change can sit unseen. It is the
+ *    ceiling, never the floor: an adaptive census (zellij's) states the slowest it ever runs.
+ *
+ * It is DECLARED rather than discovered because the only alternative is the phone timing the bridge,
+ * and a number derived that way is indistinguishable from a slow network (ADR 0031). `/api/config`
+ * publishes it, and it is the whole reason the home screen can honestly say "synced 4s ago" under one
+ * multiplexer and stay silent under another.
+ */
+export type MuxTopologyLatency =
+  | { readonly kind: "push" }
+  | { readonly kind: "bounded"; readonly ms: number };
 
 /**
  * The route that consumes each capability — the evidence the set was derived rather than invented.
@@ -61,6 +84,8 @@ export const MUX_CAPABILITY_ROUTES = {
   sendKeys: "POST /api/pane/:id/reply (step two, the submit key) and POST /api/pane/:id/keys (the Keys tray).",
   renamePane: "POST /api/pane/:id/rename — set or clear a pane's operator-chosen label.",
   closePane: "POST /api/pane/:id/close — kill the pane and the agent in it.",
+  setFocus:
+    "POST /api/pane/:id/focus — the pane action sheet's \"Show in terminal\" row, the one act by which the phone moves the operator's own screen. Absent ⇒ the row is not there (hide the meaningless), and the phone can still SEE which pane the terminal shows, because `MuxPane.focused` is on the floor.",
   createTab: "POST /api/tab — a new tab in a space, opening a fresh shell.",
   renameTab: "POST /api/tab/:id/rename.",
   closeTab: "POST /api/tab/:id/close — a bulk pane-close.",
@@ -89,13 +114,58 @@ export interface MuxCapabilityDeclaration {
   readonly unsupportedKeys: readonly string[];
   /** Per-capability operator-facing reason, shown where a control is explained rather than hidden. */
   readonly notes: Readonly<Partial<Record<MuxCapability, string>>>;
+  /**
+   * How many spaces this multiplexer can hold. A FACT, declared — never a capability.
+   *
+   * `"one"` is not "has one space right now"; it is "one is all it can ever have, by construction",
+   * which is true of zellij (every one of its verbs is scoped to a single session) and of nothing
+   * else here. It is not a capability because nothing degrades: there is no verb to decline and no
+   * control to grey out — the space level simply is not a level on that multiplexer, so the UI drops
+   * a strip that could only ever show one chip and the tab strip becomes the top level.
+   *
+   * Published in `/api/config` under `mux`. The phone reads an ABSENT value as `"many"`, which is
+   * both the fail-open direction and the harmless one: a space strip over one space is a strip
+   * nobody needed, while a hidden strip over three spaces is navigation the operator cannot reach.
+   */
+  readonly spaces: MuxSpaceCapacity;
+  /**
+   * How soon an out-of-band topology change is seen. See {@link MuxTopologyLatency}.
+   *
+   * REQUIRED, and there is no default: a missing answer would read as `push` to anything that
+   * defaulted optimistically and as `bounded` to anything that defaulted safely, and those two are
+   * different promises to the operator.
+   *
+   * The opposite rule to {@link spaces} one line up, and the two disagree for a reason. An
+   * unanswered SHAPE has a harmless answer (`"many"` leaves every level reachable), so it may
+   * default. An unanswered BOUND has none: both directions promise the operator something the
+   * adapter never said.
+   */
+  readonly topologyLatency: MuxTopologyLatency;
 }
+
+/**
+ * How many spaces a multiplexer can hold — declared, because the UI reacts to it.
+ *
+ * Two values and no number: the question the UI asks is "is there a level above the tab strip?", and
+ * a count would invite reading a momentary snapshot as a permanent shape.
+ */
+export type MuxSpaceCapacity = "one" | "many";
 
 /** What an adapter passes to {@link declareCapabilities}. Anything omitted is declared ABSENT. */
 export interface MuxCapabilityInput {
   readonly supports: readonly MuxCapability[];
   readonly unsupportedKeys?: readonly string[];
   readonly notes?: Readonly<Partial<Record<MuxCapability, string>>>;
+  /**
+   * How many spaces this multiplexer can hold. Omitted reads as `"many"`.
+   *
+   * The opposite default to a capability's, on purpose: an unanswered CAPABILITY must degrade the UI
+   * (fail-closed), while an unanswered SHAPE must leave every level reachable (fail-open). The same
+   * rule the phone applies to an absent `mux` block, applied here so the two ends cannot disagree.
+   */
+  readonly spaces?: MuxSpaceCapacity;
+  /** Required — see {@link MuxCapabilityDeclaration.topologyLatency} for why there is no default. */
+  readonly topologyLatency: MuxTopologyLatency;
 }
 
 /**
@@ -119,6 +189,7 @@ export function declareCapabilities(input: MuxCapabilityInput): MuxCapabilityDec
     sendKeys: claimed.has("sendKeys"),
     renamePane: claimed.has("renamePane"),
     closePane: claimed.has("closePane"),
+    setFocus: claimed.has("setFocus"),
     createTab: claimed.has("createTab"),
     renameTab: claimed.has("renameTab"),
     closeTab: claimed.has("closeTab"),
@@ -130,6 +201,8 @@ export function declareCapabilities(input: MuxCapabilityInput): MuxCapabilityDec
     supports,
     unsupportedKeys: input.unsupportedKeys ?? [],
     notes: input.notes ?? {},
+    spaces: input.spaces ?? "many",
+    topologyLatency: input.topologyLatency,
   };
 }
 

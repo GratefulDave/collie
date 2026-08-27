@@ -1,4 +1,4 @@
-import type { MuxAdapter, MuxPane } from "./mux/types.ts";
+import type { MuxAdapter, MuxAttention, MuxPane } from "./mux/types.ts";
 import {
   type AgentStatus,
   type AgentView,
@@ -74,6 +74,41 @@ export function extractClaudeSessionName(text: string): string | undefined {
 const SHELL = "shell";
 
 /**
+ * The interactive shells whose presence in a pane's foreground means "nothing is running here".
+ *
+ * A closed list of program names, matched on the base name only. It decides ONE thing — whether a
+ * terminal title has outlived the program that printed it — and it may decide nothing else: it is
+ * not an agent check, not a status, and it never reaches `agent` (mux/types.ts § MuxPane.agent,
+ * which is the whole reason this list is allowed to be a guess).
+ */
+const INTERACTIVE_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"]);
+
+/**
+ * Is this pane's terminal title left over from a program that has already exited?
+ *
+ * A multiplexer keeps a pane's title after the program that set it is gone — live-observed on tmux, a
+ * bare `bash` still advertising a finished agent's task ("✳ waiting for soak time…"). Two raw facts
+ * the adapter already reports say so together: an interactive SHELL in the foreground, and a title
+ * that is not that shell's own name. Neither alone means anything, and the pair is evidence rather
+ * than proof — which is exactly why the answer is a rendering hint and never a deletion: the title
+ * stays on the wire, and the phone shows it quietly instead of as the pane's name.
+ *
+ * A pane whose adapter reports no foreground command at all (Herdr) is never stale: there is nothing
+ * to read the emptiness as.
+ *
+ * Pure + exported so the rule is unit-tested and lives in ONE place.
+ */
+export function terminalTitleIsStale(pane: MuxPane): boolean {
+  const title = pane.terminalTitle?.trim() ?? "";
+  if (title.length === 0) return false;
+  const argv0 = pane.foregroundCommand?.trim().split(/\s+/)[0] ?? "";
+  const command = (argv0.split("/").pop() ?? "").toLowerCase();
+  if (command.length === 0 || !INTERACTIVE_SHELLS.has(command)) return false;
+  // A shell that titles the pane after itself is describing the present, not the past.
+  return title.toLowerCase() !== command;
+}
+
+/**
  * One pane the multiplexer reported, as the view Collie's clients read.
  *
  * Almost a rename, and that is the point: the port already carries everything a pane IS, so this
@@ -101,6 +136,9 @@ function toView(pane: MuxPane, kind: "agent" | "shell"): AgentView {
   // Denormalised alongside workspaceLabel so no client has to join tabs[].
   if (pane.tabLabel) view.tabLabel = pane.tabLabel;
   if (pane.terminalTitle) view.terminalTitle = pane.terminalTitle;
+  // The title is still on the wire; this only says the phone should read it quietly. Set only when
+  // true, so every pane that was byte-identical before this field existed still is.
+  if (terminalTitleIsStale(pane)) view.terminalTitleStale = true;
   // How the agent named its session — SERVER-SIDE ONLY (stripped by toPaneWire). Whether a ref is
   // meaningful is the journal adapter's call; absent simply means "no history for this pane".
   if (pane.agentSession) view.agentSession = pane.agentSession;
@@ -118,6 +156,16 @@ export interface EngineSnapshot {
   tabs: TabView[];
   bridge: BridgeStatus;
 }
+
+/**
+ * How long one read keeps this collie "watched".
+ *
+ * Comfortably longer than the frontend's own cold cadence (4 s) so an operator sitting on the
+ * dashboard with a quiet herd never flickers between watched and idle, and short enough that a phone
+ * put in a pocket stops costing a fast census within a couple of polls. It is deliberately NOT the
+ * poll interval: attention is about a human being present, and the poller is only the evidence.
+ */
+export const ATTENTION_WINDOW_MS = 10_000;
 
 type TransitionListener = (agent: AgentView, from: AgentStatus, to: AgentStatus) => void;
 type RemoveListener = (paneId: string) => void;
@@ -145,8 +193,18 @@ export class StateEngine {
   // One follow-up poll queued when pokeNow lands mid-poll: an event may describe state the
   // in-flight poll already read past, so we must re-poll once it settles.
   private queuedPoll = false;
+  // When a phone last read this collie — see noteAttention. Epoch ms; 0 means "never", which reads
+  // as idle for any clock.
+  private lastReadAt = 0;
+  // One warn per disconnected episode, INCLUDING the episode that starts at boot. The old
+  // connected-gated warn was silent there, so a first poll losing the multiplexer's startup race
+  // left no trace at all — the one thing an operator needs to see when a cold herd reads empty.
+  private pollFailureLogged = false;
   // Current interval cadence; setCadence swaps it (relaxed while the event stream is healthy).
   private cadenceMs: number;
+  // A relax ordered before the engine has ever CONNECTED - parked, and applied by the first
+  // successful poll. See setCadence for why relaxing is earned rather than granted on an ack.
+  private pendingCadenceMs: number | null = null;
   constructor(
     private readonly mux: MuxAdapter,
     private readonly pollMs: number,
@@ -188,6 +246,28 @@ export class StateEngine {
     return () => this.tickListeners.delete(fn);
   }
 
+  /**
+   * A phone just read this collie. Stamped by the two routes that mean somebody is LOOKING —
+   * `/api/snapshot` and `/api/pane/:id` — and by nothing else.
+   *
+   * Deliberately not every request: a push subscription, a config read or a preference write are
+   * things a background page does, and treating them as attention would keep a pocketed phone's
+   * census running fast forever.
+   */
+  noteAttention(now = Date.now()): void {
+    this.lastReadAt = now;
+  }
+
+  /**
+   * Is somebody watching right now? The bridge's answer, handed to the mux watch (mux/types.ts).
+   *
+   * `idle` until the first read, which is the honest starting state: a bridge that has just come up
+   * has nobody looking at it, and starting `watched` would spend a fast census on every restart.
+   */
+  attention(now = Date.now()): MuxAttention {
+    return now - this.lastReadAt <= ATTENTION_WINDOW_MS ? "watched" : "idle";
+  }
+
   current(): EngineSnapshot {
     return {
       agents: this.agents,
@@ -202,6 +282,7 @@ export class StateEngine {
     if (this.started) return;
     this.started = true;
     this.cadenceMs = this.pollMs;
+    this.pendingCadenceMs = null;
     void this.poll();
     this.timer = setInterval(() => void this.poll(), this.cadenceMs);
   }
@@ -228,7 +309,27 @@ export class StateEngine {
 
   /** Re-arm the interval at a new cadence (relaxed while events are healthy). No-op if unchanged or stopped. */
   setCadence(ms: number): void {
-    if (!this.started || ms === this.cadenceMs) return;
+    if (!this.started) return;
+    // Relaxing is EARNED by a connected poll, never granted on the watch's ack alone. That ack
+    // proves the multiplexer answered a CENSUS - not that a snapshot succeeded, and `snapshot()`
+    // also runs list-tabs, which on a cold start can lose a race the census won. Relaxing on the
+    // ack alone leaves that miss standing for a whole idle interval; measured at 13.1 s on zellij.
+    //
+    // So a relax ordered while never-yet-connected is PARKED: the fast cadence keeps retrying, and
+    // the first connected poll applies it. A tighten always applies at once, and kills the parked
+    // relax - a watch that flapped down must not have its earlier relax resurrected by a later
+    // connect.
+    if (ms > this.pollMs && this.bridge !== "connected") {
+      this.pendingCadenceMs = ms;
+      return;
+    }
+    this.pendingCadenceMs = null;
+    this.applyCadence(ms);
+  }
+
+  /** Swap the interval to `ms` if it differs. The one place the poll timer is re-armed. */
+  private applyCadence(ms: number): void {
+    if (ms === this.cadenceMs) return;
     this.cadenceMs = ms;
     if (this.timer) clearInterval(this.timer);
     this.timer = setInterval(() => void this.poll(), ms);
@@ -305,12 +406,20 @@ export class StateEngine {
       this.workspaces = workspaceViews;
       this.tabs = tabViews;
       this.bridge = "connected";
+      this.pollFailureLogged = false;
+      // The relax the watch ordered while we had never yet connected - earned now.
+      if (this.pendingCadenceMs !== null) {
+        const relaxed = this.pendingCadenceMs;
+        this.pendingCadenceMs = null;
+        this.applyCadence(relaxed);
+      }
 
       // After all transition/removal bookkeeping so listeners see a consistent, current snapshot.
       const snap = this.current();
       for (const fn of this.updateListeners) fn(snap);
     } catch (err) {
-      if (this.bridge === "connected") {
+      if (!this.pollFailureLogged) {
+        this.pollFailureLogged = true;
         console.warn(`[state] poll failed, marking disconnected: ${err instanceof Error ? err.message : String(err)}`);
       }
       this.bridge = "disconnected";

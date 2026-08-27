@@ -32,8 +32,9 @@
 // {@link MUX_WORLD_CHECKS}, which only ever runs against a fixture's fake world.
 //
 // WHAT AN ADAPTER OWES THIS SUITE is one {@link MuxConformanceFixture}: how to build itself against
-// an injected transport, and how to make that transport do the five things no adapter can simulate
-// from the outside (reconnect, mux restart, out-of-band rename, changed content, a pane dying).
+// an injected transport, and how to make that transport do the six things no adapter can simulate
+// from the outside (reconnect, mux restart, out-of-band rename, changed content, a pane dying, and a
+// structure change nobody announced).
 // Adding tmux (M10/04) or zellij (M10/05) is that fixture plus a registry entry — never a test file.
 
 import { MUX_CAPABILITIES, type MuxCapability } from "./capabilities.ts";
@@ -66,8 +67,8 @@ export interface MuxWrite {
 }
 
 /**
- * One adapter, built against a transport the fixture can drive — plus the five perturbations that
- * make identity and liveness checkable at all.
+ * One adapter, built against a transport the fixture can drive — plus the perturbations that make
+ * identity, liveness and freshness checkable at all.
  *
  * A world is SINGLE-USE. Checks that close panes, kill tabs or end the multiplexer get their own,
  * which is why {@link MuxConformanceFixture.create} is what the engine holds rather than a world.
@@ -93,10 +94,45 @@ export interface MuxConformanceWorld {
   restartMux(): Promise<void>;
   /** Someone renames a pane in the multiplexer's own UI — not through Collie. */
   renameOutOfBand(paneId: string, label: string): Promise<void>;
+  /**
+   * The PROGRAM in a pane prints a terminal title.
+   *
+   * A different act from {@link renameOutOfBand}, and the difference is the whole point: that one is
+   * a person naming a pane, this one is software describing itself. The contract says the second may
+   * never be reported as `paneLabel` (MUX_CONTRACT.md § Contract-owned rules, *Pane naming*), which
+   * is what {@link aPrintedTitleIsNeverAnOperatorLabel} checks.
+   *
+   * Optional, because only a multiplexer that HAS a printed-title concept can be asked to model one.
+   * A fixture that supplies none simply skips that check — nothing else in the suite reads it.
+   */
+  setProgramTitle?(paneId: string, title: string): Promise<void>;
   /** This pane's rendered content becomes different. What a keystroke landing would have done. */
   changePane(paneId: string): Promise<void>;
   /** This pane's process ends and the multiplexer forgets it. Writes to it must answer `gone`. */
   endPane(paneId: string): Promise<void>;
+  /**
+   * The OPERATOR moves their own focus, in the multiplexer's UI — not through Collie.
+   *
+   * Every multiplexer here can simulate it, because every one of them REPORTS focus on the floor
+   * ({@link MuxPane.focused}), and a fact nothing can move is a fact nothing proves. It is the
+   * perturbation behind "the snapshot reports the terminal's focus", which is the half of the focus
+   * contract that holds even where `setFocus` is declined.
+   */
+  focusOutOfBand(paneId: string): Promise<void>;
+  /**
+   * The herd's SHAPE changes and nothing announces it — the operator renamed a tab with their own
+   * keyboard.
+   *
+   * The sibling of {@link pokeTopology} and its opposite: that one announces a change on a channel,
+   * this one changes the world in SILENCE. It is what makes `refresh()` testable at all, because a
+   * change that was announced would have reached the watch by itself and proved nothing about
+   * looking on demand.
+   *
+   * A tab rename rather than a new pane, and deliberately: every multiplexer Collie drives has tabs
+   * with labels, so the perturbation is one every fixture can simulate honestly (this file asks for
+   * exactly that of a shared world knob).
+   */
+  pokeTopologyOutOfBand(): Promise<void>;
   /**
    * Make the multiplexer announce a topology / pane change on its event channel.
    *
@@ -245,6 +281,13 @@ function capabilityCalls(adapter: MuxAdapter, targets: CallTargets): CapabilityC
       writes: true,
       run: async () => refusalOf(await adapter.createSpace({ cwd: "/tmp" })),
     },
+    {
+      capability: "setFocus",
+      // It moves the OPERATOR's screen, so it is a write in the sense that matters here: the live
+      // probe must never run it against a real multiplexer (the header's rule).
+      writes: true,
+      run: async () => refusalOf(await adapter.setFocus(targets.paneId)),
+    },
     // The destructive pair is last so a world that runs the whole table top-down still has a pane and
     // a tab to aim the earlier calls at.
     {
@@ -321,6 +364,48 @@ const declarationIsWellFormed: MuxReadCheck = {
       if (!known.has(name)) problems.push(`notes carries "${name}", which is not a capability`);
     }
     return Promise.resolve(problems);
+  },
+};
+
+const latencyIsDeclared: MuxReadCheck = {
+  name: "the topology latency is declared, and a bound is a real number",
+  run(adapter) {
+    const problems: string[] = [];
+    const latency = adapter.capabilities.topologyLatency;
+    // Total and typed on the declaration, so this cannot fail on a build that compiled — which is
+    // the point: what it catches is an adapter assembling a declaration at runtime from data, and a
+    // `bounded` whose number came out of a config, an env var or an arithmetic slip.
+    if (latency.kind !== "push" && latency.kind !== "bounded") {
+      problems.push("topologyLatency is neither `push` nor `bounded` — a caller cannot read it");
+      return Promise.resolve(problems);
+    }
+    if (latency.kind === "bounded") {
+      // A bound of zero (or NaN, or a negative) is not a fast adapter, it is an unstated one: it
+      // would publish "synced 0s ago" forever and promise a freshness nothing keeps.
+      if (!Number.isFinite(latency.ms) || latency.ms <= 0) {
+        problems.push(`a bounded topologyLatency states ms=${String(latency.ms)}, which is not a bound`);
+      }
+    }
+    return Promise.resolve(problems);
+  },
+};
+
+const refreshIsHarmless: MuxReadCheck = {
+  name: "refresh() resolves against a live multiplexer and changes nothing",
+  async run(adapter) {
+    const before = await adapter.snapshot();
+    try {
+      await adapter.refresh();
+    } catch (err) {
+      return [`refresh() threw: ${err instanceof Error ? err.message : String(err)}`];
+    }
+    // The contract's own words: after refresh, the next snapshot reflects the CURRENT topology. On a
+    // quiescent herd that is the same herd, and this is the live probe's whole safety claim about
+    // the call — it is in the read-only set, so it must be provably safe to point at somebody's own
+    // work session (see MUX_READ_ONLY_CHECKS).
+    const after = await adapter.snapshot();
+    const lost = idsLostBetween(before.panes, after.panes);
+    return lost.length === 0 ? [] : [`refresh() lost the panes: ${lost.join(", ")}`];
   },
 };
 
@@ -452,6 +537,42 @@ const gridReadAnswersTheContract: MuxReadCheck = {
   },
 };
 
+const focusIsReportedHonestly: MuxReadCheck = {
+  name: "at most one pane per space is focused, and a focused pane is alive",
+  async run(adapter) {
+    const snapshot = await adapter.snapshot();
+    const problems: string[] = [];
+    const perSpace = new Map<string, string[]>();
+    for (const pane of snapshot.panes) {
+      if (!pane.focused) continue;
+      perSpace.set(pane.spaceId, [...(perSpace.get(pane.spaceId) ?? []), pane.paneId]);
+      // "The pane the operator's terminal is showing" cannot be a pane whose process has ended and
+      // whose record only survives as a corpse.
+      if (!pane.alive) problems.push(`pane "${pane.paneId}" is reported focused and not alive`);
+    }
+    for (const [spaceId, focused] of perSpace) {
+      if (focused.length > 1) {
+        problems.push(`space "${spaceId}" reports ${String(focused.length)} focused panes (${focused.join(", ")}) — a terminal shows one`);
+      }
+    }
+    // ZERO focused panes is deliberately allowed and is not a gap: focus is per-client on every
+    // multiplexer here, so a herd nobody has attached to genuinely has none (probed on zellij, whose
+    // detached session marks no tab active).
+    return problems;
+  },
+};
+
+const spaceCapacityMatchesTheWorld: MuxReadCheck = {
+  name: "a multiplexer that declares one space has exactly one",
+  async run(adapter) {
+    if (adapter.capabilities.spaces !== "one") return [];
+    const snapshot = await adapter.snapshot();
+    return snapshot.spaces.length === 1
+      ? []
+      : [`spaces is declared "one" but the snapshot carries ${String(snapshot.spaces.length)} — the phone drops the space strip on that word`];
+  },
+};
+
 /**
  * Read-only checks — every one of them safe to run against a REAL multiplexer.
  *
@@ -467,6 +588,10 @@ export const MUX_READ_ONLY_CHECKS: readonly MuxReadCheck[] = [
   undeclaredCapabilitiesRefuse,
   undeclaredPaneFactsAreAbsent,
   gridReadAnswersTheContract,
+  focusIsReportedHonestly,
+  spaceCapacityMatchesTheWorld,
+  latencyIsDeclared,
+  refreshIsHarmless,
 ];
 
 // ── The world checks (fixture only — these write) ─────────────────────────────
@@ -483,6 +608,36 @@ async function inWorld(
     await world.close();
   }
 }
+
+/** A snapshot's shape as one string — enough that any structural change is a different string. */
+function topologySignature(snapshot: MuxSnapshot): string {
+  const spaces = snapshot.spaces.map((space) => `${space.spaceId}=${space.label}`).join("|");
+  const tabs = snapshot.tabs.map((tab) => `${tab.tabId}=${tab.label}`).join("|");
+  const panes = snapshot.panes.map((pane) => pane.paneId).join("|");
+  return `${spaces}//${tabs}//${panes}`;
+}
+
+const refreshSeesASilentChange: MuxWorldCheck = {
+  name: "refresh() then snapshot() shows a change nothing announced",
+  run(fixture) {
+    return inWorld(fixture, async (world) => {
+      const { adapter } = world;
+      const before = topologySignature(await adapter.snapshot());
+      // NOT a poke on an event channel. A change that announced itself would have reached the watch
+      // by itself, and this check would then pass on every adapter while proving nothing about
+      // asking on demand — which is the one thing `refresh()` is for.
+      await world.pokeTopologyOutOfBand();
+      await adapter.refresh();
+      const after = topologySignature(await adapter.snapshot());
+      return after === before
+        ? [
+            "the herd changed with nothing announcing it, refresh() resolved, and the next snapshot " +
+              "still showed the old shape — the contract's promise is that the very next read is current",
+          ]
+        : [];
+    });
+  },
+};
 
 const declaredCapabilitiesWork: MuxWorldCheck = {
   name: "every declared capability actually works",
@@ -514,6 +669,59 @@ const declaredPaneFactsArePopulated: MuxWorldCheck = {
       }
       if (declares(adapter, "agentSessionRef") && !snapshot.panes.some((pane) => pane.agentSession !== undefined)) {
         problems.push("agentSessionRef is declared but not one pane in the fixture's world carries a session");
+      }
+      return problems;
+    });
+  },
+};
+
+/**
+ * The contract's *Pane naming* rule, checkable through the world contract because the world contract
+ * can tell the two acts apart: {@link MuxConformanceWorld.setProgramTitle} is software describing
+ * itself, {@link MuxAdapter.renamePane} is the operator naming a pane through Collie.
+ *
+ * Three assertions, and the middle one is why this is not just "never report a title as a label":
+ * the operator's own label must still SURVIVE on a multiplexer whose two names share one slot.
+ */
+const aPrintedTitleIsNeverAnOperatorLabel: MuxWorldCheck = {
+  name: "a title the pane's program printed is reported as a terminal title, never as the operator's label",
+  run(fixture) {
+    return inWorld(fixture, async (world) => {
+      const { adapter } = world;
+      const setProgramTitle = world.setProgramTitle?.bind(world);
+      if (setProgramTitle === undefined) return [];
+      const target = livePanes(await adapter.snapshot()).at(0);
+      if (target === undefined) return ["the fixture's world has no pane to title"];
+      const problems: string[] = [];
+      // No status glyph in it: an adapter may legitimately clean a title on the way through (Herdr's
+      // does), and this check is about WHICH FIELD the title lands in, not about its spelling.
+      const printed = "a sentence the program wrote about itself";
+
+      await setProgramTitle(target.paneId, printed);
+      const titled = (await adapter.snapshot()).panes.find((pane) => pane.paneId === target.paneId);
+      if (titled?.paneLabel === printed) {
+        problems.push(`a title the program printed came back as paneLabel "${printed}"`);
+      }
+      if (titled?.terminalTitle !== printed) {
+        problems.push(`a title the program printed was not reported as terminalTitle (got ${String(titled?.terminalTitle)})`);
+      }
+
+      if (!declares(adapter, "renamePane")) return problems;
+      const label = "the name the operator chose";
+      const renamed = await adapter.renamePane(target.paneId, label);
+      if (!renamed.ok) return [...problems, `renamePane is declared but answered ${describeRefusal(renamed)}`];
+      const labelled = (await adapter.snapshot()).panes.find((pane) => pane.paneId === target.paneId);
+      if (labelled?.paneLabel !== label) {
+        problems.push(`the operator's own label did not come back as paneLabel (got ${String(labelled?.paneLabel)})`);
+      }
+
+      // And the slot returns to being the program's the moment the operator's name is cleared.
+      const cleared = await adapter.renamePane(target.paneId, null);
+      if (!cleared.ok) return [...problems, `renamePane(null) answered ${describeRefusal(cleared)}`];
+      await setProgramTitle(target.paneId, printed);
+      const after = (await adapter.snapshot()).panes.find((pane) => pane.paneId === target.paneId);
+      if (after?.paneLabel !== undefined) {
+        problems.push(`a cleared label left "${after.paneLabel}" behind as paneLabel`);
       }
       return problems;
     });
@@ -681,6 +889,7 @@ const PANE_ADDRESSED = new Set<MuxCapability>([
   "sendKeys",
   "renamePane",
   "closePane",
+  "setFocus",
 ]);
 
 const revisionMovesWithContent: MuxWorldCheck = {
@@ -780,13 +989,61 @@ const watchKeepsItsPromise: MuxWorldCheck = {
   },
 };
 
+const focusFollowsTheMultiplexer: MuxWorldCheck = {
+  name: "the snapshot reports the terminal's focus, and `setFocus` moves it where it is declared",
+  run(fixture) {
+    return inWorld(fixture, async (world) => {
+      const { adapter } = world;
+      const panes = livePanes(await adapter.snapshot());
+      // TWO PANES OF ONE SPACE, deliberately. Focus is per-space on a multiplexer that has several
+      // (tmux's current window is a property of the session), so a check spanning two spaces would
+      // demand that focusing here unfocuses over there — which is not what any of them do.
+      const target = panes.find((pane) => panes.some((other) => other.spaceId === pane.spaceId && other.paneId !== pane.paneId));
+      const other = panes.find((pane) => pane.spaceId === target?.spaceId && pane.paneId !== target.paneId);
+      if (target === undefined || other === undefined) {
+        return ["the fixture's world has no space holding two live panes to move focus between"];
+      }
+      const problems: string[] = [];
+      const focusedNow = async (): Promise<string[]> =>
+        (await adapter.snapshot()).panes
+          .filter((pane) => pane.focused && pane.spaceId === target.spaceId)
+          .map((pane) => pane.paneId);
+
+      // Half one: the OPERATOR moves focus. This holds for every adapter, declared capability or not
+      // — reporting focus is on the floor, and only changing it is a capability.
+      await world.focusOutOfBand(target.paneId);
+      if (!(await focusedNow()).includes(target.paneId)) {
+        problems.push(`focus moved to "${target.paneId}" in the multiplexer and the snapshot did not report it`);
+      }
+
+      // Half two: COLLIE moves focus, and only where the adapter said it could.
+      const moved = await adapter.setFocus(other.paneId);
+      if (!declares(adapter, "setFocus")) {
+        if (moved.ok) problems.push("setFocus is declared absent but the call SUCCEEDED");
+        return problems;
+      }
+      if (!moved.ok) return [...problems, `setFocus is declared but answered ${describeRefusal(moved)}`];
+      const after = await focusedNow();
+      if (!after.includes(other.paneId)) {
+        problems.push(`setFocus("${other.paneId}") answered ok and the snapshot still focuses ${after.join(", ") || "nothing"}`);
+      }
+      if (after.includes(target.paneId)) {
+        problems.push(`setFocus moved focus to "${other.paneId}" and "${target.paneId}" is still focused too`);
+      }
+      return problems;
+    });
+  },
+};
+
 /**
  * Checks that WRITE. Fixture worlds only — never point these at a live multiplexer; they type into
  * panes, rename them, and kill them.
  */
 export const MUX_WORLD_CHECKS: readonly MuxWorldCheck[] = [
+  refreshSeesASilentChange,
   declaredCapabilitiesWork,
   declaredPaneFactsArePopulated,
+  aPrintedTitleIsNeverAnOperatorLabel,
   identitySurvivesPerturbation,
   idsAreNeverRecycled,
   sendsKeepTheirOrder,
@@ -795,4 +1052,5 @@ export const MUX_WORLD_CHECKS: readonly MuxWorldCheck[] = [
   revisionMovesWithContent,
   scrollbackReachesFurther,
   watchKeepsItsPromise,
+  focusFollowsTheMultiplexer,
 ];

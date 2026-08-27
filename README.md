@@ -4,11 +4,18 @@
   <img src="assets/collie-hero.webp" alt="A collie herding a flock of sheep" width="640">
 </p>
 
+<p align="center">
+  <a href="https://colliepwa.dev/demo"><b>Try it in your browser — no install</b></a> ·
+  <a href="https://colliepwa.dev">colliepwa.dev</a><br>
+  <sub>A real Collie build running in the page against faked data.</sub>
+</p>
+
 A phone web UI for your [Herdr](https://herdr.dev) agent herd, served over Tailscale. Open a URL, see
 which agent is waiting on you, and answer it with your phone's keyboard.
 
-The reply box is an ordinary text field, so your phone's own voice dictation works in it; Collie
-ships none of its own.
+The reply box is an ordinary text field, so your phone's own voice dictation works in it — and if you
+want a mic that doesn't depend on the keyboard, Collie has its own
+[voice input](#voice-input-optional), off until you turn it on.
 
 **Features**
 
@@ -31,16 +38,19 @@ ships none of its own.
   [Pair a device](#pair-a-device--the-write-credential)
 - [Requirements](#requirements)
 - [Install](#install)
-- [First run — what you'll see](#first-run--what-youll-see)
+- [First run — what you'll see](#first-run--what-youll-see) ·
+  [Using the app on tmux or zellij](#using-the-app-on-tmux-or-zellij) (experimental)
 - [Configure](#configure) · [Your own slash commands](#your-own-slash-commands) ·
-  [Multi-session](#multi-session)
-- [Dark mode / light mode](#dark-mode--light-mode)
-- [Commands](#commands) · [Put `collie` on your PATH](#put-collie-on-your-path) ·
-  [Herdr actions](#herdr-actions)
+  [Your own key presets](#your-own-key-presets) ·
+  [Your own quick replies](#your-own-quick-replies) · [Multi-session](#multi-session)
+- [Dark mode / light mode](#dark-mode--light-mode) · [Language](#language)
+- [Commands](#commands) · [Pack commands](#pack-commands) ·
+  [Put `collie` on your PATH](#put-collie-on-your-path) · [Herdr actions](#herdr-actions)
 - [Manage & update](#manage--update) · [Migrating from 0.x](#migrating-from-0x)
 - [Deployment variants](#deployment-variants) · [B–E in `DEPLOYMENT.md`](./DEPLOYMENT.md)
 - [Windows (experimental)](#windows-experimental)
-- [Web Push](#web-push-optional)
+- [Voice input](#voice-input-optional) · [Agent beacons](#agent-beacons-optional-linux) ·
+  [Web Push](#web-push-optional)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
 - [Developing this plugin](#developing-this-plugin)
@@ -51,6 +61,9 @@ A run through the herd from a phone: the dashboard floats the agent that **needs
 you drill into a space's tabs and panes (long-press a pane pill or a tab chip to rename or close it —
 and a Claude pane shows the name you gave it with `/rename`), answer an `AskUserQuestion` prompt with
 a tap, switch between herds, and pick up a push notification the moment an agent is waiting on input.
+
+To drive it yourself instead of watching, the [interactive demo](https://colliepwa.dev/demo) runs the
+real app in your browser against faked data — nothing to install.
 
 <table>
   <tr>
@@ -108,14 +121,16 @@ The sharp edges:
 - **Every write is appended to `<state-dir>/audit.log`** — replies, keys, uploads, pane and tab
   create/close. A trail is not a gate (details:
   [ARCHITECTURE.md §6](./ARCHITECTURE.md#6-security-model)).
-- **The defenses:** loopback bind only, never `0.0.0.0`; exactly one hardened front door —
+- **The defenses:** loopback bind only, never `0.0.0.0` (the bridge refuses to start on a wide bind
+  unless you set `COLLIE_ALLOW_NON_LOOPBACK_BIND=1`); exactly one hardened front door —
   `tailscale serve` or a conforming reverse proxy, never `funnel` and never a bare port; a
   same-origin gate and a strict CSP, with pane output rendered as React text nodes rather than
-  `innerHTML`. Two settings are yours to switch on, and you should: `COLLIE_TRUSTED_USER` rejects any
-  tailnet login but yours, and `COLLIE_PUBLIC_HOSTS` blocks DNS rebinding (effectively mandatory
-  under `COLLIE_SERVE_MODE=http`). Authorising individual *devices* is
-  [pairing](#pair-a-device--the-write-credential) — no proxy required — or, if a proxy already
-  injects a device identity, `COLLIE_DEVICE_HEADER` + `COLLIE_DEVICE_ALLOWLIST`, see
+  `innerHTML`. Host-header validation is on by default and fails closed (`COLLIE_ALLOW_ANY_HOST=1`
+  turns it off), and a non-loopback bind refuses to start. `COLLIE_TRUSTED_USER` is yours to set, and
+  you should: it rejects a mismatching *or missing* `Tailscale-User-Login` (tagged nodes get no
+  header; `COLLIE_TRUSTED_USER_OPTIONAL=1` restores the old missing-header pass). Authorising
+  individual *devices* is [pairing](#pair-a-device--the-write-credential) — no proxy required — or,
+  if a proxy already injects a device identity, `COLLIE_DEVICE_HEADER` + `COLLIE_DEVICE_ALLOWLIST`, see
   [`DEPLOYMENT.md`](./DEPLOYMENT.md).
 
 > 🚫 **Never `tailscale funnel` this** — funnel exposes it to the public internet; `serve` keeps it
@@ -164,8 +179,14 @@ On the **host** (the tailnet node your agents run on). Need Herdr 0.7.0+ — che
 | --- | --- |
 | [**Bun**](https://bun.sh) | Runs the bridge and builds the web UI — the only hard dependency. |
 | [**Herdr**](https://herdr.dev) ≥ 0.7.0 | The herd Collie mirrors; its CLI registers the plugin. |
+| **A multiplexer** — Herdr (default), [tmux](https://github.com/tmux/tmux) or [zellij](https://zellij.dev) | What Collie mirrors, one per install, picked with `COLLIE_MUX`. **tmux and zellij are experimental in 1.0** — set them up from [Using the app on tmux or zellij](#using-the-app-on-tmux-or-zellij). What each one can answer: [`MUX_CONTRACT.md`](./MUX_CONTRACT.md). |
 | [**Tailscale**](https://tailscale.com) | Front door for the default variant (`tailscale serve`); optional if you run [Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale) behind your own reverse proxy. Without any front door, Collie is `127.0.0.1`-only. |
 | **git** | Clone, and the `update` command. |
+
+**No minimum tmux or zellij version is enforced** — the adapters were probed on tmux 3.6b and zellij
+0.44.2, and neither declares a floor. One tmux caveat is checked at runtime: on a server whose
+`window-size` is `manual`, tmux below 3.7 crashes when a window is opened, so Collie refuses to open
+one and tells you to run `tmux set -g window-size latest`.
 
 Soft dependencies: **Node.js** (the `collie` CLI uses it to extract your MagicDNS name from
 `tailscale status --json`; without it the banner falls back to the loopback URL) and a **service
@@ -281,28 +302,203 @@ $ bin/collie logs        # journal timestamps trimmed here
 [push] disabled (no VAPID keys configured)
 [bridge] listening on http://127.0.0.1:8787  (poll 1500ms)
 [bridge] WARNING: COLLIE_TRUSTED_USER is empty — any tailnet device/user that reaches the bridge gets full write access. Set it to your tailnet login (see README → Variant A).
-[bridge] WARNING: COLLIE_PUBLIC_HOSTS is empty — Host-header validation is OFF (DNS rebinding not blocked). Set it to your MagicDNS name, especially under COLLIE_SERVE_MODE=http.
 ```
 
-**Both WARNINGs are expected on a fresh install** — that's Collie telling you it's running
-open-by-default on your tailnet. [Configure](#configure) closes both. (The loopback URL in the log
-is also correct: Collie itself only ever binds `127.0.0.1` — `tailscale serve` is what makes it
-reachable.) `[push] disabled` is expected too: notifications are opt-in, and
-[Web Push](#web-push-optional) is three commands.
+**That WARNING is expected on a fresh install** — identity is still open. Host-header validation is
+already on (`collie start` wrote this node's tailnet name into the unit). [Configure](#configure) sets the
+identity. (The loopback URL in the log is also correct: Collie itself only ever binds `127.0.0.1` —
+`tailscale serve` is what makes it reachable.) `[push] disabled` is expected too: notifications are
+opt-in, and [Web Push](#web-push-optional) is three commands.
 
 On the phone: your agents are listed, and the footer build stamp (`v0.9.0 · debcff9 · …`) matches
 `bin/collie version`. If the page loads but stays empty, that's the same-origin gate — see
 [Troubleshooting](#troubleshooting).
 
+## Using the app on tmux or zellij
+
+> **Experimental in 1.0.** tmux and zellij were probed on **tmux 3.6b** and **zellij 0.44.2**, by one
+> operator, on one host. Herdr stays the default and the fully supported path. **We want testers:**
+> open an issue on [AltanS/collie](https://github.com/AltanS/collie/issues/new) titled `tmux: …` or
+> `zellij: …` and say which multiplexer and version, which OS, and what you saw — what worked as much
+> as what did not.
+
+Collie drives **one** multiplexer per install, named by `COLLIE_MUX`. The two walkthroughs below get
+you from a `.env` to a dashboard listing your own windows. The reference for every key is
+[`MUX_CONTRACT.md` → Pointing a collie at a multiplexer](./MUX_CONTRACT.md#pointing-a-collie-at-a-multiplexer);
+this section is the path through it, not a copy of it.
+
+**Herdr is not required in this mode.** With `COLLIE_MUX=tmux` or `COLLIE_MUX=zellij` the bridge
+builds only the adapter you named and never dials Herdr's socket, and multi-session discovery — which
+walks Herdr's own config root — turns itself off (`bridge/index.ts`). Herdr does not have to be
+installed or running. Without it, drive Collie from the checkout with `scripts/collie-ctl.sh start`,
+and the `.env` lives in `~/.config/collie/` instead of the plugin config dir.
+
+### Pointing Collie at tmux
+
+```bash
+# in your .env — see Configure for where that file lives
+COLLIE_MUX=tmux
+COLLIE_MUX_ENDPOINT_TMUX=/run/user/1000/collie-tmux.sock  # a socket PATH (tmux -S), because it has a /
+# COLLIE_MUX_ENDPOINT_TMUX=work                           # a socket NAME (tmux -L work), no /
+# COLLIE_MUX_ENDPOINT_TMUX=                               # empty: tmux's own default server
+# COLLIE_TMUX_BIN=/usr/bin/tmux                           # only if tmux sits somewhere unusual
+```
+
+`COLLIE_TMUX_BIN` is empty for almost everyone: Collie probes a short list of fixed paths and
+deliberately never reads `PATH`, which a service and a Herdr action do not share with your shell.
+**Keep a socket path short** — a Unix socket path longer than about 100 characters cannot be
+connected to at all, and tmux says `error connecting to … (File name too long)`. `/run/user/<uid>/`
+or `/tmp` is the place for it; a deep checkout is not.
+One caveat lives here too: on tmux below 3.7 with `window-size` set to `manual`, opening a window
+crashes the server, so Collie refuses to open one — see
+[Requirements](#requirements) for the one-line fix.
+
+Restart after any `.env` edit — `bin/collie restart` — then start an agent in a window Collie can see:
+
+```bash
+tmux -S /run/user/1000/collie-tmux.sock new-window -n claude
+# in that window
+claude
+```
+
+### Pointing Collie at zellij
+
+```bash
+# in your .env
+COLLIE_MUX=zellij
+COLLIE_MUX_ENDPOINT_ZELLIJ=collie-zellij                  # a session NAME, not a path
+# COLLIE_MUX_ENDPOINT_ZELLIJ=                             # empty: the single running session
+# COLLIE_ZELLIJ_BIN=/home/you/.local/bin/zellij           # only if zellij sits somewhere unusual
+```
+
+Empty means *the* running session. With no session, or with two, Collie refuses to start rather than
+guess, and names what it found. A session you named that has since exited is refused by name — never
+silently swapped for a neighbour. One environment variable is easy to lose: zellij finds its sessions
+through `XDG_RUNTIME_DIR`, and a Collie that reports every session as exited is looking at a unit file
+without it ([contract](./MUX_CONTRACT.md#pointing-a-collie-at-a-multiplexer)).
+
+**A zellij session outlives the terminal that started it.** Start one anywhere — `zellij -s
+collie-zellij` — then detach with `Ctrl o` `d`: the session keeps running on the host, and that
+running session is what Collie drives. On a host you never sit at, `zellij attach --create-background
+collie-zellij` starts the same session with no terminal at all (probed on zellij 0.44.2). Collie
+itself never creates a session and never resurrects one.
+
+Restart with `bin/collie restart`, then start an agent in a tab Collie can see:
+
+```bash
+zellij --session collie-zellij action new-tab --name claude
+# in that tab
+claude
+```
+
+### Did it work?
+
+```bash
+bin/collie doctor      # the `mux` check names the multiplexer, its endpoint, and whether it answered
+bin/collie logs        # `[bridge] mux: tmux · socket /run/user/1000/collie-tmux.sock`, printed at
+                       # startup; a multiplexer it cannot reach is one warning line more
+curl -s http://127.0.0.1:8787/api/snapshot | head -c 400   # the herd, as the phone is given it
+```
+
+That `curl` needs no device header: both write gates leave reads alone, so a read answers even with
+`COLLIE_DEVICE_HEADER` set ([Configure](#configure)). A write from the shell is the case that needs
+the header you configured.
+
+Then open the phone: the dashboard lists your **tmux windows** or **zellij tabs**, and the pane you
+launched Claude in names the agent rather than `bash`. If every pane still reads as a shell, the
+beacon hooks are missing — next section.
+
+### Collie writes hooks into Claude's own settings
+
+On tmux and zellij a pane is just a shell, so the agent has to say what it is. That is a
+[beacon](#agent-beacons-optional-linux), and it needs Collie's hooks in Claude Code's settings:
+
+```console
+$ bin/collie hooks install claude
+$ bin/collie hooks status
+would install: /home/you/collie/bin/collie beacon emit  (this checkout)
+/home/you/.claude/settings.json: installed (v1)
+```
+
+Say it plainly, because it edits a file you own:
+
+- The target is your **global** `~/.claude/settings.json` (and any `CLAUDE_CONFIG_DIR` profile).
+  A project's `.claude/settings.json` is never written.
+- It adds **five** entries, each marked `# collie-beacon v1`, each with a 10 s timeout. Every hook
+  beside them is left exactly where it was, and `hooks uninstall claude` removes only the marked ones.
+- **An already-running Claude does not reload its hooks.** Relaunch the agents you want seen.
+- **Linux only** — the liveness check reads `/proc`; elsewhere a beacon is simply never written.
+- **A beacon belongs to one multiplexer.** It names the pane it was written for by that
+  multiplexer, its session and its pane, so after you change `COLLIE_MUX` the beacons written under
+  the old one match nothing. Nothing deletes them and nothing breaks — `collie doctor` simply keeps
+  counting them under `beacons`.
+- If you set `COLLIE_STATE_DIR`, export it in the shell your agents run in too: `collie beacon emit`
+  resolves the state dir from **its own** environment, so a beacon otherwise lands where the bridge
+  is not reading.
+
+`collie doctor` reports this as the `beacon-hooks-claude` check and names the install command as the
+remedy — including when a hook still points at a checkout that has moved. What a beacon may and may
+not do is [Agent beacons](#agent-beacons-optional-linux); this is only the setup step.
+
+### What changes compared with Herdr
+
+The reader's summary. **The truth is the cell in [`MUX_CONTRACT.md`](./MUX_CONTRACT.md)** — each row
+links to it.
+
+| | Herdr | tmux | zellij |
+| --- | --- | --- | --- |
+| [a **space** is](./MUX_CONTRACT.md#what-a-space-and-a-tab-are-per-multiplexer) | a workspace | a session | the session — exactly one, so the phone drops the space strip |
+| [a **tab** is](./MUX_CONTRACT.md#what-a-space-and-a-tab-are-per-multiplexer) | a tab | a window | a tab |
+| [a **pane** is](./MUX_CONTRACT.md#what-a-space-and-a-tab-are-per-multiplexer) | a pane | a pane | a terminal pane |
+| [who says a pane holds an agent](./MUX_CONTRACT.md#capabilities) | Herdr does, itself | a [beacon](#agent-beacons-optional-linux), or nothing | a [beacon](#agent-beacons-optional-linux), or nothing |
+| [how soon an unannounced change is seen](./MUX_CONTRACT.md#the-declared-facts--not-capabilities-either) | pushed | pushed | counted on a schedule, 12 s ceiling |
+| ["Show in terminal"](./MUX_CONTRACT.md#capabilities) | yes | yes | **no** — zellij accepts the request and moves nothing |
+| [open / rename / close a tab](./MUX_CONTRACT.md#capabilities) | yes | yes (opening is refused on the tmux crash case above) | yes |
+| [open a space](./MUX_CONTRACT.md#capabilities) | yes | yes | **no** — a session it made would be invisible to it |
+| [pane history](./MUX_CONTRACT.md#capabilities) | from Herdr's own pane record | from the beacon's session key | from the beacon's session key |
+
+Without a beacon, tmux and zellij report every pane as a plain shell, and pane history is **declared
+absent** rather than served empty.
+
+### Three things that feel different on the phone
+
+- **Pull to refresh.** On the dashboard and on a space, drag down and let go: Collie asks the
+  multiplexer to look *now* rather than waiting for its next round. The pane view has no pull —
+  its scroller is the terminal mirror, where pulling reaches older output instead.
+- **"synced Ns ago"** sits under the dashboard header, and it is the age of what you are looking at.
+  It appears **only where the bridge promises a bounded freshness** — today that is **zellij**, which
+  has no way to announce a new tab and so is re-counted on a schedule (worst case 12 s). Under Herdr
+  and tmux there is no chip, because those announce their changes and there is nothing to wait for.
+- **"Show in terminal"** is a row in a pane's actions. Tap it and the terminal you are attached to on
+  the host jumps to that pane. It is **absent under zellij** — zellij's focus command accepts the
+  request and moves nothing, so Collie declines it rather than offering a button that lies.
+
+**The phone never moves your terminal on its own.** Only that one named tap does. Browsing the herd,
+opening a pane, backing out — none of it touches the cursor of whoever is typing on the host
+([ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md)).
+
+### tmux tips — getting your windows back after a reboot
+
+Collie persists nothing about your multiplexer. A tmux server that dies takes every window with it,
+and Collie then has nothing left to list. tmux's own plugins fix that, and they are entirely optional:
+[tpm](https://github.com/tmux-plugins/tpm) installs plugins,
+[tmux-resurrect](https://github.com/tmux-plugins/tmux-resurrect) saves and restores the session tree,
+and [tmux-continuum](https://github.com/tmux-plugins/tmux-continuum) does the saving for you.
+
+What comes back is the **windows**, their layout and their working directories. **The agents inside do
+not come back running** — start Claude Code again by hand. Picking its old conversation back up is
+Claude's own feature (`claude --resume` / `claude --continue`), not the plugin's.
+
 ## Configure
 
 Out of the box Collie runs **open single-user**: anyone on your tailnet who can reach the URL has
-full control — that's exactly what the two startup WARNINGs are about. Close both in one sitting:
+full control — that's the TRUSTED_USER warning. Close it:
 
 ```bash
 # in your .env
 COLLIE_TRUSTED_USER=you@example.com           # your tailnet login — Collie rejects anyone else
-COLLIE_PUBLIC_HOSTS=myhost.tail1234.ts.net    # exact host(s) you serve on — blocks DNS rebinding
+COLLIE_PUBLIC_HOSTS=myhost.tail1234.ts.net    # only behind your OWN proxy; on a tailnet `collie
+                                              # start` discovers this for you
 ```
 
 Config is a `.env` in the plugin's config dir — find it with
@@ -315,9 +511,11 @@ cp .env.example "$(herdr plugin config-dir herdr.collie)/.env"
 ```
 
 Collie reads `.env` only at startup — after any edit, `bin/collie restart`. See
-[`.env.example`](./.env.example) for the full option list — commonly `COLLIE_PORT`, or
-`COLLIE_SERVE_MODE=http` (Headscale / `.internal` domains; read by the CLI when it runs
-`tailscale serve`).
+[`.env.example`](./.env.example) for the full option list — commonly `COLLIE_PORT`,
+`COLLIE_SERVE_MODE=http` (Headscale / `.internal` domains) or `COLLIE_SERVE_PORT` (publish the
+https front door somewhere other than :443 — see
+[DEPLOYMENT.md → Several Collies on one host](./DEPLOYMENT.md#several-collies-on-one-host)). Both
+serve settings are read by the CLI when it runs `tailscale serve`, not by the bridge.
 
 Reading history from more than one agent home? List them all in `COLLIE_TRANSCRIPT_ROOT`,
 comma-separated.
@@ -377,6 +575,28 @@ is fixed and not configurable. Chords are herdr's spelling: `ctrl+c` (never `C-c
 open a pane, tap **Keys → Presets**, your buttons are there. Rejected row?
 `journalctl --user -u collie -n 20` names it and why.
 
+### Your own quick replies
+
+The Quick dock's one-tap phrases are yours to replace, in `quick-replies.toml` next to the other two:
+
+```bash
+cp quick-replies.toml.example "$(herdr plugin config-dir herdr.collie)/quick-replies.toml"
+```
+
+```toml
+[[replies]]
+scope = "claude"             # optional; omit for every pane
+title = "confirm"
+items = ["yes", "no"]        # sent verbatim, one per button
+```
+
+A pane your rows match shows only your groups, in place of the shipped ones
+([ADR 0018](./.adr/0018-operator-command-rows-replace-the-catalog.md)). The shipped phrases are
+English (`yes`, `commit and push`); this is the way to work in another language, or to give a
+harness that wants `approve` the word it wants. `scope = "shell"` reaches a plain shell pane, which
+otherwise gets only `y`/`n`. No restart — edits are live. Verify: open a pane, tap **Quick**, your
+groups are there. Rejected row? `journalctl --user -u collie -n 20` names it and why.
+
 ### Multi-session
 
 `COLLIE_MULTI_SESSION=on` (the default) discovers and serves every named Herdr session under your
@@ -411,6 +631,13 @@ Two things follow that are worth knowing:
 > page. iOS gives web apps no way to change this at runtime — use the browser rather than the
 > installed app if it bothers you.
 
+## Language
+
+Collie's UI speaks six languages — English, Deutsch, Español, 한국어, 日本語, 中文. Open **Settings →
+Language** and pick one by its own name; the choice is per device, stored in the browser. The
+terminal mirror is never translated — it shows exactly what the agent printed, and quick replies,
+menu labels and key caps stay as the screen or the keyboard names them.
+
 ## Commands
 
 Every command works two ways: the **`collie` binary** in the checkout (`bin/collie <cmd>`) or the
@@ -432,6 +659,7 @@ as `invoke <cmd>`). The ones you'll actually use:
 | **Devices** — list / revoke paired devices | `collie devices list` · `collie devices revoke <label>` | — (CLI only) |
 | **Link** — put `collie` on your PATH ([below](#put-collie-on-your-path)) | `collie link` · `collie unlink` | — (CLI only) |
 | **Logs** — tail the journal / log file | `collie logs` | — (CLI only) |
+| **Voice** — configure / check / disable [voice input](#voice-input-optional) | `collie stt setup` · `stt test` · `stt status` · `stt off` | — (CLI only) |
 | **Push keys** — generate the VAPID keypair into your `.env` | `collie push-keys` | `invoke push-keys` |
 | **Push test** — send one notification to prove it works | `collie push-test` | `invoke push-test` |
 
@@ -451,6 +679,37 @@ banner** — the human-readable output is the action's *captured stdout*, read w
 > script — a Herdr <0.8.0 install invokes the action set cached at install time, so that path is
 > frozen ([ADR 0006](./.adr/0006-update-advances-the-checkout-herdr-installed.md)). Every verb is
 > implemented once, in the binary (`cli/`).
+
+**Ink or plain text.** `start`, `status`, `doctor`, `pack add` and `pack status` draw a terminal view
+when stdout is a TTY; `--plain` (and any pipe, file, journal or CI runner) prints the plain lines
+instead — the same lines those verbs printed before the view existed.
+
+### Pack commands
+
+A **pack** is several machines' Collies linked together, one of them the **lead**, so the phone sees
+every herd through one URL. All of it is CLI-only — no Herdr actions — and the wire between the
+machines is [`PACK_PROTOCOL.md`](./PACK_PROTOCOL.md).
+
+| Command | What it does |
+| --- | --- |
+| `collie pack invite` | Mint a single-use, 10-minute enrollment token (**on the lead**) |
+| `collie pack add <ssh-host>` | Install and enroll a peer over **your own SSH** (on the lead) |
+| `collie pack update <member>… \| --all` | Level peers to this lead's build over SSH ([above](#updating-the-rest-of-the-pack)) |
+| `collie pack status` | Mode, members, reachability, secret pickup — and why a link is refused |
+| `collie pack rotate` | Reissue the pack secret and hand it to every reachable peer |
+| `collie pack remove <member>` | Unpin and forget a member (on the lead) |
+| `collie pack set-address <member> <host:port>` | Correct where this lead dials a member |
+| `collie pack deputy <member>` | Name the ONE peer that may take over, and arm it; `--revoke` names nobody |
+| `collie pack approve-promote <member>` | Consent, on the lead, for one member to take over — 10 minutes, single-use; `--cancel` clears it |
+| `collie join <lead-address> <token>` | Join a pack (**on the joining machine**); a token is `-` for stdin or `@file` |
+| `collie leave` | Leave the pack — drops the pack secret and every pin on this machine |
+| `collie promote` | Make THIS machine the lead (on the peer taking over; `--force` if the lead is gone) |
+| `collie reconnect` | A member moved: re-point at its new address without re-enrolling anything |
+
+`deputy`, `approve-promote` and `promote` are the failover set. Setting them up while everything is
+healthy, and the runbook for the day the lead is gone, are
+[`DEPLOYMENT.md` → the standby door](./DEPLOYMENT.md#the-standby-door--a-packs-failover-path) and
+[the bad day](./DEPLOYMENT.md#the-bad-day--the-runbook).
 
 ### Put `collie` on your PATH
 
@@ -605,9 +864,66 @@ design, so while a prerelease train is running it keeps answering the last stabl
 that trusts it silently stalls on an old version. The tags are the contract; the Latest badge is only
 a hint for people.
 
+#### Testing the v1 beta
+
+The v1 line is a prerelease train — `v1.0.0-beta.N` tags cut off the `v1` branch. **A routine update
+never lands on one, and that is the design, not a gap:** `collie update` and the in-app banner resolve
+strict `vX.Y.Z` tags only ([above](#resolving-the-newest-release-from-a-script)), so on 0.x `update`
+stays on 0.x and `update --major` answers *"no release above major 0 exists yet — nothing to cross
+to."* Taking a beta is a deliberate act, by one of two routes.
+
+**Herdr-managed, pinned to the tag:**
+
+```bash
+# Fetches that one tag and detaches the checkout onto it, then builds the UI right there
+# (the manifest's [[build]] step, GitHub installs only) — see above.
+herdr plugin install AltanS/collie --ref v1.0.0-beta.16 --yes
+herdr plugin action invoke restart --plugin herdr.collie   # reinstall doesn't restart the service
+
+# NEW in v1: every verb now lives at <checkout>/bin/collie. Putting `collie` on your PATH is
+# its own act — one symlink, never a copy, never a side effect of install/build/update:
+bin/collie link                                            # ~/.local/bin/collie → <checkout>/bin/collie
+collie stt setup                                           # …and bare `collie` works from anywhere
+```
+
+A pinned install does not self-update: `update` on a beta checkout reports *"no release of major 1 yet
+— leaving this checkout where it is."* Take the next beta the way you took this one, with the newer
+tag.
+
+`link` is itself a v1 feature worth exercising — [details](#put-collie-on-your-path),
+reasoning in [ADR 0021](./.adr/0021-the-path-name-is-a-pointer-never-a-copy.md). Skip it and every
+command below reads `bin/collie …` from the checkout instead.
+
+**Linked clone:**
+
+```bash
+git fetch --tags && git checkout v1   # or a tag: git checkout v1.0.0-beta.16
+bin/collie build && bin/collie restart
+```
+
+**To go back**, reinstall without the pin. It lands on the default-branch tip, which is the 0.x stable
+line until v1 merges:
+
+```bash
+bin/collie unlink                                          # FIRST, if you linked — see below
+herdr plugin install AltanS/collie --yes                   # default-branch tip, still detached + shallow
+herdr plugin action invoke restart --plugin herdr.collie
+```
+
+**Take the link down before you roll back.** 0.x has no `cli/` and no compiled binary — its verbs are
+the shim's own — so nothing on that line ever builds or refreshes `<checkout>/bin/collie`, and a
+`collie` left on your PATH resolves to a stale v1 binary or to nothing at all. `unlink` removes the
+name only while it still points at *this* checkout, so run it before the reinstall, not after.
+
+Nothing you configured moves either way: `.env` and the `tailscale serve` record live in the plugin
+config dir, paired devices and `stt.json` in the state dir — all outside the checkout.
+
+What's new to exercise is in the `1.0.0-beta.*` entries of the [CHANGELOG](./CHANGELOG.md); the newest
+surface is [voice input](#voice-input-optional), which is off until you run `collie stt setup`.
+
 ### Migrating from 0.x
 
-The last 0.x release is **0.31.1**. Going from there to 1.0 crosses a major, so a routine `update`
+The last 0.x release is **0.32.1**. Going from there to 1.0 crosses a major, so a routine `update`
 will not do it — it will tell you 1.0 is out and name this command instead:
 
 ```bash
@@ -772,6 +1088,126 @@ over the pipe, so Windows gets the same live updates as Linux, not degraded poll
 
 `COLLIE_HERDR_DIAL=net` forces that same dialer on Linux/macOS. It exists so the Windows code path
 can be exercised — and regression-tested — without a Windows box; `bridge/dial.test.ts` uses it.
+
+## Voice input (optional)
+
+A **microphone button in the composer**, and a **hands-free switch** in Settings. Tap the button,
+speak, and the transcript lands in the message box for you to read and send. With hands-free on it is
+sent for you — down the same guarded reply path a typed message takes, never around it.
+
+**It does not exist until you run `collie stt setup`.** No button is drawn, no audio leaves the
+phone, no credential is held, no child process runs. Absent, not disabled. Two providers:
+
+| provider | what it is |
+| --- | --- |
+| **`openai-compatible`** | Any endpoint that speaks `POST /audio/transcriptions` — the public OpenAI API, a cloud Whisper clone, or **a local engine on the same machine, which is the zero-egress choice** ([below](#zero-egress-point-it-at-your-own-engine)). |
+| **`codex`** | Borrows the `codex` binary you already trust for a short-lived token. No new account, no new key — and a **private, unsupported** endpoint that carries a consent step you have to type `yes` to ([below](#the-codex-provider-what-you-are-accepting)). |
+
+Setup is a CLI act for the reason [pairing](#pair-a-device--the-write-credential) is one: this
+surface accepts a credential, so it belongs on the host's keyboard. There is no web setup form.
+
+```console
+$ bin/collie stt setup
+Which speech-to-text provider?
+  openai-compatible  any endpoint that speaks POST /audio/transcriptions —
+                     the public OpenAI API, or a local whisper.cpp / parakeet.cpp
+                     server, which is the zero-egress choice and the one to prefer.
+  codex              borrow your own `codex` sign-in. No new key, no new account —
+                     and a private endpoint that may break without notice.
+provider [openai-compatible]:
+The API base, INCLUDING its version prefix — the provider appends /audio/transcriptions.
+  local  http://127.0.0.1:8080/v1     (whisper.cpp / parakeet.cpp — nothing leaves the host)
+  cloud  https://api.openai.com/v1    (room audio leaves this machine)
+base URL: http://127.0.0.1:8080/v1
+The model the endpoint understands. Empty takes Collie's default, gpt-4o-transcribe.
+model [gpt-4o-transcribe]: whisper-1
+API key [none]:
+✓ speech-to-text configured — /home/you/.local/state/collie/stt.json (owner-only)
+  Live immediately — no restart needed. The bridge re-reads this file per request.
+  Check it end to end with `collie stt test`.
+```
+
+Every question above has a flag (`--provider` · `--url` · `--model` · `--key`), so a provisioning
+run needs no terminal. Leaving the key empty is a supported mode — a keyless endpoint is dialled
+with no `Authorization` header at all, rather than an empty one.
+
+**Did it work?** `stt test` sends a fifth of a second of generated silence through the real
+provider:
+
+```console
+$ bin/collie stt test
+provider: openai-compatible (http://127.0.0.1:8080/v1, model whisper-1)
+sending:  0.2 s of generated silence (audio/wav)
+✓ round trip in 214 ms
+  transcript: (empty) — expected from silence, and the empty answer still proves the pipeline.
+```
+
+An **empty transcript is a pass** — silence transcribes to nothing, and the round trip is what was
+being proved. If it fails, the error names its kind (auth, endpoint, response shape). Then reload
+Collie on the phone: a microphone sits beside the message box. `collie stt status` says what is
+configured and *where each setting came from* (the file, or an environment variable that outranks
+it); `collie stt off` removes `stt.json` and the button is gone again, no restart either way.
+
+### Zero-egress — point it at your own engine
+
+The reason `openai-compatible` is the provider to reach for: give it a local base URL and **no room
+audio ever leaves the host**. Two engines serve an OpenAI-compatible transcription endpoint —
+[**whisper.cpp**](https://github.com/ggml-org/whisper.cpp)'s bundled `server`, and
+[**mudler/parakeet.cpp**](https://github.com/mudler/parakeet.cpp) (MIT). Build or install either by
+its own instructions, run it on loopback, and point `--url` at it:
+
+```bash
+bin/collie stt setup --provider openai-compatible --url http://127.0.0.1:8080/v1
+```
+
+That is the whole integration — Collie has no opinion about which engine answers.
+
+### The codex provider — what you are accepting
+
+`collie stt setup --provider codex` prints a consent block and stops until you type `yes`, because
+the honest sentence is this: recordings go to an **undocumented, unsupported ChatGPT endpoint**
+authorised by *your* sign-in, so your ChatGPT account carries the rate-limit and ban exposure, and it
+may break without notice.
+
+Collie asks that endpoint **under its own name first**. Only if the honest identity is refused does
+it fall back to the Codex CLI's headers — and that fallback is written into the config, in a word
+`collie stt status` reads back to you. Collie never reads or stores `~/.codex/auth.json`; the binary
+you already trust stays the only thing that touches it.
+
+The reasoning for all of the above — why this was declined twice, what changed, and why the seam
+looks like this — is [ADR 0029](./.adr/0029-speech-to-text-is-a-provider-seam-collie-owns.md).
+
+## Agent beacons (optional, Linux)
+
+A **beacon** is the agent telling Collie what only the agent knows: a hook in Claude Code's own
+settings runs `collie beacon emit`, which writes one small file naming the harness, the session and
+the pane it is running in. Herdr reports all of that itself — beacons are for **tmux and zellij**,
+where a pane is otherwise just a shell. Installing them is a step of
+[Using the app on tmux or zellij](#collie-writes-hooks-into-claudes-own-settings); this section is
+what they are.
+
+```console
+$ bin/collie hooks install claude
+$ bin/collie hooks status
+would install: /home/you/collie/bin/collie beacon emit  (this checkout)
+/home/you/.claude/settings.json: installed (v1)
+```
+
+`status` reads and writes nothing; `hooks uninstall claude` removes only the entries Collie marked as
+its own. It edits your *global* Claude settings, never a project's. Linux only — the liveness check
+reads `/proc`, and on any other host a beacon is simply never written.
+
+A Claude is visible from the moment it starts — the hook fires on `SessionStart`, so a pane you have
+opened but not yet typed into shows an idle agent rather than a shell.
+
+What you get: the dashboard names the agent in each pane instead of `bash`, so **"needs you" can sort
+by who is actually blocked** — and a status is something notifications can fire on at all. Pane
+history works too, because the beacon carries the session key the journal needs.
+
+What you do **not** get: any control. A beacon sets what Collie *shows* and what it *looks up*, and
+nothing else — it can never cause a send, a key, a rename or a close, and it relaxes no gate. The
+threat model, and why some obviously useful fields do not exist, are
+[ADR 0024](./.adr/0024-a-beacon-is-a-hint-never-a-control-channel.md).
 
 ## Web Push (optional)
 
@@ -987,6 +1423,7 @@ Herdr's plugin system itself is upstream's to document:
 
 - Deployment variants B–E — [`DEPLOYMENT.md`](./DEPLOYMENT.md)
 - Design & rationale — [`ARCHITECTURE.md`](./ARCHITECTURE.md)
+- What each multiplexer can answer — [`MUX_CONTRACT.md`](./MUX_CONTRACT.md)
 - The lead↔peer pack link — [`PACK_PROTOCOL.md`](./PACK_PROTOCOL.md) (topology diagram: [§2](./PACK_PROTOCOL.md#2-shape-of-the-thing))
 - Recovering a pack whose lead died, from a phone — [`DEPLOYMENT.md` → the standby door](./DEPLOYMENT.md#the-standby-door--a-packs-failover-path)
 - Verified Herdr socket API — [`HERDR_API.md`](./HERDR_API.md)

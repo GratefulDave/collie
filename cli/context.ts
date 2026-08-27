@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -32,6 +32,15 @@ export interface CliContext {
   env: Environment;
   port: number;
   serveMode: ServeMode;
+  /**
+   * The tailnet listener port the https front door is published on — `443` unless the operator set
+   * `COLLIE_SERVE_PORT`. Inert in http mode, where the listener is always {@link CliContext.port}.
+   *
+   * Resolved leniently here (an unusable value reads as 443) so no unrelated verb dies on a typo;
+   * `cmdServe` re-reads the raw setting through {@link parseServePort} and REFUSES to publish on a
+   * value it cannot trust. One parser, two policies — see {@link parseServePort}.
+   */
+  servePort: number;
   socket: string;
   /** The single managed `tailscale serve` mapping's ownership record. */
   handlerFile: string;
@@ -67,6 +76,42 @@ export interface EnvVars {
 // a `bun()` function defined in there would shadow the real binary and poison every later lookup
 // (the hazard the pre-shim collie-ctl.sh worked around). Parsing removes the hazard outright — a
 // `.env` can now only set variables.
+
+/**
+ * The two filesystem facts the permission guard needs. A seam, so its truth table is unit-tested
+ * without a real file whose mode the test's own umask would decide.
+ */
+export interface EnvFilePerms {
+  /** The file's permission bits (`mode & 0o777`), or `null` when it cannot be stated. */
+  mode(path: string): number | null;
+  /** Tighten it to `0600`. `false` when the chmod failed — a file owned by someone else. */
+  tighten(path: string): boolean;
+}
+
+/** The modes a `.env` may already carry without anyone touching it: owner-only, read or read/write. */
+const PRIVATE_ENV_MODES = new Set([0o600, 0o400]);
+
+/**
+ * Hold `.env` to owner-only, tightening it in place when it is not — and say so either way.
+ *
+ * This file holds `COLLIE_VAPID_PRIVATE` (a Web Push signing key) and, on a shared host, the
+ * settings that decide who may type into this operator's terminals. A group- or world-readable one
+ * is a credential leak that nothing else in Collie can detect: `EnvironmentFile=` and this CLI both
+ * read it happily at any mode. So the read path is where it is checked.
+ *
+ * **Warn, never refuse.** A `.env` this process cannot chmod belongs to another user, and a Collie
+ * that would not start because of it is a Collie the operator cannot use to fix it.
+ *
+ * Returns the line for stderr, or `null` when there was nothing to say.
+ */
+export function tightenEnvFile(path: string, perms: EnvFilePerms): string | null {
+  const mode = perms.mode(path);
+  if (mode === null || PRIVATE_ENV_MODES.has(mode)) return null;
+  const shown = mode.toString(8).padStart(3, "0");
+  return perms.tighten(path)
+    ? `warn: ${path} was mode ${shown} (expected 600); tightened it to 600.`
+    : `warn: ${path} is mode ${shown} (expected 600) and could not be tightened; it may be readable by other users.`;
+}
 
 /**
  * Parse `KEY=value` lines the way `set -a; . file` would for the assignment-only subset: `export`
@@ -173,6 +218,25 @@ export function resolveConfigDir(deps: ConfigDirDeps): ConfigDirResult {
 // caller keeps importing it from here.
 export { collieVersion, collieVersionBare, collieVersionFrom } from "../bridge/version.ts";
 
+/** {@link EnvFilePerms} against the real filesystem. */
+const diskEnvPerms: EnvFilePerms = {
+  mode(path) {
+    try {
+      return statSync(path).mode & 0o777;
+    } catch {
+      return null;
+    }
+  },
+  tighten(path) {
+    try {
+      chmodSync(path, 0o600);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+};
+
 /** File contents, or `null` when missing/unreadable. */
 function readIfPresent(p: string): string | null {
   try {
@@ -185,7 +249,8 @@ function readIfPresent(p: string): string | null {
 // ── Derived settings ─────────────────────────────────────────────────────────
 
 /**
- * `COLLIE_PORT` → port, `COLLIE_SERVE_MODE` → https|http, `HERDR_SOCKET_PATH` → socket.
+ * `COLLIE_PORT` → port, `COLLIE_SERVE_MODE` → https|http, `COLLIE_SERVE_PORT` → the https listener,
+ * `HERDR_SOCKET_PATH` → socket.
  *
  * The port and socket defaults come from `bridge/config.ts`, not from a second copy: the CLI writes
  * them into the generated unit and the bridge reads them at boot, so a divergence would put the
@@ -194,15 +259,58 @@ function readIfPresent(p: string): string | null {
 export function deriveSettings(
   env: Environment,
   home: string,
-): Pick<CliContext, "port" | "serveMode" | "socket"> {
+): Pick<CliContext, "port" | "serveMode" | "servePort" | "socket"> {
   const rawPort = env.COLLIE_PORT?.trim();
   const port = rawPort && /^\d+$/.test(rawPort) ? Number(rawPort) : DEFAULT_PORT;
   const mode = env.COLLIE_SERVE_MODE?.trim();
   return {
     port,
     serveMode: mode === "http" ? "http" : "https",
+    servePort: effectiveServePort(env),
     socket: env.HERDR_SOCKET_PATH?.trim() || defaultSocketPath(process.platform, env, home),
   };
+}
+
+// ── COLLIE_SERVE_PORT ────────────────────────────────────────────────────────
+// Several developers sharing one host each want their own tailnet URL, and a tailnet name is per
+// host, not per user — so the second Collie needs a listener port of its own. `tailscale serve
+// --https=<port>` takes any port (only `funnel` is restricted to 443/8443/10000), so this is still
+// THE one managed front door (ADR 0001): only its port is now the operator's to choose.
+//
+// It is deliberately https-only. In http mode the listener IS the bridge port — that is what
+// `COLLIE_PORT` already means — so a second port there would be two answers to one question, and
+// `cmdServe` refuses the combination rather than picking one.
+
+/** The port `tailscale serve` terminates TLS on unless the operator names another. */
+export const DEFAULT_SERVE_PORT = 443;
+
+/**
+ * `COLLIE_SERVE_PORT` → the https listener port, or the reason it cannot be used.
+ *
+ * The one parser, read by two policies. {@link deriveSettings} takes the lenient half so that `url`,
+ * `status`, `qr` and `doctor` keep working through a typo; `cmdServe` takes the strict half and
+ * refuses to publish, because a front door on a port the operator did not ask for is a door they do
+ * not know is open.
+ */
+export function parseServePort(
+  env: Environment,
+): { ok: true; port: number } | { ok: false; message: string } {
+  const raw = env.COLLIE_SERVE_PORT?.trim();
+  if (raw === undefined || raw === "") return { ok: true, port: DEFAULT_SERVE_PORT };
+  const port = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return {
+      ok: false,
+      message: `COLLIE_SERVE_PORT="${raw}" is not a usable port — a whole number from 1 to 65535.`,
+    };
+  }
+  return { ok: true, port };
+}
+
+/** {@link parseServePort}'s lenient half: an unusable value reads as the default. */
+export function effectiveServePort(env: Environment): number {
+  const parsed = parseServePort(env);
+  return parsed.ok ? parsed.port : DEFAULT_SERVE_PORT;
 }
 
 // ── The instance suffix ──────────────────────────────────────────────────────
@@ -286,8 +394,13 @@ export function loadContext(warn: (line: string) => void = (l) => console.error(
 
   // `.env` overrides the ambient environment, exactly as `set -a; . .env` did.
   const env: Environment = { ...process.env };
-  const dotenv = readIfPresent(join(configDir, ".env"));
-  if (dotenv !== null) Object.assign(env, parseEnvFile(dotenv));
+  const envPath = join(configDir, ".env");
+  const dotenv = readIfPresent(envPath);
+  if (dotenv !== null) {
+    const tightened = tightenEnvFile(envPath, diskEnvPerms);
+    if (tightened !== null) warn(tightened);
+    Object.assign(env, parseEnvFile(dotenv));
+  }
 
   // Resolved from the MERGED env, so a `.env` may name the instance — the second instance's config
   // dir is its own, and putting `COLLIE_INSTANCE`/`COLLIE_PORT` there is how it stays set for every

@@ -79,6 +79,23 @@ interface FakePane {
   viewport: string[];
 }
 
+/**
+ * One client attached to the fake server — what `list-clients` reports.
+ *
+ * `control` is the whole point of the record: this adapter's own watch attaches control clients, and
+ * the snapshot has to tell them apart from a terminal somebody is looking at (adapter.ts
+ * § watchedSession). The seeded world has NONE, which is a real tmux state — a server full of
+ * detached sessions — and the state the fallback rule exists for.
+ */
+interface FakeClient {
+  /** tmux prints the session's NAME here, not its `$N` id (probed). Moved by `switch-client`. */
+  session: string;
+  readonly control: boolean;
+  readonly activity: number;
+  /** `client_tty`. tmux's only handle on a client, and what `switch-client -c` addresses. */
+  readonly tty: string;
+}
+
 /** One live control-mode client of the fake server. */
 interface FakeControlClient {
   readonly handlers: TmuxControlHandlers;
@@ -107,11 +124,21 @@ export class FakeTmux implements TmuxExec {
   private panes: FakePane[] = [];
   private readonly buffers = new Map<string, string>();
   private readonly controls = new Set<FakeControlClient>();
+  /** Attached clients. Empty by default — see {@link FakeClient}. */
+  private clients: FakeClient[] = [];
   private readonly recorded: MuxWrite[] = [];
+  /** Every command group this fake was asked to run, in order. What proves a spawn did NOT happen. */
+  private readonly ran: string[][] = [];
   /** Only ever climbs, so no id is ever handed to a second pane, window or session. */
   private minted = 0;
   /** False while the "connection" is down — every command fails, as a dead socket does. */
   private connected = true;
+  /** The server's answer for the GLOBAL `window-size`. tmux's own default is `latest`. */
+  private windowSize = "latest";
+  /** What `#{version}` reports. The version the whole adapter was probed against (M10/04). */
+  private version = "3.6b";
+  /** Set once the server has died under the call — see {@link killServerMidCall}. */
+  private crashed = false;
 
   constructor() {
     this.seed();
@@ -121,6 +148,32 @@ export class FakeTmux implements TmuxExec {
 
   writes(): readonly MuxWrite[] {
     return this.recorded;
+  }
+
+  /** The command groups run so far. Read by the unit tests, never by the conformance engine. */
+  invocations(): readonly (readonly string[])[] {
+    return this.ran;
+  }
+
+  /** The operator's global `window-size`, as this server would report it. */
+  setWindowSize(value: string): void {
+    this.windowSize = value;
+  }
+
+  /** Which tmux this fake claims to be. `3.6b` unless a test says otherwise. */
+  setVersion(value: string): void {
+    this.version = value;
+  }
+
+  /**
+   * The server dies while a command runs — a segfault, or the operator's own `kill-server`.
+   *
+   * Distinct from {@link reconnect}, which is a socket that was already gone: here the client had a
+   * server and lost it, so it prints `server exited unexpectedly` rather than `error connecting`, and
+   * the contract requires that to read as `unreachable` (MUX_CONTRACT.md § Contract-owned rules).
+   */
+  killServerMidCall(): void {
+    this.crashed = true;
   }
 
   /**
@@ -152,10 +205,70 @@ export class FakeTmux implements TmuxExec {
     await Promise.resolve();
   }
 
+  /**
+   * The OPERATOR moves their own focus — they press `prefix o` on their keyboard, not in Collie.
+   *
+   * Both levels, because that is what tmux does: the pane becomes its window's active one and the
+   * window becomes its session's current one. Nothing here goes through the adapter, which is the
+   * point — the snapshot has to REPORT focus, not remember what Collie last set.
+   */
+  async focusOutOfBand(paneId: string): Promise<void> {
+    await Promise.resolve();
+    const pane = this.panes.find((candidate) => candidate.id === paneId);
+    if (pane === undefined) return;
+    for (const candidate of this.panes) {
+      if (candidate.windowId === pane.windowId) candidate.active = candidate.id === pane.id;
+    }
+    for (const window of this.windows) {
+      if (window.sessionId === pane.sessionId) window.active = window.id === pane.windowId;
+    }
+  }
+
+  /** A terminal (or this adapter's own watch) attaches to a session. For the tests that need one. */
+  attachClient(sessionName: string, options: { control?: boolean; activity?: number; tty?: string } = {}): void {
+    this.clients = [
+      ...this.clients,
+      {
+        session: sessionName,
+        control: options.control ?? false,
+        activity: options.activity ?? this.clients.length + 1,
+        tty: options.tty ?? `/dev/pts/${String(this.clients.length)}`,
+      },
+    ];
+  }
+
+  /** Which session each attached client is showing now, by tty. What `switch-client` has to move. */
+  clientSessions(): ReadonlyMap<string, string> {
+    return new Map(this.clients.map((client) => [client.tty, client.session]));
+  }
+
   /** Someone sets a pane's title in tmux itself — `select-pane -T` from the operator's own keyboard. */
   async renameOutOfBand(paneId: string, label: string): Promise<void> {
     const pane = this.panes.find((candidate) => candidate.id === paneId);
     if (pane !== undefined) pane.title = label;
+    await Promise.resolve();
+  }
+
+  /**
+   * The PROGRAM in a pane prints an OSC title. The same one slot `select-pane -T` writes — which is
+   * the whole hazard, and why the adapter has to remember what it set rather than read the slot.
+   */
+  async setProgramTitle(paneId: string, title: string): Promise<void> {
+    const pane = this.panes.find((candidate) => candidate.id === paneId);
+    if (pane !== undefined) pane.title = title;
+    await Promise.resolve();
+  }
+
+  /**
+   * The program in a pane EXITS, leaving the shell that launched it — and its title behind.
+   *
+   * Both halves are tmux's real behaviour: `pane_current_command` falls back to the shell, and
+   * `pane_title` keeps whatever the dead program last printed. Live-observed, and the bug this
+   * fixture exists to pin.
+   */
+  async exitProgram(paneId: string): Promise<void> {
+    const pane = this.panes.find((candidate) => candidate.id === paneId);
+    if (pane !== undefined) pane.command = "bash";
     await Promise.resolve();
   }
 
@@ -174,6 +287,19 @@ export class FakeTmux implements TmuxExec {
    */
   async endPane(paneId: string): Promise<void> {
     this.panes = this.panes.filter((pane) => pane.id !== paneId);
+    await Promise.resolve();
+  }
+
+  /** The operator renames a window in tmux itself. No control-mode line is emitted. */
+  async pokeTopologyOutOfBand(): Promise<void> {
+    const window = this.windows[0];
+    if (window !== undefined) {
+      window.name = `out-of-band-${String(this.windows.length)}`;
+      // Cleared alongside the name, because that is what tmux does: a window the operator named is
+      // no longer auto-named, and a fixture that left the flag set would describe a state tmux never
+      // produces.
+      window.autoNamed = false;
+    }
     await Promise.resolve();
   }
 
@@ -204,8 +330,10 @@ export class FakeTmux implements TmuxExec {
   async run(args: readonly string[], stdin?: string): Promise<TmuxRunResult> {
     await Promise.resolve();
     if (!this.connected) return { code: 1, stdout: "", stderr: "error connecting to /fake/tmux-socket\n" };
+    if (this.crashed) return { code: 1, stdout: "", stderr: "server exited unexpectedly\n" };
     let stdout = "";
     for (const group of splitCommands(args)) {
+      this.ran.push([...group]);
       const result = this.command(group, stdin);
       if (result.code !== 0) return result;
       stdout += result.stdout;
@@ -239,12 +367,16 @@ export class FakeTmux implements TmuxExec {
     if (verb === "paste-buffer") return this.pasteBuffer(group);
     if (verb === "send-keys") return this.sendKeys(group);
     if (verb === "select-pane") return this.selectPane(group);
+    if (verb === "select-window") return this.selectWindow(group);
+    if (verb === "list-clients") return this.listClients(group);
+    if (verb === "switch-client") return this.switchClient(group);
     if (verb === "kill-pane") return this.killPane(group);
     if (verb === "new-window") return this.newWindow(group);
     if (verb === "rename-window") return this.renameWindow(group);
     if (verb === "kill-window") return this.killWindow(group);
     if (verb === "new-session") return this.newSession(group);
     if (verb === "display-message") return this.displayMessage(group);
+    if (verb === "show-options") return this.showOptions(group);
     return { code: 1, stdout: "", stderr: `unknown command: ${verb}\n` };
   }
 
@@ -307,11 +439,73 @@ export class FakeTmux implements TmuxExec {
     return said("");
   }
 
+  /**
+   * `select-pane -t <pane> [-T <title>]` — tmux's one verb for two acts, and the flag decides which.
+   *
+   * With `-T` it writes the title slot (`renamePane`, including the `-T ""` that clears it). Without
+   * it, it FOCUSES the pane inside its window, which is the second half of `setFocus`.
+   */
   private selectPane(group: readonly string[]): TmuxRunResult {
     const paneId = flagValue(group, "-t") ?? "";
     const pane = this.panes.find((candidate) => candidate.id === paneId);
     if (pane === undefined) return missing("pane", paneId);
-    pane.title = flagValue(group, "-T") ?? "";
+    if (group.includes("-T")) {
+      pane.title = flagValue(group, "-T") ?? "";
+      return said("");
+    }
+    for (const candidate of this.panes) {
+      if (candidate.windowId === pane.windowId) candidate.active = candidate.id === pane.id;
+    }
+    return said("");
+  }
+
+  /** `select-window -t <window>` — the window becomes its session's current one. */
+  private selectWindow(group: readonly string[]): TmuxRunResult {
+    const windowId = flagValue(group, "-t") ?? "";
+    const window = this.windows.find((candidate) => candidate.id === windowId);
+    if (window === undefined) return missing("window", windowId);
+    for (const candidate of this.windows) {
+      if (candidate.sessionId === window.sessionId) candidate.active = candidate.id === window.id;
+    }
+    return said("");
+  }
+
+  /** `list-clients -F <format>` — the fourth section of the listing call. */
+  private listClients(group: readonly string[]): TmuxRunResult {
+    const format = flagValue(group, "-F") ?? "";
+    return said(
+      this.clients
+        .map(
+          (client) =>
+            `${render(
+              format,
+              new Map([
+                ["client_session", client.session],
+                ["client_control_mode", client.control ? "1" : "0"],
+                ["client_activity", String(client.activity)],
+                ["client_tty", client.tty],
+              ]),
+            )}\n`,
+        )
+        .join(""),
+    );
+  }
+
+  /**
+   * `switch-client -c <tty> -t <session>` — the one verb that moves a TERMINAL to another session.
+   *
+   * Modelled because it is the half of `setFocus` that reaches the operator's screen: selecting a
+   * window changes what the target SESSION shows, and a client sitting on another session sees none
+   * of it. An unknown tty answers tmux's own `can't find client:`.
+   */
+  private switchClient(group: readonly string[]): TmuxRunResult {
+    const tty = flagValue(group, "-c") ?? "";
+    const target = flagValue(group, "-t") ?? "";
+    const client = this.clients.find((candidate) => candidate.tty === tty);
+    if (client === undefined) return missing("client", tty);
+    const session = this.sessions.find((candidate) => candidate.id === target || candidate.name === target);
+    if (session === undefined) return missing("session", target);
+    client.session = session.name;
     return said("");
   }
 
@@ -372,8 +566,23 @@ export class FakeTmux implements TmuxExec {
    */
   private displayMessage(group: readonly string[]): TmuxRunResult {
     if (!group.includes("-p")) return said("");
-    const vars = new Map([["socket_path", FAKE_TMUX_SOCKET]]);
+    const vars = new Map([
+      ["socket_path", FAKE_TMUX_SOCKET],
+      ["version", this.version],
+    ]);
     return said(`${render(flagValue(group, "-F") ?? "", vars)}\n`);
+  }
+
+  /**
+   * `show-options -gv <name>` — one GLOBAL option's bare value, which is what `-v` means.
+   *
+   * Only `window-size` has an answer here, because it is the only global option the adapter asks
+   * about (the #4849 spawn guard). Everything else renders empty, as the real binary does for an
+   * option that is set to nothing.
+   */
+  private showOptions(group: readonly string[]): TmuxRunResult {
+    const name = flagValue(group, "-gv") ?? "";
+    return said(`${name === "window-size" ? this.windowSize : ""}\n`);
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
@@ -480,7 +689,10 @@ export class FakeTmux implements TmuxExec {
 
   /**
    * The world every conformance world starts in: three live panes across two sessions and two
-   * windows, one of them carrying an operator-set title.
+   * windows, one of them carrying a title in tmux's one title slot.
+   *
+   * Nobody set that title THROUGH COLLIE, so the adapter reports it as a `terminalTitle` and not as
+   * the operator's label — which is the contract's *Pane naming* rule seen from the fixture side.
    *
    * The engine's world contract asks for exactly this. A single bare shell would let half the suite
    * pass vacuously — nothing about a space join, nothing about ids staying unique across two spaces.
@@ -488,8 +700,8 @@ export class FakeTmux implements TmuxExec {
   private seed(): void {
     const first = this.newSessionNamed("collie");
     const firstTab = this.newWindowIn(first, "agents", false);
-    const labelled = this.newPaneIn(firstTab, "/home/dev/collie");
-    labelled.title = "the pane the operator named";
+    const titled = this.newPaneIn(firstTab, "/home/dev/collie");
+    titled.title = "the title the pane printed";
     this.newPaneIn(firstTab, "/home/dev/collie");
 
     const second = this.newSessionNamed("scratch");
@@ -553,8 +765,11 @@ export function tmuxWorld(fake: FakeTmux): MuxConformanceWorld {
     reconnect: () => fake.reconnect(),
     restartMux: () => fake.restartMux(),
     renameOutOfBand: (paneId, label) => fake.renameOutOfBand(paneId, label),
+    setProgramTitle: (paneId, title) => fake.setProgramTitle(paneId, title),
+    focusOutOfBand: (paneId) => fake.focusOutOfBand(paneId),
     changePane: (paneId) => fake.changePane(paneId),
     endPane: (paneId) => fake.endPane(paneId),
+    pokeTopologyOutOfBand: () => fake.pokeTopologyOutOfBand(),
     pokeTopology: () => fake.pokeTopology(),
     pokePane: (paneId) => fake.pokePane(paneId),
     close: () => {

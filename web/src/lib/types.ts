@@ -1,6 +1,9 @@
 // Frontend mirror of the bridge's domain model (bridge/types.ts). Kept as a small, deliberate
 // duplicate so the web app builds independently of the Bun server's source tree.
 
+import type { ApiErrorCode, ApiErrorDetail } from "@/lib/api-error-codes";
+import { t } from "@/lib/i18n";
+
 export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
 
 export interface AgentView {
@@ -57,6 +60,16 @@ export interface AgentView {
    */
   terminalTitle?: string;
   /**
+   * True when `terminalTitle` was left behind by a program that has already EXITED — a multiplexer
+   * keeps a pane's title after the program that printed it is gone, so a bare shell can sit under a
+   * finished agent's sentence for hours. Derived bridge-side; absent on an older bridge, which reads
+   * as "not known to be stale" and renders exactly as it always did.
+   *
+   * It demotes, it never hides: a stale title is not the pane's NAME (see {@link paneDisplayName}),
+   * but it still shows on the muted line, because it is the only trace of what ran here.
+   */
+  terminalTitleStale?: boolean;
+  /**
    * A finished sentence the bridge composed about this pane, for the operator to read. Absent on
    * almost every pane, and on every bridge older than the version that introduced it.
    *
@@ -98,11 +111,15 @@ export interface AgentView {
  * overwritten by one the process is rewriting every turn; the title outranks the agent name because
  * "claude" tells you nothing when four rows say it. All three are rendered only as React text nodes
  * by callers — never markup — so they stay within the pane-output XSS boundary.
+ *
+ * A STALE title names nothing: the program that wrote it has exited, so it is a fact about the past,
+ * and a past task standing in as a live pane's name is the bug this rule exists to stop. Such a pane
+ * falls back to what it would be called with no title at all.
  */
 export function paneDisplayName(pane: AgentView): string {
   if (pane.paneLabel) return pane.paneLabel;
   if (pane.sessionName) return pane.sessionName;
-  if (pane.terminalTitle) return pane.terminalTitle;
+  if (pane.terminalTitle && !pane.terminalTitleStale) return pane.terminalTitle;
   return pane.kind === "shell" ? "shell" : pane.agent;
 }
 
@@ -343,16 +360,26 @@ export type PaneHistoryResponse =
       fileTruncated: boolean;
     };
 
+/**
+ * `error` is the bridge's English sentence and stays what a client displays when it has nothing
+ * better; `code` + `detail` are the machine half, which `lib/api-error-message.ts` turns into the
+ * operator's language. `code` was once only ever `"prompt_changed"` — it now names any catalogued
+ * refusal, so a client must fall back on a code it doesn't recognise rather than treat it as a bug.
+ * Mirrors ActionResponse in bridge/types.ts.
+ */
 export type ActionResponse =
   | { ok: true }
   | {
       ok: false;
       error: string;
       textDelivered?: boolean;
-      code?: "prompt_changed";
+      code?: ApiErrorCode;
+      detail?: ApiErrorDetail;
     };
 
-export type UploadResponse = { ok: true; path: string } | { ok: false; error: string };
+export type UploadResponse =
+  | { ok: true; path: string }
+  | { ok: false; error: string; code?: ApiErrorCode; detail?: ApiErrorDetail };
 
 /** A freshly-created shell pane — enough to navigate into before the next poll lands. */
 export interface CreatedPane {
@@ -364,7 +391,9 @@ export interface CreatedPane {
 }
 
 /** Result of creating a new tab/space — on success `pane` is the fresh shell to navigate into. */
-export type CreateResponse = { ok: true; pane: CreatedPane } | { ok: false; error: string };
+export type CreateResponse =
+  | { ok: true; pane: CreatedPane }
+  | { ok: false; error: string; code?: ApiErrorCode; detail?: ApiErrorDetail };
 
 /**
  * Which role the bridge plays in a pack (PACK_PROTOCOL.md §3). Mirrors PackMode in bridge/types.ts.
@@ -424,6 +453,7 @@ export const MUX_CAPABILITIES = [
   "sendKeys",
   "renamePane",
   "closePane",
+  "setFocus",
   "createTab",
   "renameTab",
   "closeTab",
@@ -448,6 +478,14 @@ export interface MuxConfig {
   capabilities: Partial<Record<MuxCapability, boolean>>;
   /** Neutral key spellings this multiplexer refuses. */
   unsupportedKeys: string[];
+  /**
+   * How many spaces this multiplexer can hold — not how many exist right now.
+   *
+   * `"one"` drops the space strip and makes the tab strip the top level. ABSENT (an older bridge, a
+   * cached page) reads as `"many"`; the rule and its reasoning live in lib/mux-capability.ts beside
+   * every other "what is true of the multiplexer" answer.
+   */
+  spaces?: "one" | "many";
   /** The adapter's own words for the capabilities it lacks — the text an explanation renders. */
   notes: Partial<Record<MuxCapability, string>>;
   /**
@@ -460,6 +498,42 @@ export interface MuxConfig {
    * (lib/mux-capability.ts, scripts/check-mux-names.sh).
    */
   logoUrl?: string;
+  /**
+   * How soon this bridge sees a topology change nobody announced. Mirrors `MuxTopologyLatency` in
+   * bridge/mux/capabilities.ts.
+   *
+   * **Absent on any bridge older than the field, and absent reads as `push`** — the same fail-open
+   * direction the capabilities take (lib/mux-capability.ts). Read it through `useTopologyLatency()`
+   * rather than here, so that rule lives in exactly one place.
+   */
+  topologyLatency?: MuxTopologyLatency;
+}
+
+/**
+ * How soon Collie sees a change made in the operator's own terminal — declared by the bridge, never
+ * measured here (ADR 0031).
+ *
+ * `push` means the multiplexer announces it, so there is nothing to say and the UI says nothing.
+ * `bounded` means the bridge censuses and `ms` is the longest a change can sit unseen — which is
+ * what makes "synced Ns ago" honest information rather than decoration.
+ */
+export type MuxTopologyLatency =
+  | { kind: "push" }
+  | { kind: "bounded"; ms: number };
+
+/**
+ * One operator-declared Quick-dock group (a `[[replies]]` table in their `quick-replies.toml`).
+ * Mirrors OperatorQuickReplyRow in bridge/types.ts. Resolved against the shipped groups by
+ * `quickRepliesFor()`, which hands a pane these rows instead of the shipped ones when any of them
+ * address it.
+ */
+export interface OperatorQuickReplyRow {
+  /** Herdr agent name this applies to, lowercased. Omitted = every agent. */
+  agent?: string;
+  /** The group's heading, and its identity within one scope. */
+  title: string;
+  /** The literal strings sent — each is typed into the pane and submitted verbatim. */
+  items: string[];
 }
 
 export interface BridgeConfig {
@@ -477,12 +551,36 @@ export interface BridgeConfig {
   operatorCommands?: OperatorCommand[];
   /** The operator's own Keys-tray presets. Absent when there is no `keys.toml`. */
   operatorKeys?: OperatorKeyRow[];
+  /** The operator's own Quick-dock groups. Absent when there is no `quick-replies.toml`. */
+  operatorQuickReplies?: OperatorQuickReplyRow[];
   /**
    * The multiplexer and its declared capabilities. **Absent on a bridge older than this field**, and
    * that absence is read as "everything is supported" — a mid-upgrade Herdr operator must never
    * watch controls disappear while a cached config is in flight (lib/mux-capability.ts).
    */
   mux?: MuxConfig;
+  /**
+   * Speech-to-text, when the operator configured a provider (ADR 0029). Mirrors `SttCapability` in
+   * bridge/types.ts.
+   *
+   * **Absent is the feature being off**, and it is also what every bridge older than the field
+   * sends — so the phone reads "no key" as "no microphone" and draws no record button at all. The
+   * feature is absent, not disabled.
+   */
+  stt?: SttCapability;
+}
+
+/**
+ * What `/api/config` says about speech-to-text — a label and a yes/no, never the endpoint, the model
+ * or the credential. The phone decides whether to draw a button, not where the audio goes.
+ */
+export interface SttCapability {
+  /** The provider's id, e.g. `openai-compatible`. A label to show, never a branch. */
+  provider: string;
+  /** Whether it could serve a request right now. */
+  available: boolean;
+  /** Operator-facing prose when it could not. Absent when it could. */
+  reason?: string;
 }
 
 /**
@@ -507,10 +605,8 @@ export const STATUS_RANK = {
   done: 4,
 } satisfies Record<AgentStatus, number>;
 
-export const STATUS_LABEL = {
-  blocked: "needs you",
-  working: "working",
-  idle: "idle",
-  done: "done",
-  unknown: "unknown",
-} satisfies Record<AgentStatus, string>;
+/** Translated status labels, resolved fresh on every call — a caller that renders one must also
+ *  call `useLocale()` so it re-renders when the active language changes (see hooks/use-locale.ts). */
+export function statusLabel(status: AgentStatus): string {
+  return t(`status.label.${status}`);
+}

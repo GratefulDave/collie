@@ -1,9 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { StateEngine, type EngineSnapshot } from "./state-engine.ts";
+import {
+  ATTENTION_WINDOW_MS,
+  StateEngine,
+  terminalTitleIsStale,
+  type EngineSnapshot,
+} from "./state-engine.ts";
 import { HerdrMux } from "./mux/herdr/adapter.ts";
 import type { HerdrClient, PaneRead } from "./mux/herdr/client.ts";
-import type { MuxAdapter } from "./mux/types.ts";
+import type { MuxAdapter, MuxPane } from "./mux/types.ts";
 import type { AgentStatus } from "./types.ts";
 
 // HerdrClient carries private socket fields, so no fake can ever *be* one structurally — every fake
@@ -544,13 +549,20 @@ describe("StateEngine — poke / cadence / onUpdate", () => {
     expect(herdr.calls).toBe(0);
   });
 
-  test("setCadence re-arms the interval only when started and changed", () => {
-    const { engine } = makeEngine();
+  test("setCadence re-arms the interval only when started and changed", async () => {
+    const { herdr, engine, poll } = makeEngine();
     const cadence = () => engine["cadenceMs"];
     const timer = () => engine["timer"];
 
     engine.setCadence(9000); // not started → no-op
     expect(cadence()).toBe(1500);
+
+    // Connect first: a relax ordered before the engine has ever connected is PARKED, not applied
+    // (pinned by its own test below), so re-arming has to be asked of a connected engine. This poll
+    // runs BEFORE start(), whose own first poll would otherwise still be in flight and make this
+    // one a no-op against the in-flight guard.
+    herdr.panes = [pane("w1:p1", "w1", "idle", "claude")];
+    await poll();
 
     engine.start();
     expect(cadence()).toBe(1500);
@@ -560,6 +572,32 @@ describe("StateEngine — poke / cadence / onUpdate", () => {
     engine.setCadence(12_000); // changed → re-arm
     expect(cadence()).toBe(12_000);
     expect(timer()).not.toBe(before);
+    engine.stop();
+  });
+
+  // Relaxing is earned by a connected poll, never granted on the event watch's ack. The ack proves
+  // a census answered; it does not prove `snapshot()` succeeded. Relaxing on it alone left a cold
+  // start's missed first poll standing for a whole idle interval — 13.1 s, measured on zellij.
+  test("a relax ordered before the first connected poll is parked until one lands", async () => {
+    const { herdr, engine, poll } = makeEngine();
+    const cadence = () => engine["cadenceMs"];
+    engine["started"] = true;
+    engine.setCadence(12_000); // never connected → parked; the fast cadence keeps retrying
+    expect(cadence()).toBe(1500);
+    herdr.panes = [pane("w1:p1", "w1", "idle", "claude")];
+    await poll();
+    expect(cadence()).toBe(12_000); // the first connected poll earns it
+    engine.stop();
+  });
+
+  test("a tighten while a relax is parked discards the parked relax", async () => {
+    const { engine, poll } = makeEngine();
+    const cadence = () => engine["cadenceMs"];
+    engine["started"] = true;
+    engine.setCadence(12_000); // parked
+    engine.setCadence(1500); // the watch flapped down → fast wins, and the parked relax dies
+    await poll();
+    expect(cadence()).toBe(1500); // connecting must NOT resurrect it
     engine.stop();
   });
 });
@@ -718,5 +756,126 @@ describe("StateEngine — pane capability fields", () => {
     herdr.panes = [pane("w1:p1", "w1", "idle", "claude")];
     await poll();
     expect(engine.current().agents[0]!.readableLines).toBeUndefined();
+  });
+});
+
+// A TITLE OUTLIVES THE PROGRAM THAT WROTE IT (MUX_CONTRACT.md § traps).
+//
+// Live-observed on tmux: pane %3 was running a bare `bash`, and its title still read
+// `✳ waiting for soak time - server performance` — the OSC title of a Claude that had exited hours
+// earlier. tmux keeps a pane's title after the program goes away, so the two raw facts the adapter
+// reports only mean something TOGETHER, which is what this rule reads. It marks; it never deletes.
+describe("terminalTitleIsStale", () => {
+  function muxPane(fields: Partial<MuxPane>): MuxPane {
+    return {
+      paneId: "%3",
+      spaceId: "$0",
+      spaceLabel: "collie",
+      spaceNumber: 1,
+      tabId: "@0",
+      cwd: "/home/dev/collie",
+      focused: false,
+      alive: true,
+      agent: "shell",
+      status: "unknown",
+      ...fields,
+    };
+  }
+
+  test("a shell under a title the shell did not write is stale", () => {
+    const left = muxPane({ foregroundCommand: "bash", terminalTitle: "✳ waiting for soak time" });
+    expect(terminalTitleIsStale(left)).toBe(true);
+  });
+
+  test.each(["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh", "/usr/bin/zsh", "BASH"])(
+    "%s counts as a shell",
+    (command) => {
+      expect(terminalTitleIsStale(muxPane({ foregroundCommand: command, terminalTitle: "a task" }))).toBe(true);
+    },
+  );
+
+  test("a program still running under its own title is not stale", () => {
+    const live = muxPane({ foregroundCommand: "claude", terminalTitle: "✳ waiting for soak time" });
+    expect(terminalTitleIsStale(live)).toBe(false);
+  });
+
+  test("a shell that titles the pane after itself is describing the present", () => {
+    expect(terminalTitleIsStale(muxPane({ foregroundCommand: "bash", terminalTitle: "bash" }))).toBe(false);
+  });
+
+  test.each([
+    ["no title", { foregroundCommand: "bash" }],
+    ["an empty title", { foregroundCommand: "bash", terminalTitle: "   " }],
+    // Herdr reports no foreground command at all, so no Herdr pane is ever marked stale: there is
+    // nothing to read the emptiness as, and guessing would put a mark on a live agent's own title.
+    ["no foreground command", { terminalTitle: "✳ waiting for soak time" }],
+  ])("%s is never stale", (_label, fields) => {
+    expect(terminalTitleIsStale(muxPane(fields))).toBe(false);
+  });
+
+  /** A multiplexer that reports exactly the panes it is handed. */
+  function muxOf(panes: readonly MuxPane[]): MuxAdapter {
+    // SAFETY: a poll over a herd of bare SHELLS reaches `snapshot()` and nothing else — the
+    // session-name scrape runs only for a claude pane, and none of these is one. The members left
+    // off are unobservable here.
+    const stub: Partial<MuxAdapter> = {
+      reachable: () => Promise.resolve(true),
+      snapshot: () => Promise.resolve({ panes, spaces: [], tabs: [] }),
+    };
+    // SAFETY: see above — every member this poll can reach is present on `stub`.
+    return stub as MuxAdapter;
+  }
+
+  test("the mark reaches the view, and the title itself goes on the wire untouched", async () => {
+    const stale = muxPane({ foregroundCommand: "bash", terminalTitle: "✳ waiting for soak time" });
+    const engine = new StateEngine(muxOf([stale]), 1500);
+    await engine["poll"]();
+    const view = engine.current().shellPanes[0]!;
+    expect(view.terminalTitle).toBe("✳ waiting for soak time");
+    expect(view.terminalTitleStale).toBe(true);
+  });
+
+  test("a live program's title reaches the view with the flag ABSENT, not false", async () => {
+    const live = muxPane({ foregroundCommand: "claude", terminalTitle: "✳ waiting for soak time" });
+    const engine = new StateEngine(muxOf([live]), 1500);
+    await engine["poll"]();
+    const view = engine.current().shellPanes[0]!;
+    expect(view.terminalTitle).toBe("✳ waiting for soak time");
+    // Absent, exactly as every other optional field on the wire is when it has nothing to say.
+    expect("terminalTitleStale" in view).toBe(false);
+  });
+});
+
+// ATTENTION — the one fact the bridge knows and the multiplexer cannot: is somebody looking?
+//
+// It is read by a censusing adapter's watch (mux/types.ts § MuxWatchOptions.attention), so getting
+// it wrong is not visible as a failure: it is visible as a phone that feels slow, or as a host
+// spending a process every 1.5 s for nobody. Both directions are pinned here.
+describe("StateEngine — attention", () => {
+  const NOW = 1_700_000_000_000;
+
+  test("a bridge nobody has read is idle — a restart must not spend a fast census on an empty room", () => {
+    const { engine } = makeEngine();
+    expect(engine.attention(NOW)).toBe("idle");
+  });
+
+  test("a read makes it watched, and it stays watched for the whole window", () => {
+    const { engine } = makeEngine();
+    engine.noteAttention(NOW);
+    expect(engine.attention(NOW)).toBe("watched");
+    expect(engine.attention(NOW + ATTENTION_WINDOW_MS)).toBe("watched");
+  });
+
+  test("one millisecond past the window it is idle again", () => {
+    const { engine } = makeEngine();
+    engine.noteAttention(NOW);
+    expect(engine.attention(NOW + ATTENTION_WINDOW_MS + 1)).toBe("idle");
+  });
+
+  test("a later read extends it — a phone polling every four seconds never flickers", () => {
+    const { engine } = makeEngine();
+    engine.noteAttention(NOW);
+    engine.noteAttention(NOW + 4000);
+    expect(engine.attention(NOW + ATTENTION_WINDOW_MS + 1)).toBe("watched");
   });
 });

@@ -139,10 +139,17 @@ describe("parseListing", () => {
     expect(parsed.panes).toHaveLength(1);
   });
 
+  test("a client record carries its tty — the only handle `switch-client` accepts", () => {
+    const client = parseListing(["C", "collie-tmux", "0", "42", "/dev/pts/3"].join(SEP)).clients.at(0);
+    expect(client).toEqual({ sessionId: "collie-tmux", control: false, activity: 42, tty: "/dev/pts/3" });
+  });
+
   test("the listing asks for its fields rather than parsing a human table", () => {
     expect(LISTING_ARGS).toContain("-F");
-    // One invocation, three commands: tmux's own `;` separator, as its lexer reads it.
-    expect(LISTING_ARGS.filter((arg) => arg === ";")).toHaveLength(2);
+    // One invocation, four commands — sessions, windows, panes, clients — joined by tmux's own `;`
+    // separator, as its lexer reads it.
+    expect(LISTING_ARGS.filter((arg) => arg === ";")).toHaveLength(3);
+    expect(LISTING_ARGS).toContain("list-clients");
   });
 });
 
@@ -178,6 +185,11 @@ describe("the sentences tmux answers with", () => {
     expect(saysNoServer("error connecting to /tmp/tmux-1000/colliegone (No such file or directory)")).toBe(true);
     expect(saysNoServer("duplicate session: other")).toBe(false);
     expect(saysNoServer("can't find pane: %999")).toBe(false);
+  });
+
+  test("a server that died DURING the call is `unreachable` too — the transport, not a refusal", () => {
+    expect(saysNoServer("server exited unexpectedly")).toBe(true);
+    expect(saysNoServer("lost server")).toBe(true);
   });
 });
 

@@ -19,6 +19,7 @@ import { fetchPane, sendKeys, sendReply } from "./api";
 import { parseAnsi } from "./ansi";
 import { splitLines } from "./blocks";
 import { detectPromptSelect } from "./harness/claude/prompt-select";
+import { t } from "./i18n";
 import { FEEDBACK_MAX_LENGTH, submitPromptFeedback, submitPromptOption } from "./prompt-action";
 
 const mockFetchPane = vi.mocked(fetchPane);
@@ -229,6 +230,22 @@ describe("submitPromptFeedback — the states it refuses BEFORE touching the pan
       status: "changed",
     });
     expect(mockSendKeys).not.toHaveBeenCalled();
+  });
+
+  it("refuses a free-text row — that is not Claude's plan-feedback send path", async () => {
+    const grokAsk = {
+      ...model(),
+      family: "select" as const,
+      feedback: { key: "z", focused: false, text: "", purpose: "free-text" as const },
+    };
+    const res = await submitPromptFeedback({ ...base, prompt: grokAsk, text: "navy" });
+    expect(res).toEqual({
+      status: "error",
+      error: t("promptAction.feedback.freeTextUnsupported"),
+    });
+    expect(mockFetchPane).not.toHaveBeenCalled();
+    expect(mockSendKeys).not.toHaveBeenCalled();
+    expect(mockSendReply).not.toHaveBeenCalled();
   });
 
   it("refuses empty text without sending anything", async () => {
