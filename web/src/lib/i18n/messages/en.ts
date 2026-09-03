@@ -14,11 +14,7 @@
 
 export const en = {
   "settings.language.title": "Language",
-  "settings.language.description":
-    "Choose the language Collie speaks. The terminal mirror is never translated — it shows what the agent printed.",
-  "settings.language.active": "Collie is showing {language}.",
-  "settings.language.available.one": "{count} language available.",
-  "settings.language.available.other": "{count} languages available.",
+  "settings.language.description": "The terminal mirror is never translated.",
 
   // --- settings (page chrome) ---
   "settings.title": "Settings",
@@ -35,6 +31,15 @@ export const en = {
   "settings.haptics.title": "Haptics",
   "settings.haptics.description": "A short buzz when you press a key or a quick reply.",
 
+
+  // --- settings.zen ---
+  // Availability only: the toggle decides whether the pane menu offers zen at all.
+  "settings.install.title": "Install the app",
+  "settings.install.description": "Add Collie to your home screen — full screen, its own icon.",
+  "settings.install.button": "Install",
+  "settings.install.iosHint": "On an iPhone or iPad, install from the browser's share sheet: tap Share, then \"Add to Home Screen\".",
+  "settings.zen.title": "Zen mode",
+  "settings.zen.description": "Adds a row to the pane menu that hides everything but the terminal.",
 
   // --- settings.handsFree ---
   "settings.handsFree.title": "Hands-free voice",
@@ -146,10 +151,37 @@ export const en = {
   "settings.updateBanner.majorAvailable": "Collie {version} — a new major",
   "settings.updateBanner.copyAria": "Copy command: {command}",
 
+  // --- settings.typeface (the APP's own face — a per-device preference since ADR 0033) ---
+  // FAMILY NAMES ARE NOT HERE, and must not be added: "Space Grotesk" and "Aldrich" are proper
+  // nouns and are named the same in every locale, exactly like the terminal families below. The
+  // NOTES are phrases about a face rather than the name of one, so they are translated.
+  "settings.typeface.title": "Typeface",
+  "settings.typeface.description": "The app's own face, on this device.",
+  "settings.typeface.family": "Family",
+  "settings.typeface.system": "System default",
+  "settings.typeface.note.system": "Your phone's own face. Downloads nothing.",
+  "settings.typeface.note.grotesk": "Collie's own voice, drawn to match the mark.",
+  // Says the cost out loud rather than letting it be discovered: Aldrich ships one weight, and the
+  // app suppresses synthesized bold, so bold text under it is not heavier than the rest.
+  "settings.typeface.note.aldrich": "One weight, so bold text looks the same as regular.",
+  "settings.typeface.note.operator": "Added by this collie's operator.",
+
+  // --- settings.fonts (the terminal face: the mirror's size and the draft field's; NOT the app's own typeface) ---
+  "settings.fonts.title": "Terminal font",
+  "settings.fonts.description": "The terminal mirror and the draft field, on this device.",
+  "settings.fonts.family": "Family",
+  "settings.fonts.size": "Mirror text",
+  "settings.fonts.draftSize": "Draft text",
+  "settings.fonts.draftSize.hint":
+    "iOS keeps this at 16 — Safari zooms the page into any smaller field you type in, and never zooms back out.",
+  "settings.fonts.draftSize.decrease": "Decrease draft text size",
+  "settings.fonts.draftSize.increase": "Increase draft text size",
+  "settings.fonts.system": "System default",
+
   // --- settings.display (mirror display prefs, behind the composer's ⚙ dock) ---
   "settings.display.wrap.label": "Wrap lines",
   "settings.display.wrap.hint":
-    "Off shows column-faithful output for TUI tables — you pan instead.",
+    "Off pans the whole pane, column-faithful. You no longer need it for a table — a table pans by itself while Wrap is on.",
   "settings.display.tapToType.label": "Tap to type",
   "settings.display.tapToType.hint":
     "On, tapping the mirror anywhere opens the keyboard. Off, the mirror behaves like a document — taps land on the text and only the composer opens the keyboard.",
@@ -176,8 +208,8 @@ export const en = {
   "composer.controls.display": "Display",
   "composer.sentPreview.label": "You sent:",
   "composer.placeholder.gone": "Pane is gone",
-  "composer.placeholder.readOnly": "Read-only — device not authorised",
-  "composer.placeholder.noMuxSend": "This terminal can't be typed into from here",
+  "composer.placeholder.readOnly": "Read-only — not authorised",
+  "composer.placeholder.noMuxSend": "Can't type into this terminal",
   "composer.placeholder.direct": "Type into the terminal…",
   "composer.placeholder.shell": "Type a shell command…",
   "composer.placeholder.reply": "Type a reply…",
@@ -229,16 +261,36 @@ export const en = {
   "sendMode.armed.stop": "Stop",
 
   // --- chat (the pane view shell: header, mirror, switcher) ---
-  "chat.find.aria": "Find in output",
-  "chat.history.aria": "Conversation history",
-  "chat.header.openOverviewAria": "Open {workspace} overview",
+  "chat.zen.label": "Zen mode",
+  // The floating pill is the ONE way out of zen, and it carries no words — only the glyph.
+  "chat.zen.exitAria": "Exit zen mode",
+  // --- chat.strips (the tab row + pane row, folded into one bar of beads) ---
+  // The chevron's own name, and the summary bar's. Both are chosen for the rows actually on screen:
+  // a pane row appears only above one pane, so naming it unconditionally would promise a row that is
+  // not there. Each case is a WHOLE sentence rather than a phrase assembled from parts — "3 tabs" is
+  // a noun phrase, and dropping one into a template is the bug every language with cases hands back.
+  "chat.strips.hide.both": "Hide tabs and panes",
+  "chat.strips.hide.tabs": "Hide tabs",
+  "chat.strips.hide.panes": "Hide panes",
+  "chat.strips.show.both": "Show tabs and panes. {tabs}, {panes} hidden.",
+  "chat.strips.show.tabs": "Show tabs. {tabs} hidden.",
+  "chat.strips.show.panes": "Show panes. {panes} hidden.",
+  "chat.find.label": "Find in output",
+  "chat.history.label": "Conversation history",
+  // The header's ⋮ — the glyph names nothing, so the accessible name has to say what it OPENS.
+  "chat.paneMenu.aria": "Pane actions",
+  "chat.header.openOverviewAria": "Open {workspace} overview{status}",
+  "chat.header.statusAria": " — {label}",
   "chat.header.agentGone": "(agent gone)",
   "chat.scrollback.showHistory": "Show entire history",
   "chat.scrollback.loadOlder": "Load older",
   "chat.scrollback.loading": "Loading…",
+  "chat.scrollback.noSessionReported":
+    "{agent} has not reported a session to Herdr. Install or update the Herdr integration for it, then restart the agent in this pane.",
   "chat.output.empty": "(no recent output)",
   "chat.switcher.aria": "Switch pane",
   "chat.switcher.title": "Switch pane",
+  "chat.switcher.launch.here": "here",
   "chat.status.feedbackSent": "Feedback sent",
   "chat.status.sent": "Sent",
   "chat.status.menuChanged": "Menu changed — refreshing",
@@ -283,9 +335,10 @@ export const en = {
   "paneActions.close.label": "Close pane",
   "paneActions.close.confirm": "Tap again to close",
   "paneActions.close.closing": "Closing…",
-  "paneActions.showInTerminal.label": "Show in terminal",
-  "paneActions.showInTerminal.done": "Shown in the terminal",
-  "paneActions.showInTerminal.failed": "Couldn't show it in the terminal",
+  "paneActions.focus.labelWithMux": "Focus in {mux}",
+  "paneActions.focus.labelFallback": "Focus in the terminal",
+  "paneActions.focus.done": "Focused in the terminal",
+  "paneActions.focus.failed": "Couldn't focus in the terminal",
   "paneActions.empty.fallback": "This multiplexer offers no actions for a pane.",
   "paneActions.status.renamed": "Renamed",
   "paneActions.status.labelCleared": "Label cleared",
@@ -388,6 +441,7 @@ export const en = {
   "space.tab.renamed": "Renamed",
   "space.tab.renameFailed": "Rename failed",
   "space.tab.closeFailed": "Close failed",
+  "space.tab.closed": "Tab closed",
   "space.readOnly.notPaired": "Not paired — pair this device in Settings",
   "space.readOnly.deviceUnauthorised": "Read-only — device not authorised",
   "space.create.ready": "New {what} ready — launch your agent",
@@ -455,11 +509,55 @@ export const en = {
   "connection.session.aria": "Session: {name}. Switch session",
   "connection.session.primary": "primary",
   "connection.session.unreachable": "unreachable",
+  "connection.session.ariaIn": "In session: {name}",
+  "connection.session.all": "All sessions",
+  "connection.session.allDescription": "Every session on this machine, in one list",
+  "connection.session.allAria": "Showing every session. Switch session",
   "connection.server.title": "Machines",
   "connection.server.aria": "Host: {name}. Switch host",
 
+  // --- pack (the read-only /pack census; role names stay English, ADR 0030) ---
+  "pack.title": "Pack",
+  "pack.nav.back": "Back",
+  "pack.entry.title": "Pack overview",
+  "pack.entry.description": "How every machine in the pack is doing.",
+  "pack.footer.label": "Pack · {machines} · {reachable}",
+  "pack.footer.aria": "Open the pack overview",
+  "pack.summary.counts": "{machines} · {reachable}",
+  "pack.summary.machines.one": "{count} machine",
+  "pack.summary.machines.other": "{count} machines",
+  "pack.summary.reachable": "{count} reachable",
+  "pack.summary.deputy": "Deputy",
+  "pack.summary.noDeputy": "no deputy named",
+  "pack.summary.warrant": "warrant {generation}",
+  "pack.summary.secret": "Secret",
+  "pack.summary.secretValue": "generation {generation} · rotated {time}",
+  "pack.member.health": "State",
+  "pack.member.reason": "Reason",
+  "pack.member.conflict": "Conflict",
+  "pack.member.conflictValue": "{lead} also leads · warrant {generation}",
+  "pack.member.conflictNoWarrant": "{lead} also leads · no warrant",
+  "pack.member.version": "Version",
+  "pack.member.versionDiffers": "differs from lead",
+  "pack.member.address": "Address",
+  "pack.member.enrolled": "Enrolled",
+  "pack.member.secretBehind": "Has not picked up the current secret.",
+  "pack.member.provisional": "Enrolled but never reached.",
+  "pack.health.reachable": "reachable",
+  "pack.health.unreachable": "unreachable",
+  "pack.health.incompatible": "incompatible",
+  "pack.health.conflicted": "conflicted",
+  "pack.role.deputy": "deputy",
+  "pack.sheet.goTo": "Go to this machine",
+  "pack.formation.aria": "Pack formation: {machines}",
+  "pack.node.aria": "{name}, {role}, {health}",
+  "pack.node.ariaPlain": "{name}, {health}",
+  "pack.solo.title": "This collie is not leading a pack",
+  "pack.solo.description": "A pack is created and changed from the command line.",
+  "pack.error.title": "Could not load pack status",
+  "pack.error.description": "The bridge did not answer. Collie tries again on the next poll.",
+
   // --- error (boot splash, route-level error recovery) ---
-  "error.boot.loadingAria": "Loading",
   "error.boot.connecting": "Connecting to the herd…",
   "error.boot.title": "Not connected",
   "error.boot.body": "Can’t reach Collie — check your connection to the host, then try again.",
@@ -470,7 +568,6 @@ export const en = {
 
   // --- idle (the idle-pause cover) ---
   "idle.dialogAria": "Collie paused",
-  "idle.catchingUp.label": "Catching up",
   "idle.catchingUp.title": "Catching up",
   "idle.catchingUp.body": "Fetching the herd's current state.",
   "idle.paused.title": "Paused",
@@ -510,10 +607,6 @@ export const en = {
   "time.compact.now": "now",
 
   // --- sync (how fresh the herd on screen is, and asking for a fresher one) ---
-  "sync.age": "synced {age} ago",
-  "sync.pull.hint": "Pull to refresh",
-  "sync.pull.release": "Release to refresh",
-  "sync.pull.busy": "Refreshing…",
 
   // --- dialog (menu / multi-select / wizard / preview-select block renderers) ---
   "dialog.sendingAria": "Sending",
@@ -531,6 +624,7 @@ export const en = {
   "dialog.submitAnswers": "Submit answers",
   "dialog.cancel": "Cancel",
   "dialog.endsQuestionsSuffix": "— ends the questions",
+  "dialog.autocomplete.title": "Slash commands",
   "dialog.menu.moveUp": "Move up",
   "dialog.menu.moveDown": "Move down",
   "dialog.menu.leftAria": "Left — {verb} ({label})",
@@ -621,6 +715,8 @@ export const en = {
   "apiError.tab.rename_failed": "The tab couldn't be renamed: {reason}",
   "apiError.tab.close_failed": "The tab couldn't be closed: {reason}",
   "apiError.tab.workspace_required": "No space was named for the new tab.",
+  "apiError.launch.not_allowlisted": "That command isn't one of your launchers",
+  "apiError.launch.pane_unknown": "That pane is gone, nothing was launched",
   "apiError.workspace.create_failed": "The space couldn't be created: {reason}",
   "apiError.upload.too_large": "That image is too large — 10 MB is the limit.",
   "apiError.upload.no_file": "No file was sent.",
@@ -642,6 +738,85 @@ export const en = {
   "apiError.device.unknown": "No paired device has that name.",
   "apiError.session.unknown": "There is no session called {session} on this collie.",
   "apiError.host.unknown": "There is no collie called {host} in this pack.",
+  "apiError.pack.not_lead": "This collie doesn't lead a pack, so there is no pack to show.",
+  // --- worktrees (ADR 0032) ---
+  "apiError.worktree.list_failed": "The worktrees couldn't be listed: {reason}",
+  "apiError.worktree.create_failed": "The worktree couldn't be created: {reason}",
+  "apiError.worktree.created_not_opened": "The branch was created, but nothing could be opened on it: {reason}",
+  "apiError.worktree.open_failed": "The worktree couldn't be opened: {reason}",
+  "apiError.worktree.busy": "Another worktree operation is still running — try again in a moment.",
+  "apiError.worktree.ambiguous_branch": "That branch name matches more than one thing: {reason}",
+  "apiError.worktree.branch_required": "Type a branch name first.",
+  "apiError.worktree.not_a_repo": "This space isn't in a Git repository.",
+  "worktree.section": "Worktrees",
+  "worktree.new": "New worktree",
+  "worktree.branchLabel": "Branch name",
+  "worktree.branchPlaceholder": "feature/my-change",
+  "worktree.branchesFrom": "Branches from {branch}",
+  "worktree.create": "Create",
+  "worktree.creating": "Creating…",
+  "worktree.open": "Open",
+  "worktree.opening": "Opening…",
+  "worktree.mainCheckout": "the repo itself",
+  "worktree.empty": "No worktrees yet.",
+  "worktree.detached": "detached",
+  "worktree.recoverOpen": "Open the branch that was created",
+  "space.new.tab.plain": "Space",
+  "space.new.tab.worktree": "Worktree",
+  "space.new.repo.label": "Repository",
+  "space.new.host.label": "Host",
+  "worktree.orOpenExisting": "Or open one that already exists",
+  // --- apiError.update (POST /api/update refusals, M15/05) ---
+  "apiError.update.confirm_required": "That update needed a confirm, so nothing was started.",
+  "apiError.update.in_progress": "An update is already running ({state}). Nothing was started.",
+  "apiError.update.preflight_unavailable": "The preflight couldn't be run on this machine, so the update was refused.",
+  "apiError.update.preflight_red": "Preflight is red on {check}: {reason}",
+  "apiError.update.major_confirm_required": "{version} crosses a major, and a major needs its own confirm.",
+  "apiError.update.target_mismatch": "This screen offered {asked}, but this collie would install {would}. Reload and read it again.",
+  "apiError.update.none_available": "There is no newer release to take.",
+  "apiError.update.start_failed": "The update couldn't be started: {reason}",
+  // --- settings.updateCard (the update card, M15/05) ---
+  "settings.updateCard.title": "Update Collie",
+  "settings.updateCard.running": "Running {current}",
+  "settings.updateCard.newest": "Newest {version}",
+  "settings.updateCard.upToDate": "Up to date. Nothing to do.",
+  "settings.updateCard.unknownLatest": "The newest release isn't known yet.",
+  "settings.updateCard.includes": "One update folds in {versions}.",
+  "settings.updateCard.action": "Update to {version}",
+  "settings.updateCard.majorAction": "Cross to {version}",
+  "settings.updateCard.majorNote": "{version} is a new major.",
+  "settings.updateCard.dismiss": "Remind me next digest",
+  "settings.updateCard.dismissed": "Dismissed until the next digest.",
+  "settings.updateCard.packLead": "Peers are updated from the terminal: collie pack update",
+  "settings.updateCard.details": "Details",
+  "settings.updateCard.summary.checks.one": "{count} check",
+  "settings.updateCard.summary.checks.other": "{count} checks",
+  "settings.updateCard.summary.red.one": "{count} red",
+  "settings.updateCard.summary.red.other": "{count} red",
+  "settings.updateCard.summary.amber.one": "{count} amber",
+  "settings.updateCard.summary.amber.other": "{count} amber",
+  "settings.updateCard.preflightUnavailable": "The preflight couldn't be run on this machine.",
+  "settings.updateCard.remedy": "Fix: {command}",
+  "settings.updateCard.confirmTitle": "Update to {version}?",
+  "settings.updateCard.confirmBody": "Your terminal session stays alive. The phone view drops for up to 30 seconds.",
+  "settings.updateCard.confirmAction": "Yes, update",
+  "settings.updateCard.majorConfirmTitle": "Cross the major to {version}?",
+  "settings.updateCard.majorConfirmBody": "{version} is a new major, so it is consented to on its own and never folded into a routine update. Read its release notes first. Your terminal session stays alive. The phone view drops for up to 30 seconds.",
+  "settings.updateCard.majorConfirmAction": "Yes, cross to {version}",
+  "settings.updateCard.cancel": "Cancel",
+  "settings.updateCard.starting": "Starting…",
+  "settings.updateCard.state.preflight": "Checking this machine…",
+  "settings.updateCard.state.staging": "Staging {version}…",
+  "settings.updateCard.state.restarting": "Restarting. This is not an outage.",
+  "settings.updateCard.state.verifying": "Verifying the new build…",
+  "settings.updateCard.state.done": "Updated to {version}.",
+  "settings.updateCard.state.rolledBack": "Rolled back. This machine is still on {version}.",
+  "settings.updateCard.state.stuck": "The update is stuck. Run this in a terminal:",
+  "settings.updateCard.state.interrupted": "The update stopped before it finished. Nothing was left half-installed.",
+  "settings.updateCard.progressNote": "Keep this screen open. Your terminal session is untouched.",
+  "settings.updateCard.retry": "Retry",
+  "settings.updateCard.logTail": "Log tail",
+  "settings.updateCard.versionUnknown": "an unknown version",
 } as const;
 
 /** Every key that exists, as a union of string literals. The completeness contract. */

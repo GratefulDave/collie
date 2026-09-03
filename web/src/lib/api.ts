@@ -3,7 +3,7 @@
 
 import { parseApiErrorFields, type ApiErrorDetail, type ApiErrorFields } from "./api-error-codes";
 import { trackBusy } from "./busy";
-import { markLive } from "./connection-health";
+import { beginLongUpload, endLongUpload, markLive } from "./connection-health";
 import { abortSignalAfter, abortSignalAny } from "./env";
 import { asJsonString, parseJsonObject } from "./json";
 import { authHeader, clearNotPaired, markNotPaired, NOT_PAIRED_BODY } from "./pairing";
@@ -14,13 +14,20 @@ import type {
   BridgeConfig,
   CreateResponse,
   DevicesResponse,
+  LaunchersResponse,
   NotifyPrefs,
   PaneHistoryResponse,
+  PackStatusResponse,
   PaneReadResponse,
   PairFailure,
   SnapshotResponse,
+  UpdateCheckResponse,
   UpdateInfo,
+  UpdateRun,
+  UpdateStartResponse,
   UploadResponse,
+  WorktreeListResponse,
+  WorktreeOpenResponse,
 } from "./types";
 
 export type { NotifyPrefs, UpdateInfo };
@@ -42,6 +49,12 @@ export type { NotifyPrefs, UpdateInfo };
  * signal rather than one vendor's feature — oauth2-proxy and Authelia read it too — so it stays a
  * single unconditional header with no proxy-specific branching, in keeping with a bridge that gates
  * on vendor-neutral headers and manages nobody else's front door (ADR 0001).
+ *
+ * Some forward-auth deployments still turn that 401 back into a 3xx at the reverse-proxy layer.
+ * Every API fetch therefore uses `redirect: "manual"`; a returned redirect is normalised to a local
+ * 401 below so the same refusal banner appears instead of a CORS/transport failure. Collie never
+ * follows or discovers the proxy's login flow itself — the banner's ordinary `/auth/` link remains
+ * the operator-owned recovery path.
  *
  * Costs nothing against the bridge itself: it is same-origin by design, so no preflight in practice,
  * and the bridge ignores headers it does not read.
@@ -99,6 +112,37 @@ const MUTATION_TIMEOUT_MS = 20_000;
 //   - Uploads carry a whole file over the phone's uplink — the most generous budget.
 const UPLOAD_TIMEOUT_MS = 60_000;
 
+// ── THE TRANSCRIPTION DEADLINE IS A FUNCTION OF THE CLIP, NOT A CONSTANT ────────────────────────
+//
+// A flat budget is dishonest for a body whose size is known and varies by two orders of magnitude.
+// A five-second reply is a few kilobytes; a five-minute one is megabytes, and on a phone's uplink
+// those are not the same request. The flat 60 s that shipped in the beta failed the long clip on a
+// mobile connection — reported by a beta tester — while being far more slack than the short one
+// needs.
+//
+// The floor this assumes is a SUSTAINED, PROGRESSING 256 kb/s uplink. It is not a promise of
+// completion: a slower path, or a tunnel that stops mid-body, still fails, and it should — the
+// operator is standing there waiting and would rather be told than watch a spinner. What it does
+// buy is that a clip Collie was willing to RECORD is a clip Collie is willing to WAIT for.
+const STT_UPLINK_BITS_PER_SECOND = 256_000;
+// The bridge's own provider deadline (bridge/stt/openai.ts STT_TIMEOUT_MS), which starts only once
+// the whole body has arrived — so it is added to the upload allowance rather than overlapping it.
+const STT_PROVIDER_BUDGET_MS = 60_000;
+// Request set-up, the bridge's own parse, and the response coming back down. Small and flat: none
+// of it scales with the audio.
+const STT_OVERHEAD_MS = 20_000;
+
+/**
+ * The whole-request deadline for one clip of `bytes`, in milliseconds.
+ *
+ * Exported for the unit test, and for anyone who wants to know what the ceiling actually is: at the
+ * 8 MiB maximum (MAX_STT_AUDIO_BYTES) it is a little under six minutes.
+ */
+export function sttTimeoutFor(bytes: number): number {
+  const upload = Math.ceil((Math.max(0, bytes) * 8 * 1000) / STT_UPLINK_BITS_PER_SECOND);
+  return upload + STT_PROVIDER_BUDGET_MS + STT_OVERHEAD_MS;
+}
+
 /**
  * Compose the caller's abort signal (a loader's `request.signal`, used to supersede a stale poll)
  * with a fresh timeout signal, so a fetch aborts on EITHER cause. Returns the timeout signal alone
@@ -140,6 +184,25 @@ async function errorDetail(res: Response): Promise<string> {
   } catch {
     return res.statusText;
   }
+}
+
+// `redirect: "manual"` is intentionally local to the API client rather than a global fetch patch.
+// Browsers expose a manual redirect as `opaqueredirect` (status 0); test/runtime implementations may
+// expose the actual 3xx. Collie's own API has no redirect contract, and 304 is a normal pane ETag hit,
+// so only these redirect statuses are authentication-front-door territory.
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+function normaliseProxyRedirect(res: Response): Response {
+  if (res.type !== "opaqueredirect" && !REDIRECT_STATUSES.has(res.status)) return res;
+  return new Response("fronting identity proxy requires sign-in", {
+    status: 401,
+    statusText: "Unauthorized",
+    headers: { "content-type": "text/plain; charset=utf-8" },
+  });
+}
+
+async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  return normaliseProxyRedirect(await fetch(input, { ...init, redirect: "manual" }));
 }
 
 /**
@@ -196,7 +259,7 @@ async function doReq<T>(path: string, init?: RequestInit, recover?: Recover<T>):
   // GET reads get the short leash; anything mutating gets the longer mutation budget.
   const method = init?.method?.toUpperCase() ?? "GET";
   const timeoutMs = method === "GET" ? GET_TIMEOUT_MS : MUTATION_TIMEOUT_MS;
-  const res = await fetch(path, {
+  const res = await apiFetch(path, {
     ...init,
     signal: withTimeout(init?.signal, timeoutMs),
     headers: {
@@ -240,11 +303,25 @@ function req<T>(path: string, init?: RequestInit, recover?: Recover<T>): Promise
   return method === "GET" ? op : trackBusy(op);
 }
 
+/**
+ * The herd snapshot.
+ *
+ * `all` WIDENS the pane lists to every Herdr session on the addressed machine (`?sessions=all`).
+ * It is a separate argument rather than a field on the scope because it is not part of a pane's
+ * address — lib/scope.ts states that argument at {@link ALL_PARAM}. Note the browser URL spells it
+ * `?all=1` and the wire spells it `?sessions=all`: the wire word is the one the bridge already uses
+ * for the dimension, and the URL word is the one an operator might read.
+ */
 export async function fetchSnapshot(
   scope?: Scope,
   signal?: AbortSignal,
+  all = false,
 ): Promise<SnapshotResponse> {
-  const snap = await req<SnapshotResponse>(withScope("/api/snapshot", scope), { signal });
+  const path = withScope("/api/snapshot", scope);
+  const snap = await req<SnapshotResponse>(
+    all ? `${path}${path.includes("?") ? "&" : "?"}sessions=all` : path,
+    { signal },
+  );
   // A snapshot whose herd link is UP is a provably-live moment — stamp the shared connection-health
   // anchor so escalation is measured from here. A snapshot that 200s but reports `bridge:
   // "disconnected"` is NOT live (the pill/banner still escalate on it), so it must NOT reset the
@@ -299,7 +376,7 @@ export async function fetchPane(
   });
   if (cached) headers.set("if-none-match", cached.etag);
 
-  const res = await fetch(url, { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
+  const res = await apiFetch(url, { signal: withTimeout(signal, GET_TIMEOUT_MS), headers });
   captureBuild(res); // pane polls carry the build header too (incl. 304s) — keep the store fresh
 
   if (res.status === 304 && cached) {
@@ -499,6 +576,69 @@ export function createWorkspace(
   });
 }
 
+// POST /api/launch — the command string here is an allowlist KEY the bridge must recognise, not an
+// arbitrary line the client gets to run. Anything not in `launchers.toml` is a 400 before the
+// multiplexer is ever touched, and that lookup is the whole security story of the route. Scoped
+// like /api/tab and /api/workspace: the new pane is created where you are looking. The client never
+// sends a path — only, optionally, `besidePaneId`, the pane this launch should open a TAB beside
+// (the switcher). Omitted, the bridge creates a throwaway Space instead (the dashboard).
+/** POST /api/launch's body — a named contract so `launch` below infers against it, not a widened literal. */
+interface LaunchRequestBody {
+  command: string;
+  paneId?: string;
+}
+
+export function launch(command: string, besidePaneId?: string, scope?: Scope): Promise<CreateResponse> {
+  const body: LaunchRequestBody = { command };
+  if (besidePaneId !== undefined) body.paneId = besidePaneId;
+  return req<CreateResponse>(withScope("/api/launch", scope), {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * GET /api/launchers — THIS scope's own host's launcher rows, read live off its `launchers.toml`.
+ * Never cached alongside `/api/config`: rows must come from the host that runs them, and the
+ * operator file is read live on the bridge, so this is fetched on mount and again whenever the
+ * scope changes (lib/operator-config.ts's `useLaunchers`).
+ */
+export function fetchLaunchers(scope?: Scope): Promise<LaunchersResponse> {
+  return req<LaunchersResponse>(withScope("/api/launchers", scope));
+}
+
+/** The worktrees of the repo a space sits in. Empty-handed when the space is not in one. */
+export function listWorktrees(workspaceId: string, scope?: Scope): Promise<WorktreeListResponse> {
+  return req<WorktreeListResponse>(
+    withScope(`/api/workspace/${encodeURIComponent(workspaceId)}/worktrees`, scope),
+  );
+}
+
+/** Create a worktree on a new branch and open it as its own space. */
+export function createWorktree(
+  workspaceId: string,
+  branch: string,
+  scope?: Scope,
+): Promise<WorktreeOpenResponse> {
+  return req<WorktreeOpenResponse>(
+    withScope(`/api/workspace/${encodeURIComponent(workspaceId)}/worktree`, scope),
+    { method: "POST", body: JSON.stringify({ branch }) },
+  );
+}
+
+/** Show a worktree that already exists. Answers `alreadyOpen` rather than refusing. */
+export function openWorktree(
+  workspaceId: string,
+  path: string,
+  scope?: Scope,
+): Promise<WorktreeOpenResponse> {
+  return req<WorktreeOpenResponse>(
+    withScope(`/api/workspace/${encodeURIComponent(workspaceId)}/worktree/open`, scope),
+    { method: "POST", body: JSON.stringify({ path }) },
+  );
+}
+
+
 /**
  * The bridge's startup config: push setup, the build id, the operator's own rows, and the
  * multiplexer's declared capabilities (M10/06 — read them through lib/mux-capability.ts, never by
@@ -546,6 +686,54 @@ export function setNotifyPrefs(patch: Partial<NotifyPrefs>): Promise<NotifyPrefs
  */
 export function checkForUpdates(): Promise<UpdateInfo> {
   return req<UpdateInfo>("/api/update/check", { method: "POST" });
+}
+
+/**
+ * The update card's read: the same status the snapshot carries, plus the PREFLIGHT that decides
+ * whether the update button is live and what it says when it is not (M15/05).
+ *
+ * A GET, and read-gated: it starts nothing and takes no upstream look, so it is safe to poll. The
+ * preflight behind it is cached on the bridge, so polling it costs one `collie update --check` a
+ * minute at most.
+ */
+export function fetchUpdateState(signal?: AbortSignal): Promise<UpdateCheckResponse> {
+  return req<UpdateCheckResponse>("/api/update/check", signal ? { signal } : undefined);
+}
+
+/**
+ * Start an update — one tap plus one confirm, and this is what the confirm sends.
+ *
+ * `target` is the version the operator READ about on the card. The bridge refuses if that is no
+ * longer what it would install, so a card left open overnight cannot consent to a version nobody
+ * read about. `major` is the second consent, and only a major crossing takes one (ADR 0020).
+ *
+ * WRITE-gated, exactly like typing into a pane. A refusal is a throw carrying the bridge's own code
+ * (`update.in_progress`, `update.preflight_red`, `update.major_confirm_required`, …) — the caller
+ * renders it through `lib/api-error-message.ts` like every other refusal.
+ */
+export function startUpdate(a: { target: string; major: boolean }): Promise<UpdateStartResponse> {
+  return req<UpdateStartResponse>("/api/update", {
+    method: "POST",
+    body: JSON.stringify({ confirm: true, target: a.target, major: a.major }),
+  });
+}
+
+/** "Remind me next digest" — the card's dismiss. Not a mute: the banner keeps showing. */
+export function snoozeUpdate(): Promise<UpdateInfo> {
+  return req<UpdateInfo>("/api/update/snooze", { method: "POST" });
+}
+
+/**
+ * The run record from the STANDBY door (`GET /standby/update`), for the window in which the front
+ * door is not answering because the update is restarting it.
+ *
+ * Same-origin, because that is the deployment this can help in: a failover proxy publishes
+ * `/standby/*` beside the app (PACK_PROTOCOL.md §18.15, and `lib/sw-routes.ts` keeps the service
+ * worker's hands off it). Everywhere else it simply fails, which is exactly what the caller already
+ * handles — the card treats a failed poll during `restarting` as expected either way.
+ */
+export function fetchStandbyRun(signal?: AbortSignal): Promise<UpdateRun> {
+  return req<UpdateRun>("/standby/update", signal ? { signal } : undefined);
 }
 
 // ── Device pairing ───────────────────────────────────────────────────────────────────────────────
@@ -604,6 +792,19 @@ export function fetchDevices(signal?: AbortSignal): Promise<DevicesResponse> {
 }
 
 /**
+ * The pack census (`GET /api/pack`). Read-level, like the snapshot — looking at who is in the pack
+ * needs no token; changing it is a CLI verb and has no endpoint here at all.
+ *
+ * Carries NO scope: the question is "what does this collie lead", and only a lead can answer it. A
+ * solo collie and a peer both refuse with 404, which the loader reads as "no pack" rather than as a
+ * failure — so this throws for that case exactly as it does for any other refusal, and the branch
+ * lives at the one call site that knows what a 404 means here (lib/loaders.ts `packLoader`).
+ */
+export function fetchPack(signal?: AbortSignal): Promise<PackStatusResponse> {
+  return req<PackStatusResponse>("/api/pack", { signal });
+}
+
+/**
  * Revoke a paired device by label, returning the registry as it now stands. WRITE-level, so it needs
  * this device's own token — including when the label being revoked IS this device, which is allowed
  * and self-unpairs (the caller drops the local token afterwards).
@@ -625,7 +826,7 @@ export function uploadImage(paneId: string, file: File, scope?: Scope): Promise<
     (async () => {
       const fd = new FormData();
       fd.append("file", file);
-      const res = await fetch(withScope(`/api/pane/${encodeURIComponent(paneId)}/upload`, scope), {
+      const res = await apiFetch(withScope(`/api/pane/${encodeURIComponent(paneId)}/upload`, scope), {
         method: "POST",
         body: fd,
         // No content-type: the browser sets the multipart boundary. The XHR marker still applies —
@@ -677,9 +878,13 @@ export type SttResult =
  * only a transport failure (offline, timeout) still throws.
  */
 export function transcribeAudio(audio: Blob, signal?: AbortSignal): Promise<SttResult> {
+  // Announced to the connection-health store for the whole call, and released in the `finally`
+  // below on every path — success, refusal, abort. While it is in flight the app stops polling and
+  // stops escalating: the link is not failing, it is carrying this (see lib/connection-health).
+  beginLongUpload();
   return trackBusy(
     (async () => {
-      const res = await fetch("/api/stt", {
+      const res = await apiFetch("/api/stt", {
         method: "POST",
         body: audio,
         headers: {
@@ -689,7 +894,7 @@ export function transcribeAudio(audio: Blob, signal?: AbortSignal): Promise<SttR
           [XHR_HEADER]: XHR_HEADER_VALUE,
           ...authHeader(),
         },
-        signal: withTimeout(signal, UPLOAD_TIMEOUT_MS),
+        signal: withTimeout(signal, sttTimeoutFor(audio.size)),
       });
       const detail = await errorDetail(res);
       notePairing("POST", res.status, res.ok ? undefined : detail);
@@ -709,6 +914,6 @@ export function transcribeAudio(audio: Blob, signal?: AbortSignal): Promise<SttR
         code: fields?.code,
         detail: fields?.detail,
       };
-    })(),
+    })().finally(endLongUpload),
   );
 }

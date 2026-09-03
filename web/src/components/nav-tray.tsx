@@ -134,7 +134,8 @@ export function NavTray({
   // Send the whole queue as one ordered call, then reset any stray confirm. No echo on the strip's
   // Send, deliberately: `take()` empties the queue synchronously, so the chips vanishing IS the
   // receipt (and the strip itself unmounts unless a locked modifier holds it open) — a spinner there
-  // would have nothing left to render on.
+  // would have nothing left to render on. That sentence is also quoted at `sendKeys` in
+  // lib/ack-manifest.ts, which is where a "this control says nothing" claim is now reviewed.
   function sendQueue() {
     if (disabled) return;
     const keys = take();
@@ -174,7 +175,7 @@ export function NavTray({
         {held ? (
           <span className="mx-auto flex items-center gap-1">
             {content}
-            {repeat.count > 1 && <span className="font-mono text-xs tabular-nums">×{repeat.count}</span>}
+            {repeat.count > 1 && <span className="text-xs tabular-nums">×{repeat.count}</span>}
           </span>
         ) : phase === "done" ? (
           <Check className="mx-auto size-4" />
@@ -207,7 +208,7 @@ export function NavTray({
   };
 
   return (
-    <div className="space-y-2 border-t border-border/60 bg-muted/30 px-3 py-2.5">
+    <div className="space-y-2 border-t border-rule bg-muted/30 px-3 py-2.5">
       {/* Staging strip — visible only while composing (a modifier armed or keys queued). Same on
           both tabs; the review-and-Send surface replaces the old "⇧ armed" hint line. */}
       <KeyQueueStrip

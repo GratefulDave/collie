@@ -255,3 +255,144 @@ describe("PaneActionsSheet — a pane on an unreachable machine", () => {
     expect(screen.getByRole("button", { name: /close pane/i })).toBeInTheDocument();
   });
 });
+
+// The two READ rows the pane header hands this sheet when the ⋮ opens it. The pane STRIP passes
+// neither, and that asymmetry is the design: find searches the buffer the open pane already fetched,
+// and a strip pill can open this sheet on a pane whose output was never loaded.
+describe("PaneActionsSheet — the read rows", () => {
+  it("shows neither row when the caller offers neither (the pane strip's case)", () => {
+    renderSheet();
+    expect(screen.queryByRole("button", { name: "Find in output" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Conversation history" })).toBeNull();
+  });
+
+  it("shows only the row it was given a callback for", () => {
+    renderSheet({ onFind: vi.fn() });
+    expect(screen.getByRole("button", { name: "Find in output" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Conversation history" })).toBeNull();
+  });
+
+  it("closes the sheet BEFORE it acts, so the surface the row leads to arrives alone", async () => {
+    const user = userEvent.setup();
+    const onFind = vi.fn();
+    const props = renderSheet({ onFind });
+    await user.click(screen.getByRole("button", { name: "Find in output" }));
+    expect(props.onClose).toHaveBeenCalledTimes(1);
+    expect(onFind).toHaveBeenCalledTimes(1);
+    // Order matters: the find bar takes over the header row, and the sheet must not still be over it.
+    expect(vi.mocked(props.onClose).mock.invocationCallOrder[0]!).toBeLessThan(
+      onFind.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("leads the list — reads come before the writes you arrive at deliberately", () => {
+    renderSheet({ onFind: vi.fn(), onHistory: vi.fn() });
+    const find = screen.getByRole("button", { name: "Find in output" });
+    const rename = screen.getByRole("button", { name: "Rename" });
+    expect(find.compareDocumentPosition(rename) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // Neither read is a write, so neither refusal is about them. A device that may not write can still
+  // search the output it already has; a machine that has stopped answering is exactly when you want
+  // to read the last thing it said.
+  it("survives read-only, which takes only the writes", () => {
+    renderSheet({ readOnly: true, onFind: vi.fn(), onHistory: vi.fn() });
+    expect(screen.getByText(/read-only/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Find in output" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Conversation history" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("goes away in rename mode — that view is a sub-screen, not a section", async () => {
+    const user = userEvent.setup();
+    renderSheet({ onFind: vi.fn() });
+    await user.click(screen.getByRole("button", { name: "Rename" }));
+    expect(screen.queryByRole("button", { name: "Find in output" })).toBeNull();
+  });
+
+  // DESIGN.md §6: 44px is the floor for anything tappable, and a sheet row is a thumb target that
+  // slides up under the finger. Every row in here states the floor — `min-h-11` around a 20px
+  // `text-sm` line, because `px-3 py-2.5` alone drew 40.
+  it("gives every row a 44px hit box", () => {
+    renderSheet({ onFind: vi.fn(), onHistory: vi.fn() });
+    for (const name of ["Find in output", "Conversation history", "Rename", "Close pane"]) {
+      expect(screen.getByRole("button", { name })).toHaveClass("min-h-11");
+    }
+  });
+});
+
+// The host chip moved INTO the title row (beside the pane name) so every row in the sheet — not
+// just Close — reads as acting on a specific machine. Queries are scoped by `data-slot` because a
+// bare text/role query is ambiguous once the title row can hold two name-shaped things.
+//
+// jsdom does no layout, so "the title row's height never changes" and "the pane name truncates
+// before the host does" are pinned here as the CSS/structure that PRODUCES those facts (the
+// `min-w-0`/`truncate` split, the chip's `shrink-0`/fixed `max-w-[8rem]`), not as measured pixels.
+// The pixels were measured over CDP in a real browser (Chrome, via agent-browser) against the exact
+// markup this component renders, at 402px (the phone frame's 390px + its 6px bezel) and at 320px,
+// both themes:
+//   - title row height: 44px in every one of solo / pack-short-name / pack-long-name — unchanged,
+//     because the 32px (`size-8`) close button, not the title's content, is what's tallest in the
+//     row; the row's own height was never coupled to whether a chip renders.
+//   - a long pane name ("deploy-frontend-webapp-production-release-candidate") truncates
+//     (`scrollWidth > clientWidth`, computed `text-overflow: ellipsis`) while the host chip keeps
+//     its full reserved width (128px = 8rem, unshrunk) at both 402px and 320px.
+//   - the dialog's computed accessible name (Chrome's own accessibility tree, not a hand-rolled
+//     string): solo — `"webapp"` (the sample pane name used for that measurement, byte-identical to
+//     before this change); pack — `"webapp Sends to host: workshop"` (the pane name, then the
+//     chip's own `aria-label`, space-joined by the browser's accname algorithm — nothing
+//     hand-authored produces that join).
+describe("PaneActionsSheet — title row names the machine", () => {
+  const roster: ServerSummary[] = [
+    { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 9_000 },
+    { id: "workshop", name: "workshop", isLead: false, reachable: true, protocol: "ok", lastSeenAt: 9_000 },
+  ];
+  const pack = ({ children }: { children: React.ReactNode }) => (
+    <PackProvider servers={roster} ts={20_000} pollMs={1500}>
+      {children}
+    </PackProvider>
+  );
+
+  it("renders nothing extra in the title row on a solo install", () => {
+    renderSheet();
+    const row = document.querySelector('[data-slot="sheet-title-row"]')!;
+    expect(row.querySelector('[aria-label^="Sends to host"]')).toBeNull();
+    expect(document.querySelector('[data-slot="pane-actions-title-name"]')).toHaveTextContent("claude");
+  });
+
+  it("puts the host chip in the title row, beside the pane name, on a pack", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, { wrapper: pack });
+    const row = document.querySelector('[data-slot="sheet-title-row"]')!;
+    const chip = row.querySelector('[aria-label^="Sends to host"]');
+    expect(chip).not.toBeNull();
+    expect(chip).toHaveAttribute("aria-label", "Sends to host: workshop");
+    // Same row as the name, not a second line below it.
+    expect(row.querySelector('[data-slot="pane-actions-title-name"]')?.compareDocumentPosition(chip!)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("gives the pane name the shrinkable box and the host the protected one", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, { wrapper: pack });
+    const name = document.querySelector('[data-slot="pane-actions-title-name"]')!;
+    const chip = document.querySelector('[aria-label^="Sends to host"]')!;
+    // The name's box may shrink below its content size and ellipsize; the chip's may not — it
+    // carries a fixed cap (`max-w-[8rem]`) and refuses to shrink (`shrink-0`) so a long pane name
+    // never eats into the machine name's budget.
+    expect(name.className).toContain("truncate");
+    expect(name.className).toContain("min-w-0");
+    expect(chip.className).toContain("shrink-0");
+    expect(chip.className).toContain("max-w-[8rem]");
+  });
+
+  it("the whole dialog's accessible name still says which machine — screen-reader value pinned above", () => {
+    render(<PaneActionsSheet {...renderProps({ pane: { ...agent, host: "workshop" } })} />, { wrapper: pack });
+    // aria-labelledby points at data-slot="sheet-title", whose subtree is the name plus the chip's
+    // own aria-label — the accname algorithm (verified over CDP, see the block comment above) joins
+    // them with a space: "webapp Sends to host: workshop".
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "aria-labelledby",
+      document.querySelector('[data-slot="sheet-title"]')!.id,
+    );
+  });
+});

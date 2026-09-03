@@ -5,6 +5,7 @@ import { AgentChat } from "@/components/agent-chat";
 import { useLoadingStalled } from "@/hooks/use-loading-stalled";
 import { type PaneData } from "@/lib/loaders";
 import { homePath, panePath } from "@/lib/nav";
+import { paneScopeKey } from "@/lib/scope";
 import { findPane, paneScope } from "@/lib/hosts";
 import { setStatus } from "@/lib/status";
 import type { AgentView } from "@/lib/types";
@@ -54,8 +55,8 @@ export function DetailRoute() {
   // mirror of, and a composer typing into, the one the URL actually addresses. Solo panes carry no
   // host and match unconditionally, so this is the same lookup it has always been.
   const agent =
-    findPane(root.agents, paneId, scope, root.servers) ??
-    findPane(root.shellPanes, paneId, scope, root.servers) ??
+    findPane(root.agents, paneId, scope, root.servers, root.sessions) ??
+    findPane(root.shellPanes, paneId, scope, root.servers, root.sessions) ??
     (fresh && fresh.paneId === paneId && !seen ? fresh : undefined);
   const tabLabel = root.tabs.find((t) => t.tabId === agent?.tabId)?.label;
   const gone = !agent;
@@ -65,6 +66,10 @@ export function DetailRoute() {
   // transient poll failure or reconnect doesn't evict a still-valid pane.
   useEffect(() => {
     if (gone && root.bridge === "connected" && !root.error) {
+      // The operator did not close this pane from this phone. It went away under them — from
+      // another device, from the terminal itself, or because the agent exited — and a poll is what
+      // noticed. The status (and the orbit round it turns) is what stops the eviction that follows
+      // being the first thing they see.
       setStatus("Pane closed", "info");
       navigate(homePath(scope), { replace: true });
     }
@@ -72,7 +77,12 @@ export function DetailRoute() {
 
   return (
     <AgentChat
-      key={paneId}
+      // Keyed by the pane's FULL address, not its id. The key exists to remount the composer on a
+      // pane switch so a draft never follows you into another terminal — and `w1:p1` is a different
+      // terminal in every session and on every machine. Keyed by the id alone, walking from
+      // `w1:p1` on one session to `w1:p1` on another kept the same mounted composer, draft and all.
+      // `paneScopeKey` is the same triple every per-pane cache is keyed by.
+      key={paneScopeKey(scope, paneId)}
       paneId={paneId}
       scope={scope}
       agent={agent}
@@ -90,7 +100,15 @@ export function DetailRoute() {
       onBack={() => navigate(homePath(scope))}
       onSelect={(id) =>
         navigate(
-          panePath(id, paneScope(scope, findPane([...root.agents, ...root.shellPanes], id, scope, root.servers), root.servers)),
+          panePath(
+            id,
+            paneScope(
+              scope,
+              findPane([...root.agents, ...root.shellPanes], id, scope, root.servers, root.sessions),
+              root.servers,
+              root.sessions,
+            ),
+          ),
         )
       }
     />

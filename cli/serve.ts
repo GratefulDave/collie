@@ -13,9 +13,11 @@ import {
   type ServeHandlers,
   type ServeStatus,
 } from "../bridge/front-door.ts";
+import { deriveMode, type PackMode } from "../bridge/pack/mode.ts";
+import { enrollmentOf, parseTrustStore, trustStorePath } from "../bridge/pack/trust-store.ts";
 import { EXIT, type Io } from "./io.ts";
 import type { Exec, Files } from "./sys.ts";
-import { tailnetName } from "./tailnet.ts";
+import { bridgeUrl, localBridgeHostPort, tailnetName } from "./tailnet.ts";
 
 // The single managed front door, ported from the pre-shim `collie-ctl.sh`. ADR 0001 is the whole
 // point of it: Collie manages exactly ONE `tailscale serve` mapping, records it, and only ever tears
@@ -142,12 +144,43 @@ export function cmdServe(deps: ServeDeps): number {
 
   // Skipping teardown would strand a mapping published BEFORE the flag was flipped on, leaving the
   // app reachable by a path the operator thinks is closed. So Variant C/E publishes nothing — and
-  // still tears down. (DEPLOYMENT.md Variants C/E; bridge/config.ts exposes the flag as `skipServe`.)
+  // still tears down. (docs/deployment.md Variants C/E; bridge/config.ts exposes the flag as `skipServe`.)
   if (deps.ctx.env.COLLIE_SKIP_SERVE === "1") {
     const torn = stopTailscaleServe(deps);
     if (torn !== EXIT.OK) return torn;
     deps.io.out(
-      `tailscale serve skipped (COLLIE_SKIP_SERVE=1) — bridge is on 127.0.0.1:${deps.ctx.port} only`,
+      // F13: name the bind, not loopback — under Variant C a peer is routinely bound elsewhere
+      // and this line was the one telling the operator to go and look at a dead port.
+      `tailscale serve skipped (COLLIE_SKIP_SERVE=1) — bridge is on ${localBridgeHostPort(deps.ctx.env, deps.ctx.port)} only`,
+    );
+    return EXIT.OK;
+  }
+
+  // ADR 0013 / §3: A PEER PUBLISHES NO FRONT DOOR. The one managed front door is the lead's — it is
+  // what the phone opens and what the pack's peer→lead direction rides — and a peer that published
+  // its own would be a second door onto a machine that answers no phone.
+  //
+  // The gate lives here, in the one function that publishes, rather than in each verb that might
+  // reach it. `collie reconnect` was the verb that exposed the gap: it restarts through the generic
+  // start path, so on a peer it tore the mapping down and then tried to publish it again, failing
+  // with `tailscale not found` on a machine that was never supposed to ask. `join` had the same
+  // shape and only got away with it because it calls `unserve` afterwards — publish, then undo.
+  //
+  // The mode is read from the trust store ON DISK, not from `pack-runtime.json`: the marker records
+  // what the RUNNING bridge wired at ITS boot, and every membership verb restarts precisely because
+  // the two differ for a moment. Disk is the decision the operator just made. A store that is
+  // absent, unreadable or malformed derives `solo`, which publishes — the untaxed path is unchanged
+  // and a corrupt file cannot take a solo machine's front door away.
+  //
+  // Teardown still runs, exactly as it does under `COLLIE_SKIP_SERVE=1` and for the same reason: a
+  // machine that has just become a peer must drop the door it published as a lead, and skipping the
+  // teardown would leave it reachable by a path the operator believes is closed.
+  if (packModeOnDisk(deps) === "peer") {
+    const torn = stopTailscaleServe(deps);
+    if (torn !== EXIT.OK) return torn;
+    deps.io.out(
+      "tailscale serve skipped — this collie is a PEER of a pack, and a peer publishes no front" +
+        " door (ADR 0013). The lead's door speaks for the whole pack.",
     );
     return EXIT.OK;
   }
@@ -204,6 +237,41 @@ export function cmdServe(deps: ServeDeps): number {
   );
   if (output.trim() !== "") deps.io.out(output.trimEnd());
   return EXIT.FAIL;
+}
+
+/**
+ * `collie serve` as an operator TYPES it: publish the front door, then say where to point a phone.
+ *
+ * The `open:` line is the whole difference from {@link cmdServe}, which `start` calls — `start`'s own
+ * banner already carries the URL, so printing it there would say it twice.
+ *
+ * **A peer prints no such line.** A peer publishes no front door (ADR 0013), which is what the
+ * refusal one line above just said; following that sentence with `open: http://127.0.0.1:8787` — an
+ * address that is not even a peer's bind, and answers no phone — contradicted it in the next breath.
+ * The refusal stands alone (F24).
+ */
+export function cmdServeVerb(deps: ServeDeps): number {
+  const code = cmdServe(deps);
+  if (code !== EXIT.OK) return code;
+  if (packModeOnDisk(deps) === "peer") return EXIT.OK;
+  deps.io.out(`open: ${bridgeUrl(deps.exec, deps.ctx)}`);
+  return EXIT.OK;
+}
+
+/**
+ * This collie's mode as the trust store on disk decides it (§3) — `solo` when there is no store, no
+ * readable store, or no enrollment, which is every instance that never joined a pack.
+ *
+ * Exported for the ONE other surface that must agree with the publish decision: the status banner,
+ * whose `tailnet` row is a row about the front door this function decides never to publish
+ * (`cli/lifecycle.ts`). Two answers to "is this a peer?" would be two banners.
+ *
+ * Sync and file-shaped because `cmdServe` is: it runs inside `start`, which has no `await` to spare
+ * for a `TrustStore` handle it would otherwise have to thread through four call sites.
+ */
+export function packModeOnDisk(deps: ServeDeps): PackMode {
+  const raw = deps.files.read(trustStorePath(deps.ctx.stateDir));
+  return deriveMode(enrollmentOf(raw === null ? null : parseTrustStore(raw))).mode;
 }
 
 /**

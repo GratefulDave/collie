@@ -27,11 +27,31 @@ export function spacePath(spaceId: string, scope?: Scope): string {
 }
 
 /** The dashboard path, carrying the current scope so "go home" doesn't drop you back to the lead. */
-export function homePath(scope?: Scope): string {
-  return `/${scopeSearch(scope)}`;
+export function homePath(scope?: Scope, opts?: { all?: boolean }): string {
+  return `/${scopeSearch(scope, opts)}`;
 }
 
 /** The settings route, carrying the current scope like the other path helpers. */
 export function settingsPath(scope?: Scope): string {
   return `/settings${scopeSearch(scope)}`;
+}
+
+/**
+ * The pack overview — the read-only census of every machine in the pack. Carries the scope like the
+ * others so "back" returns you to the machine you were looking at, not to the lead.
+ */
+export function packPath(scope?: Scope): string {
+  return `/pack${scopeSearch(scope)}`;
+}
+
+/**
+ * The fragment naming the Paired-devices card inside Settings. It is a route-level anchor, so it
+ * lives here beside the paths rather than in the card: `read-only-banner.tsx` links to it and
+ * `paired-devices.tsx` answers to it, and neither should own the other's spelling.
+ */
+export const PAIRED_DEVICES_HASH = "paired-devices";
+
+/** Settings, scrolled to the card that pairs this phone — the read-only strip's remedy. */
+export function pairedDevicesPath(scope?: Scope): string {
+  return `${settingsPath(scope)}#${PAIRED_DEVICES_HASH}`;
 }

@@ -2,6 +2,7 @@ import { http, HttpResponse } from "msw";
 
 import type {
   AgentView,
+  PackStatusResponse,
   ServerSummary,
   SessionSummary,
   SnapshotResponse,
@@ -159,16 +160,97 @@ export const fixturePackSessions: SessionSummary[] = [
 ];
 
 /**
- * The merged snapshot a lead serves. `workspaces`/`tabs` stay the LEAD's — the merge deliberately
- * does not union peer workspaces (their ids are only unique per machine, and a pane already carries
- * the denormalised labels the home list renders).
+ * Spaces and tabs across two machines, host-tagged the way the lead's merge emits them — and with
+ `w1` deliberately used on BOTH, because Herdr numbers spaces per machine and two default installs
+ * both call theirs `w1` / `w1:t1`. An untagged merge collapsed those into one row carrying one
+ * machine's counts; `(host, workspaceId)` is what keeps them apart.
+ */
+export const fixturePackWorkspaces: WorkspaceView[] = [
+  ...fixtureWorkspaces.map((w) => Object.assign({}, w, { host: "bluefin" })),
+  {
+    workspaceId: "w1",
+    number: 1,
+    label: "moonward",
+    focused: false,
+    activeTabId: "w1:t1",
+    tabCount: 1,
+    paneCount: 1,
+    host: "workshop",
+  },
+];
+
+export const fixturePackTabs: TabView[] = [
+  ...fixtureTabs.map((t) => Object.assign({}, t, { host: "bluefin" })),
+  { tabId: "w1:t1", workspaceId: "w1", number: 1, label: "1", focused: false, paneCount: 1, host: "workshop" },
+];
+
+/**
+ * The merged snapshot a lead serves. `workspaces`/`tabs` are unioned and host-tagged, exactly as
+ * `bridge/pack/merge.ts` emits them; `lib/hosts.ts`'s `ambientSpaces` is what narrows them back to
+ * the one machine the URL is on, which is where the navigator's tree belongs.
  */
 export const fixturePackSnapshot: SnapshotResponse = {
   ...fixtureSnapshot,
   agents: fixturePackAgents,
   shellPanes: fixturePackShellPanes,
+  workspaces: fixturePackWorkspaces,
+  tabs: fixturePackTabs,
   sessions: fixturePackSessions,
   servers: fixtureServers,
+};
+
+/**
+ * The `/api/pack` census the LEAD serves, matching `fixtureServers` machine for machine — the two
+ * describe the same pack, so a test can mount the roster and the page together without them
+ * disagreeing. `attic` carries the loud pair: an incompatible protocol AND a second lead claiming
+ * the pack, which is what the page has to shout about.
+ *
+ * `ts` is the LEAD's clock and every timestamp here is stamped on it. It is deliberately AHEAD of
+ * the roster's `lastSeenAt` values by a realistic margin so the ages render as ages rather than
+ * as "now" — the page must never date anything against `Date.now()`.
+ */
+export const fixturePackStatus: PackStatusResponse = {
+  pack: { id: "pk1", name: "home", secretGeneration: 3, rotatedAt: 100_000 },
+  self: { id: "bluefin", name: "bluefin", version: "0.30.0" },
+  deputy: { id: "workshop", warrantGeneration: 2 },
+  members: [
+    {
+      id: "bluefin",
+      name: "bluefin",
+      isLead: true,
+      health: "reachable",
+      lastSeenAt: 1_000,
+      version: "0.30.0",
+      secretBehind: false,
+      provisional: false,
+    },
+    {
+      id: "workshop",
+      name: "workshop",
+      isLead: false,
+      address: "workshop.tail1234.ts.net:8787",
+      enrolledAt: 50_000,
+      health: "reachable",
+      lastSeenAt: 990,
+      version: "0.29.0",
+      secretBehind: false,
+      provisional: false,
+    },
+    {
+      id: "attic",
+      name: "attic",
+      isLead: false,
+      address: "attic.tail1234.ts.net:8787",
+      enrolledAt: 60_000,
+      health: "conflicted",
+      reason: "pack protocol 2 (this collie speaks 1)",
+      lastSeenAt: 500,
+      secretBehind: true,
+      provisional: true,
+      conflict: { leadMemberId: "cellar", warrantGeneration: 7 },
+    },
+  ],
+  ts: 400_000,
 };
 
 /** A minimal two-turn transcript: a human ask and the agent's tool-call-plus-answer reply. */
@@ -265,7 +347,19 @@ export const handlers = [
       },
     }),
   ),
+  // The DEFAULT world is solo, so the census refuses exactly as a non-lead bridge does: 404 with the
+  // app's ordinary JSON error shape. Every pre-existing test therefore keeps asserting the one-host
+  // world, and a test that wants a pack overrides this with `fixturePackStatus`.
+  http.get("/api/pack", () =>
+    HttpResponse.json(
+      { error: "this collie is not the lead of a pack", code: "pack.not_lead" },
+      { status: 404 },
+    ),
+  ),
   http.get("/api/config", () => HttpResponse.json({ push: false, vapidPublicKey: "" })),
+  // Default world: no `launchers.toml`. Session-scoped (server.ts), so a test that wants rows
+  // overrides this with its own `/api/launchers` handler rather than adding a field to `/api/config`.
+  http.get("/api/launchers", () => HttpResponse.json({ launchers: [], home: "" })),
   http.post<never, { snoozedUntil: number | null }>("/api/notifications/snooze", async ({ request }) => {
     const { snoozedUntil } = await request.json();
     return HttpResponse.json({ snoozedUntil });

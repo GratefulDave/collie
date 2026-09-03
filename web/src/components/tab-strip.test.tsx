@@ -35,6 +35,71 @@ describe("TabStrip", () => {
     expect(renderedTabs).toEqual(["Second", "First"]);
   });
 
+  // The row draws no name any more — a folder tab announces itself by its shape, which is why the
+  // operator asked for the word to go. The NAME is not the word: a run of buttons with no accessible
+  // name is what LabelledStrip existed to prevent, so it moved to an aria-label and must stay.
+  it("keeps its accessible name while drawing no visible label", () => {
+    render(
+      <TabStrip
+        workspaceId="w1"
+        tabs={tabs}
+        agents={[]}
+        selected={null}
+        onSelect={vi.fn()}
+        onNewTab={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("navigation", { name: "Tabs" })).toBeInTheDocument();
+    expect(screen.queryByText("Tabs")).toBeNull();
+  });
+
+  // THE fault a folder tab ships with. The active tab gains a border on three sides and a fill; if
+  // the inactive ones did not already reserve that box, every label to the right would jump on every
+  // selection. jsdom has no layout, so this pins the mechanism instead of the pixels: the border and
+  // padding classes are in the BASE string and therefore identical in both states, and only colour /
+  // background classes differ. The measured proof is in the browser — a label's left edge, top edge
+  // and width are the same to three decimals in both states at 390px.
+  it("reserves the active tab's box in every state, so no label moves on selection", () => {
+    const { rerender } = render(
+      <TabStrip
+        workspaceId="w1"
+        tabs={tabs}
+        agents={[]}
+        selected={null}
+        onSelect={vi.fn()}
+        onNewTab={vi.fn()}
+      />,
+    );
+    const boxClasses = (el: Element) =>
+      el.className
+        .split(/\s+/)
+        .filter((c) => /^(h-|min-w-|px-|py-|p-|border($|-)|rounded)/.test(c))
+        .toSorted();
+
+    const inactive = boxClasses(screen.getByRole("button", { name: "2" }));
+    rerender(
+      <TabStrip
+        workspaceId="w1"
+        tabs={tabs}
+        agents={[]}
+        selected="w1:t2"
+        onSelect={vi.fn()}
+        onNewTab={vi.fn()}
+      />,
+    );
+    const active = screen.getByRole("button", { name: "2" });
+    expect(active).toHaveAttribute("aria-current", "true");
+    // Every box-affecting class is shared. The only difference is the border COLOUR — tailwind-merge
+    // resolves `border-transparent` against `border-rule`, so exactly one of the two is present in
+    // each state and the 1px border itself is in neither branch.
+    const colour = (c: string) => c === "border-transparent" || c === "border-rule";
+    expect(boxClasses(active).filter((c) => !colour(c))).toEqual(inactive.filter((c) => !colour(c)));
+    expect(inactive.filter(colour)).toEqual(["border-transparent"]);
+    expect(boxClasses(active).filter(colour)).toEqual(["border-rule"]);
+    // Rule E: state may not change font weight, or the whole row re-flows.
+    expect(active.className).toContain("font-medium");
+  });
+
   it("shows All plus only this workspace's tabs, and reports selection", async () => {
     const user = userEvent.setup();
     const onSelect = vi.fn();
@@ -278,5 +343,94 @@ describe("TabStrip — status on the chips", () => {
     for (const word of ["idle", "working", "done", "needs you"]) {
       expect(empty).not.toHaveTextContent(word);
     }
+  });
+
+  // WHICH AGENT IS IN THERE — the operator's ask, and the reason it belongs on the tab rather than
+  // only in the pane header: a space's tabs are exactly the dimension along which the answer changes,
+  // so the header names one agent and switching tabs changes it with no warning in the row you came
+  // from. The tile is drawn only when the tab's panes agree on ONE brand. Silence is the honest
+  // answer in the other two cases and both are pinned below, because a mark is a claim about the
+  // whole tab that only one pane in it would support.
+  //
+  // Read through the LOGO's own accessible name, not a class: AgentIcon labels itself "<agent> logo"
+  // and the wrapper hides it from the tab's own name, so the query has to reach inside the button.
+  const logos = (el: HTMLElement) =>
+    Array.from(el.querySelectorAll('[role="img"]')).map((n) => n.getAttribute("aria-label"));
+
+  it("marks a tab with the agent it runs, when its panes agree on one", () => {
+    strip([pane("w1:t1", "idle"), { ...pane("w1:t1", "working"), paneId: "w1:t1:p2" }]);
+    expect(logos(screen.getByRole("button", { name: /code/ }))).toEqual(["claude logo"]);
+    // …and it is not announced a second time: the tab already says its label and its status.
+    expect(screen.getByRole("button", { name: /code/ }).getAttribute("aria-label")).toBeNull();
+    expect(screen.getByRole("button", { name: /code/ })).not.toHaveTextContent("claude");
+  });
+
+  it("marks nothing when a tab runs two different agents", () => {
+    strip([pane("w1:t1", "idle"), { ...pane("w1:t1", "idle"), paneId: "w1:t1:p2", agent: "codex" }]);
+    expect(logos(screen.getByRole("button", { name: /code/ }))).toEqual([]);
+    // The status is still counted over both panes — only the BRAND claim is withheld.
+    expect(screen.getByRole("button", { name: /code/ })).toHaveTextContent("idle");
+  });
+
+  it("marks nothing on a tab with no agents at all", () => {
+    strip([pane("w1:t1", "idle")]);
+    expect(logos(screen.getByRole("button", { name: /empty/ }))).toEqual([]);
+  });
+});
+
+// The "+" gives no feedback while a create is in flight — the operator taps it, nothing visibly
+// happens for a beat, and taps again. `creatingTab` is the fix: the caller (agent-chat.tsx,
+// space.tsx) computes it from the hook's `creatingTab` set for THIS workspace, and the button
+// disables itself and swaps its icon for a spinner rather than staying a live-looking no-op.
+describe("TabStrip new-tab busy state", () => {
+  it("disables the '+' and shows a spinner while its Space is creating", () => {
+    render(
+      <TabStrip
+        workspaceId="w1"
+        tabs={tabs}
+        agents={[]}
+        selected={null}
+        onSelect={vi.fn()}
+        onNewTab={vi.fn()}
+        creatingTab
+      />,
+    );
+    const button = screen.getByRole("button", { name: "New tab" });
+    expect(button).toBeDisabled();
+    expect(button.querySelector(".animate-spin")).not.toBeNull();
+  });
+
+  it("stays enabled with a plain plus when not creating", () => {
+    render(
+      <TabStrip
+        workspaceId="w1"
+        tabs={tabs}
+        agents={[]}
+        selected={null}
+        onSelect={vi.fn()}
+        onNewTab={vi.fn()}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "New tab" });
+    expect(button).toBeEnabled();
+    expect(button.querySelector(".animate-spin")).toBeNull();
+  });
+
+  it("a tap while creating never reaches onNewTab", async () => {
+    const user = userEvent.setup();
+    const onNewTab = vi.fn();
+    render(
+      <TabStrip
+        workspaceId="w1"
+        tabs={tabs}
+        agents={[]}
+        selected={null}
+        onSelect={vi.fn()}
+        onNewTab={onNewTab}
+        creatingTab
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "New tab" }));
+    expect(onNewTab).not.toHaveBeenCalled();
   });
 });

@@ -15,6 +15,8 @@ import {
   sendKeys,
   sendReply,
   uploadImage,
+  sttTimeoutFor,
+  transcribeAudio,
   withTimeout,
   XHR_HEADER,
   XHR_HEADER_VALUE,
@@ -210,6 +212,33 @@ describe("api client — request timeouts", () => {
   });
 });
 
+// A transcription deadline is a function of the clip, not a constant. The beta shipped a flat 60s,
+// which failed a five-minute recording on a mobile uplink while being far more slack than a
+// five-second one ever needs.
+describe("api client — the transcription deadline scales with the clip", () => {
+  it("a longer clip earns a longer deadline, always", () => {
+    const small = sttTimeoutFor(64 * 1024);
+    const large = sttTimeoutFor(8 * 1024 * 1024);
+    expect(large).toBeGreaterThan(small);
+  });
+
+  it("an 8 MiB clip — the largest Collie will record — is allowed a little under six minutes", () => {
+    const budget = sttTimeoutFor(8 * 1024 * 1024);
+    expect(budget).toBeGreaterThan(5 * 60_000);
+    expect(budget).toBeLessThan(6 * 60_000);
+  });
+
+  it("a short clip still keeps the whole fixed allowance the provider and the round trip need", () => {
+    // 80s of provider deadline + overhead, before a single byte of audio is counted.
+    expect(sttTimeoutFor(0)).toBe(80_000);
+    expect(sttTimeoutFor(20 * 1024)).toBeGreaterThan(80_000);
+  });
+
+  it("a nonsense size cannot produce a deadline shorter than the fixed allowance", () => {
+    expect(sttTimeoutFor(-1)).toBe(80_000);
+  });
+});
+
 // The browser URL uses the short `?h=` / `?s=`; on the wire every scoped endpoint takes the long
 // names `host=` and `session=`, in that fixed order. A named host/session must append its param
 // (composing correctly with fetchPane's `?lines=`); the lead's primary session (both undefined) must
@@ -397,36 +426,59 @@ describe("api client — connection-health stamping", () => {
 // A proxy that REDIRECTS an unauthenticated request instead of refusing it strips Collie of the only
 // signal `isAuthError` (lib/loaders.ts) can act on: `fetch` follows the cross-origin 302, the call
 // rejects as a TypeError with no status, and the refusal banner — with the Sign-in link that would
-// restore the session — never renders. Marking requests as XHR is what makes such a proxy answer 401
-// instead. Every path that talks to the bridge must carry it, including the two that bypass `req`:
-// fetchPane builds its own header bag, and uploadImage sets none at all so the browser keeps
-// ownership of the multipart boundary.
-describe("api client — XHR marker for identity proxies", () => {
+// restore the session — never renders. The XHR marker handles proxies that honour it; manual redirect
+// handling covers forward-auth layers that turn the refusal back into a 3xx. Every path that talks to
+// the bridge must carry both behaviours, including pane reads and multipart uploads that bypass `req`.
+describe("api client — identity proxy refusals", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  function captureHeaders() {
-    const seen: Headers[] = [];
+  function captureRequests() {
+    const headers: Headers[] = [];
+    const redirects: (RequestRedirect | undefined)[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
-      seen.push(new Headers(init?.headers));
+      headers.push(new Headers(init?.headers));
+      redirects.push(init?.redirect);
       return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     });
-    return seen;
+    return { headers, redirects };
   }
 
-  it("marks reads, mutations, pane polls and uploads alike", async () => {
-    const seen = captureHeaders();
+  it("marks reads, mutations, pane polls and uploads as XHR and disables redirect following", async () => {
+    const seen = captureRequests();
     await fetchSnapshot();
     await sendReply("w1:p1", "hi");
     await fetchPane("w1:p1");
     await uploadImage("w1:p1", new File(["x"], "x.png", { type: "image/png" }));
-    expect(seen).toHaveLength(4);
-    for (const headers of seen) expect(headers.get(XHR_HEADER)).toBe(XHR_HEADER_VALUE);
+    expect(seen.headers).toHaveLength(4);
+    for (const headers of seen.headers) expect(headers.get(XHR_HEADER)).toBe(XHR_HEADER_VALUE);
+    expect(seen.redirects).toEqual(["manual", "manual", "manual", "manual"]);
   });
 
   it("leaves the multipart upload without a content-type so the boundary survives", async () => {
-    const seen = captureHeaders();
+    const seen = captureRequests();
     await uploadImage("w1:p1", new File(["x"], "x.png", { type: "image/png" }));
-    expect(seen[0].get("content-type")).toBeNull();
+    expect(seen.headers[0].get("content-type")).toBeNull();
+  });
+
+  it("turns a fronting proxy 3xx into the 401 auth path the loader understands", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 302 }));
+    await expect(fetchSnapshot()).rejects.toThrow(/401.*requires sign-in/);
+  });
+
+  it("turns a browser manual opaqueredirect into the same 401 auth path", async () => {
+    const response = new Response(null, { status: 200 });
+    Object.defineProperty(response, "type", { value: "opaqueredirect" });
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(response);
+    await expect(fetchSnapshot()).rejects.toThrow(/401.*requires sign-in/);
+  });
+
+  // The fourth bridge call site. It bypasses `req` like the other two and, unlike them, returns its
+  // refusal as a value instead of throwing — so a proxy 3xx has to arrive here as a plain 401 too,
+  // or the composer prints a transport error where the sign-in sentence belongs.
+  it("turns a fronting proxy 3xx on the transcribe POST into a 401 result", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 302 }));
+    const result = await transcribeAudio(new Blob(["x"], { type: "audio/webm" }));
+    expect(result).toMatchObject({ ok: false, status: 401 });
   });
 });
 

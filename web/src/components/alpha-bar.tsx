@@ -11,7 +11,7 @@ interface AlphaBarProps {
   className?: string;
 }
 
-// The prerelease marker: a thin amber strip across the top of the one AppHeader, saying which
+// The prerelease marker: a thin amber strip across the top of the one header shell, saying which
 // non-stable build you are looking at. It exists because a v1 alpha runs BESIDE the stable install on
 // its own origin — same dog, same layout, different machine-eating capabilities — and "which tab is
 // which" cannot be left to the operator's memory of a port number.
@@ -22,7 +22,14 @@ interface AlphaBarProps {
 // setting to forget to turn off.
 //
 // Colours are the shared `status-info` sky token, which is declared with `light-dark()` in
-// index.css and therefore already correct under both themes — hence NO `dark:` variants here. Sky
+// index.css and therefore already correct under both themes — hence NO `dark:` variants here.
+//
+// This strip is the tightest contrast case in the app, because it is a translucent wash under its
+// own solid ink and it inherits whatever the header is filled with. On the header's old `bg-muted`
+// band (rgb 235) the `/15` chip measured 4.41:1 — under the 4.5 floor index.css claims for the
+// token. The header is the page colour now (app-header.tsx), so the same pair reads 4.79:1 light
+// and 8.40:1 dark. The margin in light is ~0.29 and that is the whole margin: do not re-tint the
+// header behind this strip, and do not drop the wash below /15. Sky
 // rather than the `status-working` amber deliberately: this strip isn't a warning, just a calm
 // "you're on the prerelease build" fact. The treatment (border-b + /15 wash + solid token text) is
 // deliberately the ReadOnlyBanner's, so the app's two "this session is not normal" strips read as
@@ -46,8 +53,13 @@ export function AlphaBar({ version = BUILD.version, className }: AlphaBarProps) 
       )}
     >
       <Info className="size-3 shrink-0" aria-hidden="true" />
+      {/* The version wears the app's face, not the terminal's. A bare semver is the app talking
+          about itself — chrome (F-D2) — and `font-mono` here was only ever the look of a build
+          stamp. The split the app now keeps: semver alone is chrome; a semver carrying a git hash
+          is a machine build id and stays monospaced (build-stamp.tsx, connection-info.tsx's
+          "Server build" row). */}
       <span className="truncate tracking-wide">
-        {label} <span aria-hidden="true">·</span> <span className="font-mono">{version}</span>
+        {label} <span aria-hidden="true">·</span> <span>{version}</span>
       </span>
     </div>
   );

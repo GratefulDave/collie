@@ -97,7 +97,14 @@ self.addEventListener("message", (event: ExtendableMessageEvent) => {
 // ── Web Push ────────────────────────────────────────────────────────────────────────────────────
 // The branching (suppress vs show vs clear, tag/title/renotify) lives in lib/push-decision so it's
 // unit-tested; here we only parse the event, read client visibility, and run the side effect.
-const ICON = "/web-app-manifest-192x192.png";
+// Two different assets on purpose. `icon` is the large art: the mark on its tile, WITHOUT the
+// maskable safe-zone padding, so it fills the notification slot instead of floating in a frame.
+// `badge` is the small status-bar glyph: Android derives its SHAPE FROM THE ALPHA CHANNEL and tints
+// the result, so it must be a monochrome silhouette on transparency. The maskable home-screen tile
+// (`/web-app-manifest-192x192.png`) must never be used for either — it is opaque with no alpha, so
+// Android stamps it on the icon's corner as a solid grey block.
+const ICON = "/notification-icon-192x192.png";
+const BADGE = "/badge-96x96.png";
 
 self.addEventListener("push", (event: PushEvent) => {
   event.waitUntil(handlePush(event));
@@ -140,7 +147,7 @@ async function handlePush(event: PushEvent): Promise<void> {
       target: decision.target,
     } satisfies NotifData,
     icon: ICON,
-    badge: ICON,
+    badge: BADGE,
     tag: decision.tag,
     renotify: decision.renotify,
   };
@@ -168,9 +175,17 @@ self.addEventListener("notificationclick", (event: NotificationEvent) => {
 async function openPath(path: string): Promise<void> {
   const url = new URL(path, self.location.origin).href;
   const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  // Navigate BEFORE focusing, and treat a null result as "this client is no good". `navigate()`
+  // resolves null when the client is a discarded tab — Firefox on Android throws background tabs
+  // away eagerly — and the old code ignored that, focused the corpse and returned, so the tap
+  // raised the browser onto a blank tab and `openWindow` below was never reached (#147).
+  // Spec: https://w3c.github.io/ServiceWorker/#client-navigate
   for (const client of windows) {
+    if (client.url !== url) {
+      const navigated = await client.navigate(url).catch(() => null);
+      if (!navigated) continue;
+    }
     await client.focus();
-    if (client.url !== url) await client.navigate(url).catch(() => null);
     return;
   }
   await self.clients.openWindow(url);

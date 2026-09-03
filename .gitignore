@@ -56,9 +56,3 @@ docs/bugs/
 
 # Local tooling scratch (browser-automation captures)
 .playwright-mcp/
-
-# Bun compile temp artifacts
-.*-bun-build
-.-*-bun-build
-*-bun-build
-*.bun-build

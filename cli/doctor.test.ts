@@ -62,7 +62,22 @@ const netmapAnswers = (json: string): NonNullable<Scripted["answers"]> => [
   ["tailscale debug netmap", { stdout: json }],
 ];
 
+/** `herdr integration status` on a host where every journalled agent's hook is current (issue #137). */
+const INTEGRATION_OK = [
+  "claude: installed (/home/pat/.claude/hooks/herdr-agent-state.sh)",
+  "codex: installed (/home/pat/.codex/herdr-agent-state.sh)",
+  "pi: installed (/home/pat/.pi/agent/extensions/herdr-agent-state.ts)",
+  "opencode: installed (/home/pat/.config/opencode/plugins/herdr-agent-state.js)",
+  "grok: installed (/home/pat/.grok/hooks/herdr-agent-state.sh)",
+].join("\n");
+
 const HEALTHY_ANSWERS: Scripted["answers"] = [
+  ["herdr --version", { stdout: "herdr 0.8.2\n" }],
+  // A healthy checkout can say where it came from: `update` asserts `origin` against the configured
+  // update source before it fetches, so an origin-less checkout is a real (reported) problem.
+  [`git -C ${ROOT} remote get-url origin`, { stdout: "https://github.com/AltanS/collie.git\n" }],
+  [`git -C ${ROOT} symbolic-ref --short HEAD`, { stdout: "main\n" }],
+  ["herdr integration status", { stdout: INTEGRATION_OK }],
   ["tailscale status --json", { stdout: JSON.stringify({ Self: { DNSName: "laptop.tail.ts.net." } }) }],
   ["tailscale serve status --json", { stdout: SERVE_OK }],
   ...netmapAnswers(NETMAP_OPEN),
@@ -85,6 +100,10 @@ function healthyFiles(): SeededFiles {
     [`${ROOT}/web/dist/build-info.json`]: JSON.stringify({ version: "1.0.0-alpha.12" }),
     [SOCKET]: "",
     [HANDLER]: `https:443|${HOSTPORT}|${PROXY}\n`,
+    // One journal root with something in it. In the BASELINE for the same reason the emitter is:
+    // `journal-roots` warns when no root is there at all, and the contract test above asserts a
+    // healthy install warns about nothing (issue #137).
+    [`${HOME}/.claude/projects/-home-pat-repo/9f3c.jsonl`]: "{}",
   };
 }
 
@@ -135,6 +154,8 @@ function harness(
     link?: Record<string, LinkProbe>;
     /** The beacon directory this host has right now; empty is the default. */
     beacons?: FakeBeacon[];
+    /** The plugin root this Collie resolved — a staged checkout's is a worktree under `versions/`. */
+    root?: string;
   } = {},
 ): Harness {
   const contents = initial === null ? null : serializeTrustStore(initial);
@@ -153,7 +174,10 @@ function harness(
     deps: {
       // As in cli/pack.test.ts: the peer client races the fake fetch against a REAL timer, so the
       // budget is set far above anything this process could stall for.
-      ctx: context({ COLLIE_PACK_TIMEOUT_MS: "60000", ...over.env }, { socket: SOCKET }),
+      ctx: context(
+        { COLLIE_PACK_TIMEOUT_MS: "60000", ...over.env },
+        over.root === undefined ? { socket: SOCKET } : { socket: SOCKET, root: over.root },
+      ),
       io: out,
       exec,
       files,
@@ -240,8 +264,12 @@ describe("collie doctor — the contract", () => {
     const { code, byCheck, raw } = await findings(h);
     expect(code).toBe(EXIT.OK);
     expect([...byCheck.keys()]).toEqual([
+      "collie",
       "web-dist",
       "path-link",
+      "install",
+      "versions",
+      "update-source",
       "herdr-socket",
       "bind",
       "bind-wildcard",
@@ -250,10 +278,35 @@ describe("collie doctor — the contract", () => {
       "mux",
       "beacon-hooks-claude",
       "beacons",
+      "herdr-version",
+      "integration-claude",
+      "integration-codex",
+      "integration-grok",
+      "integration-opencode",
+      "integration-pi",
+      "hook-python3",
+      "agent-sessions",
+      "journal-roots",
       "restart-pending",
       "clock",
     ]);
     expect(raw.filter((f) => f.status !== "ok" && f.status !== "skipped")).toEqual([]);
+  });
+
+  test("the FIRST finding is `collie`'s own version and platform — self-identifying, always ok", async () => {
+    const h = harness(null);
+    const { raw } = await findings(h);
+    expect(raw[0]?.check).toBe("collie");
+    expect(raw[0]?.status).toBe("ok");
+    expect(raw[0]?.remedy).toBeNull();
+    // "v1.0.0-beta.49 · linux-x64" — a version and a platform, nothing else.
+    expect(raw[0]?.detail).toMatch(/^v\S+ · [a-z]+-[a-z0-9]+$/);
+
+    const code = await cmdDoctor(h.deps, []);
+    expect(code).toBe(EXIT.OK);
+    const first = h.io.stdout.find((l) => l.includes("collie") && l.trim().startsWith("✓"));
+    expect(first).toBeDefined();
+    expect(first).toMatch(/v\S+ · [a-z]+-[a-z0-9]+/);
   });
 
   test("`remedy` is null EXACTLY when the status is ok — including for a skipped check", async () => {
@@ -279,7 +332,7 @@ describe("collie doctor — the contract", () => {
       if (line.startsWith("  ✓") || !line.startsWith("  ")) continue;
       // Every warn/error/skipped line carries its remedy, and every remedy names something runnable.
       expect(line).toContain("→");
-      expect(/`collie |`herdr |`tailscale |`timedatectl |COLLIE_/.test(line)).toBe(true);
+      expect(/`collie |`herdr |`tailscale |`timedatectl |`python3|`ls |COLLIE_/.test(line)).toBe(true);
     }
   });
 
@@ -571,6 +624,147 @@ describe("collie doctor — the local checks", () => {
     expect(f?.remedy).toContain("collie restart");
     expect(code).toBe(EXIT.OK);
   });
+
+  // ── install / update-source (M14/01 §4.3) ──────────────────────────────────
+  // Reported, never repaired, from the SAME classifier `collie update` forks on — so the two verbs
+  // cannot disagree about what they are looking at.
+
+  test("install: a linked clone names its branch and its origin", async () => {
+    const f = (await findings(harness(null))).byCheck.get("install");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("linked clone");
+    expect(f?.detail).toContain("branch main");
+    expect(f?.detail).toContain("AltanS/collie");
+  });
+
+  test("install: a Herdr-managed checkout is named as one", async () => {
+    const h = harness(null, [], {
+      answers: [...HEALTHY_ANSWERS, [`git -C ${ROOT} symbolic-ref -q HEAD`, { code: 1 }]],
+    });
+    expect((await findings(h)).byCheck.get("install")?.detail).toContain("Herdr-managed checkout");
+  });
+
+  test("install: an install it cannot name warns and points at the docs", async () => {
+    const h = harness(null, [], {
+      answers: [...HEALTHY_ANSWERS, [`git -C ${ROOT} rev-parse --git-dir`, { code: 128 }]],
+    });
+    const { byCheck, code } = await findings(h);
+    expect(byCheck.get("install")?.status).toBe("warn");
+    expect(byCheck.get("install")?.detail).toContain("cannot tell how this Collie was installed");
+    expect(byCheck.get("install")?.remedy).toContain("docs/install.md");
+    // A warning, never an error: an install doctor cannot name still runs.
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // ── versions (M15/02) ──────────────────────────────────────────────────────
+  // The outside view of the stage-then-swap layout both install kinds now use: which version is
+  // live, what is retained, whether `current` resolves — and, on a checkout, whether git agrees
+  // with the directories on disk.
+
+  const STAGED = `${ROOT}/versions/v1.1.0`;
+  const stagedFiles = (over: SeededFiles = {}): SeededFiles => ({
+    ...healthyFiles(),
+    [`${ROOT}/versions/v1.1.0/.collie-build`]: JSON.stringify({ version: "1.1.0", commit: "abc1234" }),
+    [`${ROOT}/versions/v1.0.0/.collie-build`]: JSON.stringify({ version: "1.0.0", commit: "0000000" }),
+    [`${ROOT}/versions/v0.9.0/.collie-build`]: JSON.stringify({ version: "0.9.0", commit: "1111111" }),
+    ...over,
+  });
+  const worktrees = (...paths: string[]): NonNullable<Scripted["answers"]> => [
+    [
+      `git -C ${STAGED} worktree list`,
+      { stdout: [`worktree ${ROOT}`, ...paths.map((p) => `worktree ${p}`)].join("\n\n") },
+    ],
+  ];
+  const stagedLink = { [`${ROOT}/current`]: { kind: "symlink" as const, target: "versions/v1.1.0" } };
+
+  test("versions: a staged checkout names the live version and what is retained", async () => {
+    const h = harness(null, [], {
+      root: STAGED,
+      files: stagedFiles(),
+      link: stagedLink,
+      answers: [
+        ...worktrees(`${ROOT}/versions/v1.1.0`, `${ROOT}/versions/v1.0.0`, `${ROOT}/versions/v0.9.0`),
+        ...HEALTHY_ANSWERS,
+      ],
+    });
+    const { byCheck } = await findings(h);
+    expect(byCheck.get("install")?.detail).toContain("staged checkout, version v1.1.0");
+    const f = byCheck.get("versions");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("current v1.1.0");
+    expect(f?.detail).toContain("2 retained (v1.0.0, v0.9.0)");
+  });
+
+  test("versions: a `current` that resolves to nothing is an error naming rollback", async () => {
+    const h = harness(null, [], {
+      root: STAGED,
+      files: stagedFiles(),
+      answers: [...worktrees(`${ROOT}/versions/v1.1.0`), ...HEALTHY_ANSWERS],
+    });
+    const f = (await findings(h)).byCheck.get("versions");
+    expect(f?.status).toBe("error");
+    expect(f?.detail).toContain("resolves to no version");
+  });
+
+  test("versions: a worktree git records with no directory on disk is reconciled and warned about", async () => {
+    const h = harness(null, [], {
+      root: STAGED,
+      files: stagedFiles(),
+      link: stagedLink,
+      answers: [
+        ...worktrees(`${ROOT}/versions/v1.1.0`, `${ROOT}/versions/v0.8.0`),
+        ...HEALTHY_ANSWERS,
+      ],
+    });
+    const f = (await findings(h)).byCheck.get("versions");
+    expect(f?.status).toBe("warn");
+    expect(f?.detail).toContain("git still records v0.8.0");
+    expect(f?.detail).toContain("v1.0.0, v0.9.0 is on disk but git tracks no worktree there");
+    expect(f?.remedy).toContain("git worktree prune");
+  });
+
+  test("versions: an in-place checkout says the layout is not there yet, and is not an error", async () => {
+    const { byCheck, code } = await findings(harness(null));
+    expect(byCheck.get("versions")?.status).toBe("ok");
+    expect(byCheck.get("versions")?.detail).toContain("no versions/ layout yet");
+    expect(code).toBe(EXIT.OK);
+  });
+
+  test("versions: a Herdr-managed checkout is in place by design (ADR 0006)", async () => {
+    const h = harness(null, [], {
+      answers: [[`git -C ${ROOT} symbolic-ref -q HEAD`, { code: 1 }], ...HEALTHY_ANSWERS],
+    });
+    expect((await findings(h)).byCheck.get("versions")?.detail).toContain("ADR 0006");
+  });
+
+  test("update-source: an origin that is not the update source is an ERROR naming the fork docs", async () => {
+    const h = harness(null, [], {
+      answers: [
+        ...HEALTHY_ANSWERS.filter(([prefix]) => !prefix.includes("remote get-url")),
+        [`git -C ${ROOT} remote get-url origin`, { stdout: "git@github.com:youngsecurity/collie.git\n" }],
+      ],
+    });
+    const { byCheck, code } = await findings(h);
+    const f = byCheck.get("update-source");
+    expect(f?.status).toBe("error");
+    expect(f?.detail).toContain("youngsecurity/collie");
+    expect(f?.remedy).toContain("docs/upgrading.md");
+    expect(code).toBe(EXIT.FAIL);
+  });
+
+  test("update-source: a fork the operator chose is a warning, not a failure", async () => {
+    const h = harness(null, [], {
+      env: { COLLIE_UPDATE_REPO: "youngsecurity/collie" },
+      answers: [
+        ...HEALTHY_ANSWERS.filter(([prefix]) => !prefix.includes("remote get-url")),
+        [`git -C ${ROOT} remote get-url origin`, { stdout: "git@github.com:youngsecurity/collie.git\n" }],
+      ],
+    });
+    const { byCheck, code } = await findings(h);
+    expect(byCheck.get("update-source")?.status).toBe("warn");
+    expect(byCheck.get("update-source")?.detail).toContain("COLLIE_UPDATE_REPO");
+    expect(code).toBe(EXIT.OK);
+  });
 });
 
 // ── The clock ────────────────────────────────────────────────────────────────
@@ -678,6 +872,23 @@ describe("collie doctor — the pack checks", () => {
     expect(code).toBe(EXIT.FAIL);
   });
 
+  // F21: the peer's side of the same check. `/pack/v1/snapshot` is not on the closed peer → lead
+  // route set (§8.6), so the only answer the second question can get is §8.1's bare 401 — which this
+  // check reported as "answered but served no data", with the budget remedy, on a healthy pack.
+  test("lead-reach: a peer asks its lead `hello` and nothing else", async () => {
+    const peer = peerStore();
+    const h = harness(peer, [hello({ memberId: "desk" })], {
+      env: { COLLIE_HOST: "laptop.tail.ts.net" },
+      files: without({ ...healthyFiles(), ...markerFile(peer) }, HANDLER),
+    });
+    const { byCheck } = await findings(h);
+    expect(h.requests).not.toContain("https://desk.example:8787/pack/v1/snapshot");
+    const f = byCheck.get("lead-reach");
+    expect(f?.status).toBe("ok");
+    expect(f?.detail).toContain("answered `hello`");
+    expect(f?.detail).not.toContain("served a snapshot");
+  });
+
   test("member-reach: a healthy member reports both answers, and the data half is a REAL request", async () => {
     const h = harness(LEAD, [hello(), hello()], { files: { ...healthyFiles(), ...markerFile(LEAD) } });
     const { byCheck } = await findings(h);
@@ -686,6 +897,8 @@ describe("collie doctor — the pack checks", () => {
     expect(h.requests).toEqual([
       "https://laptop.example:8787/pack/v1/hello",
       "https://laptop.example:8787/pack/v1/snapshot",
+      // The history section's one GET of THIS bridge's own snapshot (issue #137), on the same seam.
+      "http://127.0.0.1:8787/api/snapshot",
     ]);
   });
 
@@ -796,12 +1009,46 @@ const zellijAnswers = (stdout: string, code = 0): Scripted["answers"] => [
 
 describe("mux", () => {
   test("herdr states the name and defers — the socket is `herdr-socket`'s question, asked once", async () => {
+    const { byCheck, code } = await findings(harness(null, [], { env: { COLLIE_MUX: "herdr" } }));
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toBe("herdr — see herdr-socket · set by COLLIE_MUX");
+    expect(finding.remedy).toBeNull();
+    expect(code).toBe(EXIT.OK);
+  });
+
+  // Since M14/03 an unset COLLIE_MUX is not silently "herdr" — `collie start` probes and decides, so
+  // `doctor` names the multiplexer that decision would land on, and the evidence for it.
+  test("with nothing configured it names what `start` would pick, and why", async () => {
     const { byCheck, code } = await findings(harness(null));
     const finding = byCheck.get("mux")!;
     expect(finding.status).toBe("ok");
-    expect(finding.detail).toBe("herdr — see herdr-socket");
-    expect(finding.remedy).toBeNull();
+    expect(finding.detail).toContain("no COLLIE_MUX");
+    expect(finding.detail).toContain(`a Herdr socket at ${SOCKET}`);
     expect(code).toBe(EXIT.OK);
+  });
+
+  test("nothing configured and nothing running is an error — that `start` refuses is the finding", async () => {
+    const h = harness(null, [], { files: without(healthyFiles(), SOCKET) });
+    const { byCheck } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain("no multiplexers are running");
+    expect(finding.remedy).toContain("printf 'COLLIE_MUX=<herdr|tmux|zellij>\\n' >>");
+    expect(finding.remedy).toContain("&& collie start");
+  });
+
+  test("nothing configured and two multiplexers running is an error naming both", async () => {
+    const h = harness(null, [], {
+      files: { ...healthyFiles(), [TMUX_BIN]: "" },
+      answers: [[`${TMUX_BIN} list-sessions`, { stdout: "work\n" }], ...HEALTHY_ANSWERS!],
+    });
+    const { byCheck } = await findings(h);
+    const finding = byCheck.get("mux")!;
+    expect(finding.status).toBe("error");
+    expect(finding.detail).toContain("2 multiplexers are running");
+    expect(finding.detail).toContain("herdr");
+    expect(finding.detail).toContain("tmux");
   });
 
   test("tmux: a server that answers reports its version, its socket and its session count", async () => {
@@ -813,7 +1060,7 @@ describe("mux", () => {
     const { byCheck, code } = await findings(h);
     const finding = byCheck.get("mux")!;
     expect(finding.status).toBe("ok");
-    expect(finding.detail).toBe(`tmux 3.6b · socket ${TMUX_SOCKET} · 2 sessions`);
+    expect(finding.detail).toBe(`tmux 3.6b · socket ${TMUX_SOCKET} · 2 sessions · set by COLLIE_MUX`);
     // One invocation, not two: the version and the listing are `;`-joined as the adapter joins its own.
     expect(h.calls.filter((c) => c.startsWith(TMUX_BIN))).toEqual([
       `${TMUX_BIN} -S ${TMUX_SOCKET} display-message -p -F #{version} ; list-sessions -F #{session_name}`,
@@ -852,7 +1099,9 @@ describe("mux", () => {
       harness(null, [], { env: ON_ZELLIJ, files, answers: zellijAnswers("work\nscratch (EXITED - attach to resurrect)\n") }),
     );
     expect(live.byCheck.get("mux")?.status).toBe("ok");
-    expect(live.byCheck.get("mux")?.detail).toBe("zellij · session work · 1 running of 2 listed");
+    expect(live.byCheck.get("mux")?.detail).toBe(
+      "zellij · session work · 1 running of 2 listed · set by COLLIE_MUX",
+    );
     expect(live.code).toBe(EXIT.OK);
 
     const gone = await findings(harness(null, [], { env: ON_ZELLIJ, files, answers: zellijAnswers("scratch\n") }));
@@ -874,6 +1123,108 @@ describe("mux", () => {
     // And it does NOT stack a second red line on the same typo: the hooks check reads the unknown
     // adapter optimistically, because `mux` above is already the finding about it.
     expect(byCheck.get("beacon-hooks-claude")?.status).toBe("ok");
+  });
+});
+
+// ── The finding set is scoped by the CHOSEN multiplexer ──────────────────────
+// Collie mirrors ONE multiplexer per install. On tmux or zellij, Herdr's socket, its build and its
+// per-agent `integration` hooks drive nothing here — the bridge never dials that socket, and the
+// hook that names an agent is Collie's own. Those checks are ABSENT rather than a hollow `ok`, and
+// a healthy host exits 0: `collie doctor` failing on a working tmux install is the bug these pin.
+
+/** The checks that only mean something under Herdr — none of them may appear on another mux. */
+const isHerdrCheck = (check: string): boolean =>
+  check.startsWith("herdr-") || check.startsWith("integration-") || check === "hook-python3";
+
+/** A healthy tmux host with NO Herdr anywhere: a socket-less filesystem and no `herdr` binary. */
+const tmuxOnly = () => ({
+  env: ON_TMUX,
+  files: { ...without(healthyFiles(), SOCKET), [TMUX_BIN]: "" },
+  answers: tmuxAnswers("3.4\nwork\n"),
+  absent: ["herdr"],
+});
+
+describe("the finding set is scoped by the chosen multiplexer", () => {
+  test("a healthy tmux host exits 0, and carries no Herdr check at all", async () => {
+    const { code, byCheck, raw } = await findings(harness(null, [], tmuxOnly()));
+    expect(code).toBe(EXIT.OK);
+    expect(raw.filter((f) => isHerdrCheck(f.check))).toEqual([]);
+    // The whole set, so a Herdr-flavoured check added later cannot slip in unnoticed.
+    expect([...byCheck.keys()]).toEqual([
+      "collie",
+      "web-dist",
+      "path-link",
+      "install",
+      "versions",
+      "update-source",
+      "bind",
+      "bind-wildcard",
+      "acl",
+      "front-door",
+      "mux",
+      "beacon-hooks-claude",
+      "beacons",
+      "agent-sessions",
+      "journal-roots",
+      "restart-pending",
+      "clock",
+    ]);
+    expect(raw.filter((f) => f.status === "error")).toEqual([]);
+  });
+
+  test("a healthy zellij host reads the same way", async () => {
+    const h = harness(null, [], {
+      env: ON_ZELLIJ,
+      files: { ...without(healthyFiles(), SOCKET), [ZELLIJ_BIN]: "" },
+      answers: zellijAnswers("work\n"),
+      absent: ["herdr"],
+    });
+    const { code, raw } = await findings(h);
+    expect(code).toBe(EXIT.OK);
+    expect(raw.filter((f) => isHerdrCheck(f.check))).toEqual([]);
+  });
+
+  // Presence is not relevance: a Herdr on PATH, with its socket right there, still drives nothing on
+  // a tmux install — so it buys back no check and no red line (the reading `collie`'s config-dir
+  // resolution already takes).
+  test("a Herdr installed alongside tmux buys back nothing", async () => {
+    const h = harness(null, [], {
+      env: ON_TMUX,
+      files: { ...healthyFiles(), [TMUX_BIN]: "" },
+      answers: tmuxAnswers("3.4\nwork\n"),
+    });
+    const { code, raw } = await findings(h);
+    expect(code).toBe(EXIT.OK);
+    expect(raw.filter((f) => isHerdrCheck(f.check))).toEqual([]);
+  });
+
+  // The `--json` array is what a script reads, and the plain rendering is what an operator reads.
+  test("neither `--json` nor the printed lines mention a Herdr check on tmux", async () => {
+    const h = harness(null, [], tmuxOnly());
+    expect(await cmdDoctor(h.deps, ["--json"])).toBe(EXIT.OK);
+    // SAFETY: `--json` prints the serialised `Finding[]` and nothing else, as in `findings` above.
+    const parsed = JSON.parse(h.io.stdout.join("\n")) as Finding[];
+    expect(parsed.some((f) => isHerdrCheck(f.check))).toBe(false);
+
+    const plain = harness(null, [], tmuxOnly());
+    expect(await cmdDoctor(plain.deps, [])).toBe(EXIT.OK);
+    for (const l of plain.io.stdout) {
+      expect(/\bherdr-(socket|version)\b|\bintegration-|\bhook-python3\b/.test(l)).toBe(false);
+    }
+  });
+
+  // Zero regression on the mux Collie defaults to: every Herdr check still runs, and still fails.
+  test("under Herdr nothing is scoped away — a missing socket is still the error it was", async () => {
+    const h = harness(null, [], {
+      env: { COLLIE_MUX: "herdr" },
+      files: without(healthyFiles(), SOCKET),
+    });
+    const { code, byCheck } = await findings(h);
+    expect(byCheck.get("herdr-socket")?.status).toBe("error");
+    expect(byCheck.get("herdr-version")).toBeDefined();
+    expect(byCheck.get("integration-claude")).toBeDefined();
+    expect(byCheck.get("hook-python3")).toBeDefined();
+    expect(code).toBe(EXIT.FAIL);
   });
 });
 
@@ -987,6 +1338,16 @@ describe("beacons", () => {
     expect(finding.status).toBe("skipped");
     expect(finding.remedy).not.toContain("hooks install");
     expect(finding.detail).toContain("installed");
+  });
+
+  test("an agent that has ended leaves an expired beacon, and that is still `ok`", async () => {
+    const finding = (await findings(harness(null, [], { beacons: [beacon(11, false)] }))).byCheck.get("beacons")!;
+    // The pane it belonged to is a shell again (M11/03) — which is the ORDINARY end of an agent, so
+    // the only honest verdict is `ok`. Doctor writes nothing either way: the sweep is a read.
+    expect(finding.status).toBe("ok");
+    expect(finding.detail).toContain("0 live");
+    expect(finding.detail).toContain("1 expired");
+    expect(finding.detail).toContain("reads as a shell");
   });
 
   test("counts live against expired, and an expired one is never a warning", async () => {

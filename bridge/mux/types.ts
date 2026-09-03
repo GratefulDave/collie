@@ -188,6 +188,19 @@ export interface MuxPane extends MuxIdentity {
    */
   readonly agentSession?: AgentSessionRef;
   /**
+   * WHICH harness wrote {@link agentSession}, when that is no longer {@link agent}.
+   *
+   * One case sets it: a pane whose agent has EXITED. Its beacon expired, so the pane reads as a
+   * plain shell again (`agent` is `"shell"`, no status) — and the conversation it left behind is
+   * still on disk. The journal registry is keyed by harness name, so without this the ref would name
+   * a log no adapter could open.
+   *
+   * Server-side only, exactly as `agentSession` is, and INVISIBLE: nothing on the wire is derived
+   * from it, so a pane carrying one is byte-identical to any other shell pane. It is a lookup key
+   * and never an identity — reading it as one would put the ghost back.
+   */
+  readonly sessionAgent?: string;
+  /**
    * Upper bound on the lines one read of this pane can return. The only reliable "is there more"
    * signal, and it means something only with `gridScrollback`.
    */
@@ -234,6 +247,23 @@ export interface MuxSpace {
   readonly activeTabId: string;
   readonly tabCount: number;
   readonly paneCount: number;
+  /**
+   * The root of the Git repo this space sits in, when the multiplexer knows one.
+   *
+   * A FACT, declared like {@link MuxCapabilityDeclaration.spaces} and for the same reason: it
+   * answers "which repo", never "can you". An adapter that keeps no repo mapping omits it, and
+   * omission is the honest fail-closed direction — no repo, no worktree rows, and nothing had to
+   * guess. It is here rather than derived from a pane's cwd because deriving it would mean Collie
+   * walking the filesystem for `.git`, which is exactly the Git work ADR 0032 keeps out of the port.
+   */
+  readonly repoRoot?: string;
+  /**
+   * Whether this space is a LINKED worktree of {@link repoRoot} rather than the repo's own checkout.
+   *
+   * Absent wherever `repoRoot` is: the pair travels together, and asking one without the other is
+   * always a bug. `false` means "this is the repo itself", which is what a worktree row nests under.
+   */
+  readonly isWorktree?: boolean;
 }
 
 /** One tab within a space — a layout holding one or more panes. */
@@ -321,6 +351,53 @@ export interface MuxTabRequest {
 export interface MuxSpaceRequest {
   readonly cwd: string;
   readonly label?: string;
+}
+
+// ── Worktrees ─────────────────────────────────────────────────────────────────
+//
+// A worktree is Git's, not the multiplexer's — so why is it here? Because the ACT is the
+// multiplexer's: every verb below ends in a space appearing, moving or going away, which is the one
+// thing a mux adapter owns. What a multiplexer may not have is the BOOKKEEPING that ties a checkout
+// to the space showing it; that is what these capabilities declare. See ADR 0032.
+
+/** A Git worktree of the repo a space sits in. */
+export interface MuxWorktree {
+  /** Absolute checkout path. The identity: a branch may be absent, and labels repeat. */
+  readonly path: string;
+  /** The branch checked out there, or `null` for a detached head. */
+  readonly branch: string | null;
+  /** The space showing it, or `null` when it exists on disk and nothing shows it. */
+  readonly openSpaceId: string | null;
+  /** `false` for the repo's own checkout — listed for context, never removable. */
+  readonly linked: boolean;
+  /** The checkout is gone and the administrative files could be pruned. */
+  readonly prunable: boolean;
+}
+
+/** Where a worktree question is asked from — the repo the asking space sits in. */
+export interface MuxWorktreeScope {
+  readonly repoRoot: string;
+}
+
+/** What a new worktree asks for. */
+export interface MuxWorktreeCreateRequest extends MuxWorktreeScope {
+  readonly branch: string;
+}
+
+/** Which existing worktree to show. */
+export interface MuxWorktreeOpenRequest extends MuxWorktreeScope {
+  readonly path: string;
+}
+
+/**
+ * Opening one either made a space or found the space already showing it.
+ *
+ * `alreadyOpen` is not an error and must not be rendered as one: asking for a worktree that is
+ * already up is the operator saying "take me there", and the pane below is where to go.
+ */
+export interface MuxWorktreeOpened {
+  readonly pane: MuxCreatedPane;
+  readonly alreadyOpen: boolean;
 }
 
 // ── Learning that something changed ───────────────────────────────────────────
@@ -488,6 +565,15 @@ export interface MuxAdapter {
 
   /** New space, opening a fresh shell. Needs `createSpace`. */
   createSpace(request: MuxSpaceRequest): Promise<MuxOutcome<MuxCreatedPane>>;
+
+  /** The worktrees of the repo a space sits in. Needs `listWorktrees`. */
+  listWorktrees(scope: MuxWorktreeScope): Promise<MuxOutcome<readonly MuxWorktree[]>>;
+
+  /** New worktree on a new branch, opened as a space. Needs `createWorktree`. */
+  createWorktree(request: MuxWorktreeCreateRequest): Promise<MuxOutcome<MuxCreatedPane>>;
+
+  /** Show an existing worktree as a space. Needs `openWorktree`. */
+  openWorktree(request: MuxWorktreeOpenRequest): Promise<MuxOutcome<MuxWorktreeOpened>>;
 
   /** Watch for change. Always available — an adapter with no push satisfies it by polling. */
   watch(options: MuxWatchOptions): MuxSubscription;

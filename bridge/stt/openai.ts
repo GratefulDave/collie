@@ -65,6 +65,10 @@ export function createOpenAiSttProvider(
       form.append("file", new File([input.audio], input.filename, { type: input.mimeType }));
       form.append("model", settings.model);
       form.append("response_format", "json");
+      // Sent only when the operator named one. An ABSENT field is auto-detect, which is the right
+      // default for somebody who mixes two languages in a sentence; a present one is the fix for the
+      // opposite complaint — a short clip in an accented voice coming back in a language nobody spoke.
+      if (settings.language !== undefined) form.append("language", settings.language);
 
       const controller = new AbortController();
       let timedOut = false;
@@ -89,7 +93,17 @@ export function createOpenAiSttProvider(
         if (!response.ok) {
           // The status is worth logging locally; the BODY is not, and never reaches the browser —
           // an upstream error can name an account, a model or an internal host.
-          throw new SttError("refused", `the transcription service answered ${response.status}`);
+          //
+          // The CONTAINER is named because the refusal is very often about the container and nothing
+          // else: a model that demuxes WAV can answer 400 to the WebM or MP4 a phone records (#148).
+          // Echoing it is safe — this is the client's own content type, already matched against the
+          // allow-list in `bridge/stt/http.ts` before any of these bytes were read, so it is one of
+          // nine known strings and never free text from the caller.
+          const container = input.mimeType.split(";", 1)[0]!.trim().toLowerCase();
+          throw new SttError(
+            "refused",
+            `the transcription service answered ${response.status} for ${container}`,
+          );
         }
         return { text: parseTranscript(body) };
       } catch (err) {

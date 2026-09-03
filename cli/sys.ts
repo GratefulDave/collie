@@ -37,8 +37,12 @@ const NOT_FOUND: ExecResult = { code: 127, stdout: "", stderr: "", found: false 
 export interface Exec {
   /** Absolute path of `tool`, or null when it isn't installed. */
   which(tool: string): string | null;
-  /** Run `tool`, capturing both streams. */
-  capture(tool: string, args: readonly string[]): ExecResult;
+  /**
+   * Run `tool`, capturing both streams. `timeoutMs` bounds the wall clock: on expiry the child is
+   * killed and the result reads as an ordinary failure (code 124, the coreutils `timeout`
+   * convention) — a caller probing a binary it does not yet trust must never hang with it.
+   */
+  capture(tool: string, args: readonly string[], timeoutMs?: number): ExecResult;
   /** Run `tool` with our own stdio — for `journalctl`, whose output IS the result. */
   inherit(tool: string, args: readonly string[]): ExecResult;
   /**
@@ -85,16 +89,122 @@ export interface Files {
   rename(from: string, to: string): void;
 }
 
+/**
+ * Why a download fails, in the two words a message needs: the HTTP status when there was one (`403`
+ * is the rate limit the updater must name), and the text of the failure otherwise.
+ */
+export interface NetFailure {
+  /** The HTTP status, or null when the request never got one (DNS, TLS, timeout). */
+  status: number | null;
+  message: string;
+}
+
+export type NetJson = { ok: true; value: unknown } | { ok: false; failure: NetFailure };
+/** One answer read as the health gate needs it: the status, one named header, and the body. */
+export type NetProbe =
+  | { ok: true; status: number; header: string | null; body: unknown }
+  | { ok: false; failure: NetFailure };
+/** A finished download, with the digest computed AS IT WAS WRITTEN — the bytes are never re-read. */
+export type NetDownload =
+  | { ok: true; sha256: string; size: number }
+  | { ok: false; failure: NetFailure };
+
+/**
+ * The third seam, and the only one that leaves the machine: two anonymous HTTPS GETs, one for JSON
+ * and one that streams a release asset to a path. It is an interface for the same reason `Exec` and
+ * `Files` are — `bun test` drives the whole binary-update path (fetch, verify, lay down, flip,
+ * roll back) without a network, and no test may reach github.com.
+ *
+ * `download` hashes while it writes rather than handing bytes back, so a ~100 MB artifact never
+ * exists in memory and the verification in `cli/update.ts` stays a string comparison.
+ */
+export interface Net {
+  getJson(url: string): Promise<NetJson>;
+  download(url: string, dest: string): Promise<NetDownload>;
+  /**
+   * `GET url`, answered **whatever the status is**, with one response header read off it.
+   *
+   * A third method rather than a flag on {@link Net.getJson}, because it asks a different question:
+   * `getJson` wants a document and treats a non-2xx as a failure, while the update health gate wants
+   * to know what a machine SAYS while it is refusing to serve. A standby door answers `503` when it
+   * is cold, and cold is a healthy peer, not a failure (M15/04, M15/06).
+   */
+  probe(url: string, header: string): Promise<NetProbe>;
+}
+
+/** Same budget as the bridge's tag check — a hung request must never wedge a verb. */
+const NET_TIMEOUT_MS = 20_000;
+
+/**
+ * A failure with no HTTP status behind it — DNS, TLS, or the timeout. `fetch` rejects with a value,
+ * not a type (a `TypeError` here, a `DOMException` for the abort), so the catch clause narrows the
+ * throw to its text and this takes that text. The parse stays at the boundary that caught it.
+ */
+const netFailure = (message: string): NetFailure => ({ status: null, message });
+
+export const realNet: Net = {
+  async getJson(url) {
+    try {
+      const res = await fetch(url, {
+        headers: { accept: "application/json", "user-agent": "collie-update" },
+        signal: AbortSignal.timeout(NET_TIMEOUT_MS),
+      });
+      if (!res.ok) return { ok: false, failure: { status: res.status, message: `HTTP ${res.status}` } };
+      return { ok: true, value: await res.json() };
+    } catch (err) {
+      return { ok: false, failure: netFailure(err instanceof Error ? err.message : String(err)) };
+    }
+  },
+  async probe(url, header) {
+    try {
+      const res = await fetch(url, {
+        headers: { accept: "application/json", "user-agent": "collie-update" },
+        signal: AbortSignal.timeout(NET_TIMEOUT_MS),
+      });
+      // The body is best effort and the status is not: a door that answered at all is a door that is
+      // up, and an unreadable body is one field missing from an answer that already arrived.
+      const body = await res.json().catch(() => null);
+      return { ok: true, status: res.status, header: res.headers.get(header), body };
+    } catch (err) {
+      return { ok: false, failure: netFailure(err instanceof Error ? err.message : String(err)) };
+    }
+  },
+  async download(url, dest) {
+    try {
+      const res = await fetch(url, {
+        headers: { "user-agent": "collie-update" },
+        signal: AbortSignal.timeout(NET_TIMEOUT_MS),
+      });
+      if (!res.ok) return { ok: false, failure: { status: res.status, message: `HTTP ${res.status}` } };
+      if (res.body === null) return { ok: false, failure: { status: res.status, message: "empty response" } };
+      mkdirSync(dirname(dest), { recursive: true });
+      const hasher = new Bun.CryptoHasher("sha256");
+      const sink = Bun.file(dest).writer();
+      let size = 0;
+      for await (const chunk of res.body) {
+        hasher.update(chunk);
+        size += chunk.byteLength;
+        sink.write(chunk);
+      }
+      await sink.end();
+      return { ok: true, sha256: hasher.digest("hex"), size };
+    } catch (err) {
+      return { ok: false, failure: netFailure(err instanceof Error ? err.message : String(err)) };
+    }
+  },
+};
+
 export function realExec(env: Environment, home: string): Exec {
   const resolve = (tool: string): string | null => findTool(tool, env, home);
   return {
     which: resolve,
-    capture(tool, args) {
+    capture(tool, args, timeoutMs) {
       const bin = resolve(tool);
       if (bin === null) return NOT_FOUND;
-      const r = Bun.spawnSync([bin, ...args], { env });
+      const r = Bun.spawnSync([bin, ...args], { env, timeout: timeoutMs });
       return {
-        code: r.exitCode,
+        // A timed-out child has no exit code — it was killed. 124 keeps the seam's "number" contract.
+        code: r.exitCode ?? 124,
         stdout: r.stdout.toString(),
         stderr: r.stderr.toString(),
         found: true,

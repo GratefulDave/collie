@@ -1,0 +1,139 @@
+/* Presentation-only rules for the states playground. Nothing here is imported by the app: the file
+   is reachable from `src/playground/main.tsx` alone, which only `playground.html` loads. */
+
+/* Orbitron, Audiowide and Nova Round — three dev-only auditions for the typeface switcher, loaded
+   straight from the Google Fonts CDN. They stay here, never in index.css: index.css names exactly
+   what the service worker caches (lib/sw-routes.ts UI_FONT_URLS, pinned by fonts.test.ts), and a CDN
+   URL has no business in that list. They also have no metric-matched fallback twins, unlike the
+   self-hosted faces below, so their swap moves layout — fine in a playground, disqualifying in the
+   app until one wins and gets the build-ui-font.sh treatment.
+
+   ALDRICH USED TO BE ON THIS LINE AND HAS LEFT IT. It won: it is a shipped face now (ADR 0033), so
+   the playground must compare the SAME BYTES the app renders — the subset, at the app's own ranges,
+   with the computed twin — and not a differently-subset CDN copy that happens to share a name. That
+   is the whole point of auditioning here rather than in the app. Its @font-face is below, beside
+   the other self-hosted faces. */
+@import url("https://fonts.googleapis.com/css2?family=Audiowide&family=Nova+Round&family=Orbitron:wght@400..700&display=swap");
+
+/* A stage holds a component that paints a whole screen. `<Stage dvh>` adds this class, and the rule
+   pulls the component's own `h-[100dvh]` root down to the stage's box so the boot splash can sit in
+   a card instead of eating the scroll. It re-sizes the component; it does not change it. */
+.pg-stage-dvh > * {
+  height: 100% !important;
+}
+
+/* The "reduce motion" toggle. An APPROXIMATION, and labelled as one in the UI: the real signal is
+   `prefers-reduced-motion`, which only the OS (or the browser's rendering-emulation panel) can set,
+   and <CollieMark/> answers it inside its own inline stylesheet where no class can reach. Stopping
+   every animation here shows the still half of each state; the colour half of the mark's "loading"
+   is what a genuine reduced-motion reader still gets, and that is unaffected either way. */
+.pg-reduce-motion *,
+.pg-reduce-motion *::before,
+.pg-reduce-motion *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}
+
+/* ── The content grid ────────────────────────────────────────────────────────────────────────────
+   The playground is read on a desktop now, so a section lays its cards out as a responsive grid
+   rather than as one phone-width column. `minmax(360px, 1fr)` is chosen off the widest card that is
+   still a WIDGET (a banner, a switcher row, a mark sampler): narrower and a banner wraps in a way it
+   never would on a phone; wider and two of them stop fitting side by side on a 1440px screen.
+
+   These live in CSS, not in Tailwind classes on the elements, for one reason: the "phone width"
+   toggle has to re-write them from an ANCESTOR (`.pg-narrow` on the page root). A utility class on
+   the grid itself cannot be overridden by a parent, so the toggle would have to conditionally swap
+   class strings on every section and every card — the same rule, expressed nine times. */
+.pg-grid {
+  display: grid;
+  gap: 1.25rem 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  align-items: start;
+}
+
+/* Route-level mounts (the dashboard list, a pane view, the pack census, settings) are SCREENS, not
+   widgets: they get two columns so the 390px phone frame inside them has room to breathe with its
+   caption beside it rather than under it. */
+.pg-span-2 {
+  grid-column: span 2;
+}
+
+/* One column below the two-column breakpoint — `span 2` on a single-column grid overflows it. */
+@media (max-width: 860px) {
+  .pg-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .pg-span-2 {
+    grid-column: auto;
+  }
+}
+
+/* ── The "phone width" toggle ────────────────────────────────────────────────────────────────────
+   Collapses the whole page back to the single narrow column it used to be, so the page can be
+   checked on a real phone (or in a narrow window) without resizing anything. Every card becomes one
+   column wide and nothing spans. */
+.pg-narrow .pg-grid {
+  grid-template-columns: minmax(0, 420px);
+}
+.pg-narrow .pg-span-2 {
+  grid-column: auto;
+}
+
+/* A phone frame owns its own scrollbar. Hide the visual bar inside it: the frame is standing in for
+   a phone, and a desktop scrollbar drawn down the inside edge is 15px of chrome no phone has. The
+   surface still scrolls — this hides the bar, it does not disable the overflow. */
+.pg-phone-scroll {
+  scrollbar-width: none;
+}
+.pg-phone-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── The two UI typefaces the app does NOT ship ──────────────────────────────────────────────────
+   Declared here rather than in index.css for one reason: index.css names exactly the webfonts the
+   service worker caches (lib/sw-routes.ts FONT_URLS, pinned by fonts.test.ts), so a candidate that
+   no shipped build asks for must not appear there. The shipped face (Space Grotesk) is in index.css
+   and needs no second declaration — this file is loaded after it.
+
+   Each face gets the same two metric-matched stand-ins the shipped one has, so the switcher in
+   typeface-card.tsx compares like with like: what you see at first paint here is what the app would
+   do at first paint if this candidate won. The percentages are recomputed by
+   scripts/build-ui-font.sh; do not hand-edit them.
+
+   When the operator picks a winner, the two losers leave together: this block, their .woff2 and
+   their LICENSE-*.txt in public/fonts/, and their entries in typeface-card.tsx. */
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("/fonts/ui-ibm-plex-sans-3.201-latin.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans Fallback";
+  src:
+    local("Arial"), local("Helvetica Neue"), local("Helvetica"),
+    local("Liberation Sans"), local("Arimo"), local("Roboto");
+  size-adjust: 101.21%;
+  ascent-override: 101.27%;
+  descent-override: 27.17%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Geist";
+  src: url("/fonts/ui-geist-1.800-latin.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Geist Fallback";
+  src:
+    local("Arial"), local("Helvetica Neue"), local("Helvetica"),
+    local("Liberation Sans"), local("Arimo"), local("Roboto");
+  size-adjust: 103.03%;
+  ascent-override: 97.54%;
+  descent-override: 28.63%;
+  line-gap-override: 0%;
+}

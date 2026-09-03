@@ -1,10 +1,11 @@
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { BEACON_HOOKS, type HookRegistration } from "./beacon.ts";
 import type { JsonObject, JsonValue } from "../bridge/json.ts";
 import type { CliContext } from "./context.ts";
+import { publishedBinary } from "./install-kind.ts";
 import { EXIT, type Io } from "./io.ts";
-import { type LinkReader, linkPath } from "./link.ts";
+import { type LinkReader, linkPath, resolveLinkTarget } from "./link.ts";
 import type { Files } from "./sys.ts";
 import { collieBinary } from "./unit.ts";
 
@@ -76,8 +77,14 @@ export function markerVersionOf(command: string): number | null {
 
 // ── The command we write ─────────────────────────────────────────────────────
 
-/** Which absolute name the hook was pinned to. Reported by `status` (and by `doctor`, M11/05). */
-export type HookCommandSource = "path-link" | "checkout";
+/**
+ * Which absolute name the hook was pinned to. Reported by `status` (and by `doctor`, M11/05).
+ *
+ * `install-current` exists because a binary install has a THIRD stable name — `<root>/current/bin/collie`,
+ * the symlink `update` flips — and calling that "the checkout" would print a remedy (`collie link`
+ * here) for a shape that has no checkout.
+ */
+export type HookCommandSource = "path-link" | "install-current" | "checkout";
 
 export interface HookCommand {
   readonly binary: string;
@@ -104,23 +111,80 @@ export function hookBinaryOf(command: string): string | null {
   return at <= 0 ? null : command.slice(0, at);
 }
 
+/** How many links a chain may follow before {@link realpathVia} gives up. `ELOOP`, without the errno. */
+const SYMLINK_HOPS = 32;
+
 /**
- * The command an entry runs — ALWAYS an absolute path.
+ * `realpath(3)` over the {@link LinkReader} seam — every component resolved, not just the last one.
+ *
+ * The last component is not where the indirection is. A binary install publishes
+ * `~/.local/bin/collie` → `<root>/current/bin/collie`, and `current` is a DIRECTORY symlink: probing
+ * the full path finds a regular file and learns nothing. So each ancestor is resolved before the
+ * component below it, which is the only way `current` and `versions/X.Y.Z` are ever seen to be the
+ * same file. A path nobody can resolve comes back as itself — that is what a dangling link is, and
+ * the caller wants to compare it, not to fail on it.
+ */
+function realpathVia(fs: LinkReader, path: string, hops = { left: SYMLINK_HOPS }): string {
+  const parent = dirname(path);
+  // The root is its own parent — that is the recursion's floor, and it needs no probe.
+  const here = parent === path ? path : join(realpathVia(fs, parent, hops), basename(path));
+  const probe = fs.probe(here);
+  if (probe.kind !== "symlink" || hops.left <= 0) return here;
+  hops.left -= 1;
+  return realpathVia(fs, resolveLinkTarget(here, probe.target), hops);
+}
+
+/**
+ * The command an entry runs — ALWAYS an absolute path, and always one that SURVIVES AN UPDATE.
  *
  * A hook does not run under the operator's login shell (the same trap as a Herdr plugin action), so a
- * bare `collie` can simply not be found. `~/.local/bin/collie` is preferred when `collie link`
- * published it and it points at THIS checkout: by ADR 0021 that name is a symlink, never a copy, so
- * it survives every rebuild and even a checkout that moves house. Otherwise the checkout's own binary
- * is written and `status` says so, because that pins the hook to one directory.
+ * bare `collie` can simply not be found. But an absolute path is not enough on its own: a binary
+ * install runs from `<root>/versions/X.Y.Z/bin/collie`, and `update` keeps only the previous version
+ * — so a hook pinned to the version directory dangles silently after one or two updates, with every
+ * pane quietly reading as a shell again. That is the bug this order exists to make impossible, and
+ * the version directory is never written here.
+ *
+ * The preference, in order:
+ *
+ *  1. `~/.local/bin/collie`, when it RESOLVES to the binary this install publishes. By ADR 0021 that
+ *     name is a symlink, never a copy, so it survives a rebuild, a version flip and a checkout that
+ *     moves house. Both sides are realpath'd ({@link realpathVia}) before they are compared, because
+ *     the link points at `<root>/current/bin/collie` while the running process was launched from
+ *     `<root>/versions/X.Y.Z/bin/collie` — the same file under two names, and a string comparison
+ *     calls them different (the whole cause of the dangling-hook bug).
+ *  2. Whatever {@link publishedBinary} says this install publishes — `<root>/current/bin/collie` on a
+ *     binary install (the symlink `update` itself flips, so it is valid at every version), and the
+ *     checkout's own `bin/collie` on a git checkout, which is exactly the old behaviour there.
  */
 export function resolveHookCommand(ctx: CliContext, fs: LinkReader): HookCommand {
-  const own = collieBinary(ctx.root);
+  const own = publishedBinary(ctx.root, fs);
   const published = linkPath(ctx.home);
   const probe = fs.probe(published);
-  const source: HookCommandSource = probe.kind === "symlink" && probe.target === own ? "path-link" : "checkout";
-  const binary = source === "path-link" ? published : own;
+  const linked =
+    probe.kind === "symlink" &&
+    realpathVia(fs, resolveLinkTarget(published, probe.target)) === realpathVia(fs, own);
+  const fallback: HookCommandSource = own === collieBinary(ctx.root) ? "checkout" : "install-current";
+  const source: HookCommandSource = linked ? "path-link" : fallback;
+  const binary = linked ? published : own;
   return { binary, source, command: `${binary}${HOOK_VERB}${HOOK_MARKER}` };
 }
+
+/** What each source is called in one phrase — `hooks status`'s parenthetical. */
+const SOURCE_NAME = {
+  "path-link": "the published PATH name",
+  "install-current": "this install's `current` symlink",
+  checkout: "this checkout",
+} satisfies Record<HookCommandSource, string>;
+
+/** The line `hooks install` prints under the events — what the pin costs, and how to improve it. */
+const PINNED_NOTE = {
+  "path-link": "Pinned to the published name (a symlink, never a copy), so a rebuild needs no re-install.",
+  // Never the version directory: `update` keeps only the previous version, so a hook pinned there
+  // dangles after one or two updates. `current` is the symlink `update` flips, valid at every version.
+  "install-current":
+    "Pinned to this install's `current` symlink, so it survives every `collie update` — never a version directory.",
+  checkout: "Pinned to this checkout — re-run after `collie link` to pin to ~/.local/bin instead.",
+} satisfies Record<HookCommandSource, string>;
 
 // ── The targets ──────────────────────────────────────────────────────────────
 
@@ -404,11 +468,7 @@ export function cmdHooksInstall(deps: HooksDeps, args: readonly string[]): numbe
 
   if (failed) return EXIT.FAIL;
   deps.io.out(`  ${BEACON_HOOKS.map((r) => r.event).join(", ")} → \`${binary} beacon emit\``);
-  deps.io.out(
-    source === "path-link"
-      ? "  Pinned to the published name (a symlink to this checkout), so a rebuild needs no re-install."
-      : `  Pinned to this checkout — re-run after \`collie link\` to pin to ~/.local/bin instead.`,
-  );
+  deps.io.out(`  ${PINNED_NOTE[source]}`);
   deps.io.out("  Outside tmux/zellij the hook exits immediately and writes nothing.");
   return EXIT.OK;
 }
@@ -448,22 +508,29 @@ export function cmdHooksUninstall(deps: HooksDeps, args: readonly string[]): num
   return EXIT.OK;
 }
 
-/** `collie hooks status` — READ-ONLY. It reports; it never repairs. */
-export function cmdHooksStatus(deps: HooksDeps): number {
-  const { binary, source } = resolveHookCommand(deps.ctx, deps.fs);
-  deps.io.out(`would install: ${binary} beacon emit  (${source === "path-link" ? "the published PATH name" : "this checkout"})`);
-  for (const target of claudeSettingsTargets(deps.ctx)) {
-    deps.io.out(`${target.path}: ${describeTarget(deps, target)}`);
-  }
-  return EXIT.OK;
-}
+/**
+ * What ONE settings file carries, as a verdict rather than a sentence.
+ *
+ * `status` renders these into its lines; `--check` branches on them. One reading, two readers — the
+ * same rule {@link markedCommandsByEvent} exists for, one level up.
+ */
+export type HookTargetState =
+  | { readonly kind: "refused"; readonly symlink: string }
+  | { readonly kind: "unreadable" }
+  | { readonly kind: "absent" }
+  | { readonly kind: "not-installed" }
+  /** Ours, and missing at least one registration this build knows — the shape a grown set leaves. */
+  | { readonly kind: "partial"; readonly at: string; readonly present: number }
+  /** Ours, complete, but written by a build whose marker was a different version. */
+  | { readonly kind: "stale"; readonly at: string }
+  | { readonly kind: "installed"; readonly at: string };
 
-function describeTarget(deps: HooksDeps, target: HookTarget): string {
+function targetState(deps: HooksDeps, target: HookTarget): HookTargetState {
   const symlink = symlinkOnPath(deps, target);
-  if (symlink !== null) return `refused — ${symlink} is a symlink`;
+  if (symlink !== null) return { kind: "refused", symlink };
   const settings = readSettings(deps, target);
-  if (settings === null) return "unreadable — not valid JSON";
-  if (settings.text === null) return "no settings file — `collie hooks install claude` creates one";
+  if (settings === null) return { kind: "unreadable" };
+  if (settings.text === null) return { kind: "absent" };
   const versions = new Set<string>();
   let present = 0;
   for (const command of markedCommandsByEvent(settings.value)) {
@@ -471,16 +538,69 @@ function describeTarget(deps: HooksDeps, target: HookTarget): string {
     present += 1;
     versions.add(String(markerVersionOf(command)));
   }
-  if (present === 0) return "not installed";
+  if (present === 0) return { kind: "not-installed" };
   const at = `v${[...versions].join("/")}`;
-  // A file installed by an older build carries the events THAT build knew, which is what this reads
-  // like once the set grows. So the line names the remedy: install adds the missing ones in place.
-  if (present < BEACON_HOOKS.length) {
-    return `partly installed (${at}, ${present}/${BEACON_HOOKS.length} events) — re-run install to add the rest`;
-  }
+  if (present < BEACON_HOOKS.length) return { kind: "partial", at, present };
   return versions.has(String(HOOK_MARKER_VERSION)) && versions.size === 1
-    ? `installed (${at})`
-    : `installed at ${at} — re-run install to heal it to v${HOOK_MARKER_VERSION}`;
+    ? { kind: "installed", at }
+    : { kind: "stale", at };
+}
+
+/**
+ * Is any settings file BEHIND this build — carrying our entries, but not all of them, or at a marker
+ * version this build no longer writes?
+ *
+ * "Behind" is deliberately narrower than "install would change something". A file with none of our
+ * entries is not behind, it OPTED OUT, and nothing should nag about it. Absent, unreadable and
+ * refused files are not behind either: they are `doctor`'s business, not an afterthought's.
+ *
+ * This is the question `collie update` asks — of the NEWLY installed binary, never in-process, since
+ * {@link BEACON_HOOKS} is compiled in and the old build's copy is exactly the stale thing.
+ */
+export function hooksAreBehind(deps: HooksDeps): boolean {
+  return claudeSettingsTargets(deps.ctx)
+    .map((target) => targetState(deps, target))
+    .some((state) => state.kind === "partial" || state.kind === "stale");
+}
+
+/**
+ * `collie hooks status` — READ-ONLY. It reports; it never repairs.
+ *
+ * `--check` is the same verdict for a caller with no eyes: nothing on stdout, and the exit code IS
+ * the answer — `EXIT.STATE` ("the local state says no", `cli/io.ts`) when {@link hooksAreBehind},
+ * `EXIT.OK` otherwise. `collie update` runs it on the binary it just installed; keeping it a flag on
+ * the existing verb means the two answers cannot drift, and it leaves `status`'s own contract alone.
+ */
+export function cmdHooksStatus(deps: HooksDeps, args: readonly string[] = []): number {
+  if (args.includes("--check")) return hooksAreBehind(deps) ? EXIT.STATE : EXIT.OK;
+  const { binary, source } = resolveHookCommand(deps.ctx, deps.fs);
+  deps.io.out(`would install: ${binary} beacon emit  (${SOURCE_NAME[source]})`);
+  for (const target of claudeSettingsTargets(deps.ctx)) {
+    deps.io.out(`${target.path}: ${describeTarget(deps, target)}`);
+  }
+  return EXIT.OK;
+}
+
+function describeTarget(deps: HooksDeps, target: HookTarget): string {
+  const state = targetState(deps, target);
+  switch (state.kind) {
+    case "refused":
+      return `refused — ${state.symlink} is a symlink`;
+    case "unreadable":
+      return "unreadable — not valid JSON";
+    case "absent":
+      return "no settings file — `collie hooks install claude` creates one";
+    case "not-installed":
+      return "not installed";
+    // A file installed by an older build carries the events THAT build knew, which is what this reads
+    // like once the set grows. So the line names the remedy: install adds the missing ones in place.
+    case "partial":
+      return `partly installed (${state.at}, ${state.present}/${BEACON_HOOKS.length} events) — re-run install to add the rest`;
+    case "stale":
+      return `installed at ${state.at} — re-run install to heal it to v${HOOK_MARKER_VERSION}`;
+    case "installed":
+      return `installed (${state.at})`;
+  }
 }
 
 export function hooksUsage(): string {
@@ -496,7 +616,7 @@ export function cmdHooks(deps: HooksDeps, args: readonly string[]): number {
     case "uninstall":
       return cmdHooksUninstall(deps, rest);
     case "status":
-      return cmdHooksStatus(deps);
+      return cmdHooksStatus(deps, rest);
     default:
       if (sub !== undefined && sub !== "" && sub !== "help") {
         deps.io.err(`error: unknown hooks subcommand \`${sub}\``);

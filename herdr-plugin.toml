@@ -1,13 +1,13 @@
 id = "herdr.collie"
 name = "Collie"
-version = "1.0.0-beta.26"
+version = "1.4.1"
 min_herdr_version = "0.7.0"
 description = "Mobile web UI to monitor and reply to your agent herd, served over Tailscale"
 platforms = ["linux", "macos"]
 
-# This plugin is a thin launcher. The actual bridge runs as a systemd --user service on Linux or a
-# launchd agent on macOS, so it outlives Herdr restarts (see ARCHITECTURE.md §3). Every action below
-# runs scripts/collie-ctl.sh, which since M6/01 implements nothing: it resolves Bun, builds bin/collie
+# This plugin is a thin launcher. The actual bridge runs as a systemd --user service so it
+# outlives Herdr restarts (see ARCHITECTURE.md §3). Every action below runs
+# scripts/collie-ctl.sh, which since M6/01 implements nothing: it resolves Bun, builds bin/collie
 # if the checkout has none, and `exec`s that binary with the same argv. The CLI (cli/) is the ONE
 # implementation of every verb. Herdr injects HERDR_SOCKET_PATH / HERDR_PLUGIN_CONFIG_DIR into
 # these invocations and nothing else — no login shell — which the shim and the binary both expect.
@@ -45,7 +45,7 @@ title = "Restart Collie"
 contexts = ["workspace"]
 command = ["bash", "scripts/collie-ctl.sh", "restart"]
 
-# Full teardown: stops + disables the Linux unit or removes the macOS LaunchAgent, then resets
+# Full teardown: stops + disables the service, removes the systemd --user unit, and resets
 # tailscale serve. Leaves the .env and the checkout (so `start` can bring it right back). See
 # cli/lifecycle.ts → cmdUninstall.
 [[actions]]

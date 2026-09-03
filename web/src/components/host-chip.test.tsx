@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { AgentList } from "./agent-list";
@@ -92,6 +92,54 @@ describe("the herd list — one cross-host 'Needs you', labelled not split", () 
     const withHosts = triage(fixturePackAgents).map((s) => [s.key, s.agents.map((a) => a.paneId)]);
     const without = triage(stripped).map((s) => [s.key, s.agents.map((a) => a.paneId)]);
     expect(withHosts).toEqual(without);
+  });
+});
+
+// The caption run is the ONE variant that stands in a strip somebody else reserved, so its glyph is
+// sized by that strip and not by the chip's own taste.
+describe("HostChip — the caption glyph is sized by the band it stands in", () => {
+  const glyph = () => document.querySelector("svg")!;
+
+  it("draws a 10px glyph in the caption run and 12px in the pills", () => {
+    // MEASURED in the browser on the pane screen at a true 390px viewport. The composer's status
+    // band is 13px: a 12px line box plus its own 1px rule. A `size-3` glyph is 12px — the band's
+    // whole content box — so it painted 0.0 → 12.0 from the band's top edge: no clearance at the
+    // seam above it, the rule immediately below it, and an optical centre (6.00) that was neither
+    // the band's (6.5) nor the caps' beside it. There was no room either side to centre it INTO.
+    // At `size-2.5` it is 1.5 → 11.5 in the same box, centroid 6.5 — the band's own middle, the
+    // same middle as the text it stands with, and clear of both edges. It is also the right weight
+    // beside 10px type. The pills keep 12: they sit in boxes with their own padding.
+    //
+    // Fails in both directions: 12px in the caption run puts the glyph back on the seam, and 10px
+    // in a pill shrinks a glyph whose box was never the constraint.
+    render(<HostChip host="workshop" variant="caption" />, { wrapper: pack });
+    expect(glyph().getAttribute("class")).toMatch(/(?:^|\s)size-2\.5(?=\s|$)/);
+    cleanup();
+
+    for (const variant of ["tag", "target"] as const) {
+      render(<HostChip host="workshop" variant={variant} />, { wrapper: pack });
+      expect(glyph().getAttribute("class")).toMatch(/(?:^|\s)size-3(?=\s|$)/);
+      cleanup();
+    }
+  });
+
+  it("keeps the size when the caption run degrades to the OTHER glyph", () => {
+    // The caption run has no border to dash, so the shape of the fault moves into the glyph —
+    // ServerOff rather than Server (WCAG 1.4.1: colour alone may not carry it). That swap is PAINT,
+    // not layout: an unreachable machine may not be 2px taller than a reachable one, or the band's
+    // whole centring is a fact about health. DESIGN.md §2.
+    const down: ServerSummary[] = [
+      { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 100_000 },
+      { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 98_000 },
+    ];
+    const unreachable = ({ children }: { children: React.ReactNode }) => (
+      <PackProvider servers={down} ts={100_000} pollMs={1500}>
+        {children}
+      </PackProvider>
+    );
+    render(<HostChip host="workshop" variant="caption" />, { wrapper: unreachable });
+    expect(screen.getByLabelText(/workshop \(unreachable\)/i)).toBeInTheDocument();
+    expect(glyph().getAttribute("class")).toMatch(/(?:^|\s)size-2\.5(?=\s|$)/);
   });
 });
 
@@ -212,5 +260,83 @@ describe("HostChip — 'unreachable' is the write gate's word, never the receipt
     // start disagreeing about one outage.
     render(<HostChip host="bluefin" />, { wrapper: at(10_000_000) });
     expect(screen.getByLabelText("Host: bluefin")).toBeInTheDocument();
+  });
+});
+
+// ── The identity tint ────────────────────────────────────────────────────────────────────────────
+//
+// Colour is the SECOND encoding here and never the first: every assertion below has a name beside
+// it. What the tests actually pin is the hide rule one more time — a solo install must not gain a
+// single `host-` class — and the precedence: a machine that is not answering is a STATE, and a
+// state outranks whose machine it is. The tint itself lands on the GLYPH ONLY: the tag root (its
+// border, background and name text) stays the literal untinted classes on every variant.
+describe("HostChip — the per-host tint (glyph only)", () => {
+  // `fixtureServers` is bluefin (lead) / workshop / attic, and lib/hosts.ts hands that roster
+  // slots 2 / 9 / 8. The numbers are asserted rather than recomputed: a change to the hash is a
+  // change to every operator's learned colours, and it should have to be typed out here.
+  const tag = (name: string) => screen.getByLabelText(name);
+  // `tag`/`target` route through AddressTag, which wraps the glyph in its own span to carry the
+  // tint (ui/address-tag.tsx) — the svg itself stays undecorated, so the tint lives one level up.
+  // `caption` has no such wrapper; it puts the tint straight on the svg (host-chip.tsx).
+  const glyphOf = (name: string) => {
+    const root = tag(name);
+    const svg = root.querySelector("svg")!;
+    return svg.parentElement !== root ? svg.parentElement! : svg;
+  };
+
+  it("tints the row tag's glyph only — the tag root carries no host class", () => {
+    render(<HostChip host="workshop" />, { wrapper: pack });
+    const root = tag("Host: workshop").className;
+    expect(root).not.toMatch(/bg-host-/);
+    expect(root).not.toMatch(/text-host-/);
+    expect(glyphOf("Host: workshop").getAttribute("class")).toMatch(/text-host-9/);
+  });
+
+  it("gives two machines two different glyph colours", () => {
+    render(
+      <>
+        <HostChip host="bluefin" />
+        <HostChip host="workshop" />
+      </>,
+      { wrapper: pack },
+    );
+    expect(glyphOf("Host: bluefin").getAttribute("class")).toMatch(/text-host-2/);
+    expect(glyphOf("Host: workshop").getAttribute("class")).toMatch(/text-host-9/);
+  });
+
+  it("lets the unreachable reading win outright — a state outranks an identity", () => {
+    render(<HostChip host="attic" />, { wrapper: pack });
+    const chip = screen.getByLabelText(/attic \(unreachable\)/i);
+    expect(chip.className).toContain("text-status-blocked");
+    expect(chip.className).not.toMatch(/host-\d/);
+    // The glyph itself must not pick up a host tint either — alert wins everywhere, not just on
+    // the root.
+    expect(chip.querySelector("svg")?.getAttribute("class")).not.toMatch(/host-\d/);
+  });
+
+  it("tints only the caption run's glyph — the name stays the muted ink", () => {
+    render(<HostChip host="workshop" variant="caption" />, { wrapper: pack });
+    const root = tag("Sends to host: workshop");
+    expect(root.className).not.toMatch(/host-\d/);
+    expect(glyphOf("Sends to host: workshop").getAttribute("class")).toMatch(/text-host-9/);
+  });
+
+  it("tints only the write surface header's glyph — its pill is already emphasis", () => {
+    render(<HostChip host="workshop" variant="target" />, { wrapper: pack });
+    const root = tag("Sends to host: workshop");
+    expect(root.className).not.toMatch(/bg-host-/);
+    expect(root.className).not.toMatch(/text-host-/);
+    expect(glyphOf("Sends to host: workshop").getAttribute("class")).toMatch(/text-host-9/);
+  });
+
+  it("carries no host class ANYWHERE on a one-machine pack", () => {
+    // The hide rule, restated in colour: a solo collie renders the dashboard it always rendered.
+    render(<AgentList agents={fixtureAgents} onOpen={vi.fn()} />, { wrapper: one });
+    expect(document.body.innerHTML).not.toMatch(/host-\d/);
+  });
+
+  it("carries no host class with no provider at all", () => {
+    render(<HostChip host="workshop" />);
+    expect(document.body.innerHTML).not.toMatch(/host-\d/);
   });
 });

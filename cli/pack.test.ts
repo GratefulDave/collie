@@ -9,13 +9,14 @@ import {
   type EnrollResponse,
 } from "../bridge/pack/enrollment.ts";
 import { fp, leadStore, material, member, PACK, peerStore, T0 } from "../bridge/pack/fixtures.ts";
+import type { PackTlsOptions } from "../bridge/pack/transport.ts";
 import {
   serializeTrustStore,
   TrustStore,
   type TrustStoreData,
   type TrustStoreIo,
 } from "../bridge/pack/trust-store.ts";
-import { capture, context, fakeExec, fakeFiles, fakeOps, ROOT } from "./fakes.ts";
+import { capture, CONFIG, context, fakeExec, fakeFiles, fakeOps, ROOT } from "./fakes.ts";
 import { EXIT } from "./io.ts";
 import {
   cmdJoin,
@@ -30,11 +31,15 @@ import {
   cmdPromote,
   cmdReconnect,
   enrollUrl,
+  looksLikePlaintextListener,
   parsePackArgs,
   readToken,
   selfAddress,
 } from "./pack.ts";
 import type { PackAddDeps } from "./remote.ts";
+import { mintWarrant } from "../bridge/pack/warrant.ts";
+import { leadDeputyLines } from "./pack-status-deputy.ts";
+import { dialableBridgeHost } from "./tailnet.ts";
 
 // The pack verbs, against fakes for every seam. NOTHING here reaches a service manager, a tailnet, a
 // real trust store or a network: `restart`/`serve`/`unserve` are counters, the transport is a
@@ -49,8 +54,15 @@ interface Harness {
   exec: ReturnType<typeof fakeExec>;
   files: ReturnType<typeof fakeFiles>;
   audit: AuditEntry[];
-  /** Every request the verbs made: method, URL, headers and body. */
-  requests: { url: string; method: string; headers: Record<string, string>; body: string }[];
+  /** Every request the verbs made: method, URL, headers, body — and whether it carried a TLS pin. */
+  requests: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body: string;
+    /** `init.tls` as `clientFor` built it. `undefined` is an UNPINNED dial (§8.1's lead exception). */
+    tls: PackTlsOptions | undefined;
+  }[];
   data(): TrustStoreData | null;
   restarts: number[];
   serves: number[];
@@ -114,6 +126,9 @@ function harness(initial: TrustStoreData | null, replies: Reply[] = [], over: Pa
         // Every pack verb sends a `JSON.stringify` string; anything else is recorded as its text so
         // the assertion that follows fails loudly rather than silently reading "".
         body: init.body === undefined || init.body === null ? "" : String(init.body),
+        // The pin itself, not merely its presence: an assertion that a peer dial is still pinned has
+        // to see WHOSE certificate is anchored, or it would pass on any non-empty object.
+        tls: init.tls,
       });
       const reply = replies[n++];
       if (reply === undefined) return jsonReply({});
@@ -130,6 +145,10 @@ function harness(initial: TrustStoreData | null, replies: Reply[] = [], over: Pa
     // fingerprint — `fp("desk")`, matching the lead in `ENROLLED` — so a `join` split yields the wire
     // token "token-from-stdin" and an invited fingerprint the answer will match.
     readStdin: () => Promise.resolve(`token-from-stdin.${fp("desk")}\n`),
+    // No terminal by default — the scripted path, which is what every test below the interactive
+    // ones asserts. A test that wants the question overrides both seams through `over`.
+    interactive: false,
+    hostname: () => "laptop-box",
     restart: () => {
       restarts.push(requests.length);
       return Promise.resolve(EXIT.OK);
@@ -352,9 +371,19 @@ describe("selfAddress — the port is explicit exactly where the dial needs it",
 });
 
 describe("enrollUrl", () => {
-  test("a bare host becomes an https enrollment URL", () => {
-    expect(enrollUrl("desk.ts.net")).toBe("https://desk.ts.net/pack/v1/enroll");
+  test("a bare host becomes an https enrollment URL on the default bridge port", () => {
+    expect(enrollUrl("desk.ts.net")).toBe("https://desk.ts.net:8787/pack/v1/enroll");
     expect(enrollUrl("http://desk:8787")).toBe("http://desk:8787/pack/v1/enroll");
+  });
+
+  // The port default is what makes `collie pack join bluefin` a whole command. It applies ONLY to an
+  // address that named neither a scheme nor a port — anything the operator spelled is taken as spelt,
+  // so a script written against 1.0.0 keeps dialling exactly where it always did.
+  test("a typed port and a typed scheme both win over the defaults", () => {
+    expect(enrollUrl("desk.ts.net:9000")).toBe("https://desk.ts.net:9000/pack/v1/enroll");
+    expect(enrollUrl("https://desk.ts.net")).toBe("https://desk.ts.net/pack/v1/enroll");
+    expect(enrollUrl("https://desk.ts.net:9000")).toBe("https://desk.ts.net:9000/pack/v1/enroll");
+    expect(enrollUrl("http://desk.ts.net")).toBe("http://desk.ts.net/pack/v1/enroll");
   });
 
   test("an address carrying a path, a query or credentials is refused", () => {
@@ -382,11 +411,27 @@ describe("collie pack invite", () => {
     expect(text(h.io)).toContain("expires");
   });
 
-  test("the printed instruction is the stdin form, not the argv one", async () => {
+  test("the banner leads with the short join command and keeps the stdin form under it", async () => {
     const h = harness(leadStore());
     await cmdPackInvite(h.deps, []);
-    expect(text(h.io)).toContain("collie join laptop.tail.ts.net -");
+    // The SHORT MagicDNS name, and no port: this lead is on 8787, which is what a bare host means.
+    expect(text(h.io)).toContain("collie pack join laptop");
+    expect(text(h.io)).toContain("collie pack join laptop -   # paste the token on stdin");
     expect(text(h.io)).toContain("leaves it in `ps` output");
+  });
+
+  test("a lead that moved off 8787 says so, and COLLIE_PUBLIC_URL wins with its port made explicit", async () => {
+    const moved = harness(leadStore(), [], { ctx: context({}, { port: 9001 }) });
+    await cmdPackInvite(moved.deps, []);
+    expect(text(moved.io)).toContain("collie pack join laptop:9001");
+
+    // A configured front door is the ingress this machine actually publishes, so it wins — and its
+    // port is spelt out, because a bare host would send the joiner to 8787 instead of to that door.
+    const published = harness(leadStore(), [], {
+      ctx: context({ COLLIE_PUBLIC_URL: "https://collie.example.com" }),
+    });
+    await cmdPackInvite(published.deps, []);
+    expect(text(published.io)).toContain("collie pack join collie.example.com:443");
   });
 
   test("it materialises the store — and identity minting refusing is the whole verb failing", async () => {
@@ -424,7 +469,7 @@ describe("collie join", () => {
     const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
     expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.OK);
     const req = h.requests[0]!;
-    expect(req.url).toBe("https://desk.ts.net/pack/v1/enroll");
+    expect(req.url).toBe("https://desk.ts.net:8787/pack/v1/enroll");
     expect(req.method).toBe("POST");
     expect(req.url).not.toContain("token-from-stdin");
     expect(JSON.parse(req.body)).toEqual({
@@ -435,14 +480,21 @@ describe("collie join", () => {
       // The joiner is becoming a PEER, so what it hands the lead is its own pack listener — host AND
       // port. Portless, the lead would dial it at :443 forever (see the `selfAddress` suite above).
       address: "laptop.tail.ts.net:8787",
-      label: null,
+      // No `--label`, so the box's own name — a member called `collie-8f3a2b1c` identifies nobody.
+      label: "laptop-box",
     });
     // Nothing was handed to a subprocess: the token cannot appear in anyone's `ps`.
     expect(h.exec.calls.join("\n")).not.toContain("token-from-stdin");
 
     const data = h.data()!;
     expect(data.pack).toMatchObject({ packId: PACK.packId, secret: PACK.secret });
-    expect(data.lead).toMatchObject({ memberId: "desk", fingerprint: fp("desk"), address: "desk.ts.net" });
+    // The ORIGIN that answered, not the string that was typed: every later peer→lead dial reads this
+    // field, and a bare `desk.ts.net` would send them all to :443 over TLS this lead never answers.
+    expect(data.lead).toMatchObject({
+      memberId: "desk",
+      fingerprint: fp("desk"),
+      address: "https://desk.ts.net:8787",
+    });
     expect(data.self.memberId).toBe("laptop");
     expect(h.audit.map((l) => l.action)).toContain("pack.joined");
   });
@@ -463,7 +515,7 @@ describe("collie join", () => {
     const h = harness(peerStore());
     expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.STATE);
     expect(text(h.io)).toContain("already in pack");
-    expect(text(h.io)).toContain("collie leave");
+    expect(text(h.io)).toContain("collie pack leave");
     expect(h.requests).toEqual([]);
   });
 
@@ -567,8 +619,20 @@ describe("collie join", () => {
 
   test("missing arguments are a usage error, not an attempt", async () => {
     const h = harness(null);
+    expect(await cmdJoin(h.deps, [])).toBe(EXIT.USAGE);
+    expect(h.requests).toEqual([]);
+    expect(text(h.io)).toContain("usage: collie pack join <lead-address> [<token>|-|@file]");
+    expect(text(h.io)).not.toContain("needs the invite token as its second argument");
+  });
+
+  test("an address with no token explains the token is missing and shows how to pass it", async () => {
+    const h = harness(null);
     expect(await cmdJoin(h.deps, ["desk.ts.net"])).toBe(EXIT.USAGE);
     expect(h.requests).toEqual([]);
+    expect(text(h.io)).toContain("usage: collie pack join <lead-address> [<token>|-|@file]");
+    expect(text(h.io)).toContain("error: join needs the invite token as its second argument.");
+    expect(text(h.io)).toContain("collie pack join desk.ts.net -");
+    expect(text(h.io)).toContain("collie pack invite");
   });
 
   // ── The lead's fingerprint on the invite authenticates the lead to the joiner (F1) ──
@@ -665,7 +729,7 @@ describe("collie join", () => {
   test("a bare host is unaffected — assumed https://, dials without --insecure", async () => {
     const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
     expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.OK);
-    expect(h.requests[0]!.url).toBe("https://desk.ts.net/pack/v1/enroll");
+    expect(h.requests[0]!.url).toBe("https://desk.ts.net:8787/pack/v1/enroll");
     expect(text(h.io)).not.toContain("refusing to enroll over http://");
   });
 
@@ -674,6 +738,286 @@ describe("collie join", () => {
     expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.UNREACHABLE);
     expect(text(h.io)).toContain("https:// was assumed");
     expect(text(h.io)).toContain("--insecure");
+  });
+
+  // ── the plain-HTTP lead: one question, asked before anything is sent ────────
+  // A default install answers `/pack/v1/*` over plain HTTP on 8787 and publishes TLS on 443 through
+  // `tailscale serve`. So the bare host an operator types resolves to https://host:8787, which is a
+  // TLS client meeting a plaintext listener — and the refusal that shipped told them to add
+  // `--insecure` to a scheme they never typed. The question below replaces that dead end.
+
+  const PROMPTED =
+    "desk.ts.net:8787 answers over plain HTTP, not HTTPS. On a tailnet the hop is still encrypted by WireGuard. Send the token over it? [y/N]";
+
+  /** Exactly what Bun 1.4's `fetch` throws when an `https://` request meets a plain-HTTP listener. */
+  const plaintextListener = (): Error =>
+    Object.assign(new TypeError("unknown certificate verification error"), {
+      code: "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR",
+    });
+
+  test("`y` retries the same host:port over http:// — and the question comes BEFORE the token", async () => {
+    const asked: string[] = [];
+    const h = harness(null, [plaintextListener(), jsonReply(ENROLLED, 200, "desk")], {
+      interactive: true,
+      prompt: (q) => {
+        asked.push(q);
+        return "y";
+      },
+    });
+    expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.OK);
+    expect(asked).toEqual([PROMPTED]);
+    // The https attempt carried the token and reached nothing; the http one is the first that any
+    // listener could have read. Same host, same port, one scheme apart.
+    expect(h.requests.map((r) => r.url)).toEqual([
+      "https://desk.ts.net:8787/pack/v1/enroll",
+      "http://desk.ts.net:8787/pack/v1/enroll",
+    ]);
+    // …and what this machine remembers is the origin that answered, not the one that did not.
+    expect(h.data()!.lead).toMatchObject({ address: "http://desk.ts.net:8787" });
+  });
+
+  test("anything but `y` is the refusal that shipped, with the --insecure hint", async () => {
+    for (const answer of ["n", "", "yes please", null]) {
+      const h = harness(null, [plaintextListener()], { interactive: true, prompt: () => answer });
+      expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.REFUSED);
+      expect(text(h.io)).toContain("refusing to enroll over http://");
+      expect(text(h.io)).toContain("--insecure");
+      // One attempt, and it was the https one: nothing crossed a plaintext wire.
+      expect(h.requests.map((r) => r.url)).toEqual(["https://desk.ts.net:8787/pack/v1/enroll"]);
+      expect(h.data()!.pack).toBeNull();
+    }
+  });
+
+  test("no terminal, no question — a scripted run keeps exactly the refusal it had", async () => {
+    // The harness `prompt` throws, so this also proves the question was never asked.
+    const h = harness(null, [plaintextListener()]);
+    expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.REFUSED);
+    expect(text(h.io)).toContain("refusing to enroll over http://");
+    expect(h.requests).toHaveLength(1);
+  });
+
+  test("--insecure given explicitly skips the question and retries straight away", async () => {
+    const h = harness(null, [plaintextListener(), jsonReply(ENROLLED, 200, "desk")], { interactive: true });
+    expect(await cmdJoin(h.deps, [...joinArgs, "--insecure"])).toBe(EXIT.OK);
+    expect(h.requests.map((r) => r.url)).toEqual([
+      "https://desk.ts.net:8787/pack/v1/enroll",
+      "http://desk.ts.net:8787/pack/v1/enroll",
+    ]);
+  });
+
+  test("an EXPLICIT http:// address is never asked about — a script that spells it means it", async () => {
+    const h = harness(null, [jsonReply(ENROLLED, 200, "desk")], { interactive: true });
+    expect(await cmdJoin(h.deps, ["http://desk.ts.net:8787", "-"])).toBe(EXIT.REFUSED);
+    expect(text(h.io)).toContain("refusing to enroll over http://");
+    expect(h.requests).toEqual([]);
+  });
+
+  test("a failure that is not a plaintext listener asks nothing and stays UNREACHABLE", async () => {
+    const h = harness(null, [new Error("connect ECONNREFUSED")], { interactive: true });
+    expect(await cmdJoin(h.deps, joinArgs)).toBe(EXIT.UNREACHABLE);
+    expect(text(h.io)).not.toContain("plain HTTP");
+  });
+
+  // ── the token, asked for rather than demanded ──────────────────────────────
+
+  test("with a terminal and no token argument, it asks for one and uses the answer", async () => {
+    const asked: string[] = [];
+    const h = harness(null, [jsonReply(ENROLLED, 200, "desk")], {
+      interactive: true,
+      prompt: (q) => {
+        asked.push(q);
+        return `  token-from-stdin.${fp("desk")}  `;
+      },
+    });
+    expect(await cmdJoin(h.deps, ["desk.ts.net"])).toBe(EXIT.OK);
+    expect(asked).toEqual(["Paste the invite token from `collie pack invite` on the lead:"]);
+    // SAFETY: the body is the `EnrollRequest` `cmdJoin` just serialised — the answer, trimmed.
+    expect(JSON.parse(h.requests[0]!.body).token).toBe("token-from-stdin");
+    // A token typed at a prompt was never in argv, so the `ps` warning must not fire for it.
+    expect(text(h.io)).not.toContain("`ps -eo args`");
+  });
+
+  test("an empty answer is the missing-token error, not an attempt", async () => {
+    const h = harness(null, [], { interactive: true, prompt: () => "   " });
+    expect(await cmdJoin(h.deps, ["desk.ts.net"])).toBe(EXIT.USAGE);
+    expect(text(h.io)).toContain("error: join needs the invite token as its second argument.");
+    expect(h.requests).toEqual([]);
+  });
+
+  test("`--label` defaults to this machine's hostname, and an explicit one still wins", async () => {
+    const h = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
+    expect(await cmdJoin(h.deps, [...joinArgs, "--label", "nas"])).toBe(EXIT.OK);
+    // SAFETY: the body is the `EnrollRequest` `cmdJoin` just serialised, whose `label` is the flag.
+    expect(JSON.parse(h.requests[0]!.body).label).toBe("nas");
+  });
+});
+
+// ── one verb, two spellings ──────────────────────────────────────────────────
+// `pack join` and `pack leave` are canonical; `collie join` / `collie leave` are aliases onto the
+// same two functions. Nothing may drift between them, so the dispatch is pinned rather than trusted.
+
+describe("`collie pack join|leave` and their top-level aliases", () => {
+  test("`pack join` runs `cmdJoin` — same requests, same words", async () => {
+    const viaPack = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
+    expect(await cmdPack(viaPack.deps, ["join", "desk.ts.net", "-"])).toBe(EXIT.OK);
+    const direct = harness(null, [jsonReply(ENROLLED, 200, "desk")]);
+    expect(await cmdJoin(direct.deps, ["desk.ts.net", "-"])).toBe(EXIT.OK);
+    expect(viaPack.requests.map((r) => r.url)).toEqual(direct.requests.map((r) => r.url));
+    expect(text(viaPack.io)).toBe(text(direct.io));
+  });
+
+  test("`pack leave` runs `cmdLeave` — same exit code, same words", async () => {
+    const viaPack = harness(null);
+    expect(await cmdPack(viaPack.deps, ["leave"])).toBe(EXIT.STATE);
+    const direct = harness(null);
+    expect(await cmdLeave(direct.deps)).toBe(EXIT.STATE);
+    expect(text(viaPack.io)).toBe(text(direct.io));
+    expect(text(viaPack.io)).toContain("not in a pack");
+  });
+
+  test("the `pack` usage block names both of them", async () => {
+    const h = harness(null);
+    expect(await cmdPack(h.deps, [])).toBe(EXIT.USAGE);
+    expect(text(h.io)).toContain("  join     join a pack:");
+    expect(text(h.io)).toContain("  leave    leave the pack");
+  });
+});
+
+// ── how a plaintext listener fails a TLS client ──────────────────────────────
+
+describe("looksLikePlaintextListener", () => {
+  test("the shapes Bun and OpenSSL actually produce", () => {
+    const thrown = (message: string, code?: string): Error =>
+      code === undefined ? new Error(message) : Object.assign(new Error(message), { code });
+    // Probed against Bun 1.4: an https:// fetch at a `Bun.serve` listener, and one that resets.
+    expect(looksLikePlaintextListener(thrown("unknown certificate verification error", "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR"))).toBe(true);
+    expect(looksLikePlaintextListener(thrown("The socket connection was closed unexpectedly", "ECONNRESET"))).toBe(true);
+    // The OpenSSL spellings every other runtime and every proxy in front of one produce.
+    expect(looksLikePlaintextListener(thrown("write EPROTO", "EPROTO"))).toBe(true);
+    expect(looksLikePlaintextListener(thrown("routines:ssl3_get_record:wrong version number"))).toBe(true);
+    expect(looksLikePlaintextListener(thrown("packet length too long"))).toBe(true);
+  });
+
+  test("a refusal, a timeout and a DNS failure are NOT it", () => {
+    for (const [message, code] of [
+      ["Unable to connect. Is the computer able to access the url?", "ConnectionRefused"],
+      ["The operation timed out", "ETIMEDOUT"],
+      ["getaddrinfo ENOTFOUND desk.ts.net", "ENOTFOUND"],
+      ["self-signed certificate", "DEPTH_ZERO_SELF_SIGNED_CERT"],
+    ] as const) {
+      expect(looksLikePlaintextListener(Object.assign(new Error(message), { code }))).toBe(false);
+    }
+  });
+});
+
+// ── the runtime's voice never reaches an operator (F18) ──────────────────────
+
+describe("an unreachable member is described in Collie's words, not Bun's", () => {
+  // The exact string Bun throws, which reached `pack status`'s link line, the 503 body a phone
+  // reads and `collie leave`'s warning — all three read the same `reason` field.
+  const BUN_CONNECT = new Error("Unable to connect. Is the computer able to access the url?");
+
+  test("`pack status` says what the far side did", async () => {
+    const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }), [BUN_CONNECT]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("unreachable · hello: nothing accepted a connection at this address");
+    expect(text(h.io)).not.toContain("Is the computer able to access the url?");
+  });
+
+  test("`collie leave` warns in the same words", async () => {
+    const h = harness(peerStore(), [BUN_CONNECT]);
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("nothing accepted a connection at this address");
+    expect(text(h.io)).not.toContain("the computer");
+  });
+});
+
+// ── the unreachable-lead remedy (F11) ────────────────────────────────────────
+
+describe("collie pack status — what an unreachable LEAD is told to do", () => {
+  const behindAFrontDoor = (): TrustStoreData =>
+    peerStore({ lead: member({ memberId: "desk", role: "lead", address: "https://desk.tailnet.ts.net" }) });
+
+  test("a lead's scheme is not a diagnosis — the set-address hint is suppressed for that row", async () => {
+    const h = harness(behindAFrontDoor(), [new Error("no route to host")]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    // A lead's address is SUPPOSED to carry a scheme: it is a front door. The old hint told the
+    // operator to strip it, and the verb it named refuses on this machine anyway.
+    expect(text(h.io)).not.toContain("an address with a scheme is a front door's");
+    expect(text(h.io)).not.toContain("pack set-address desk");
+  });
+
+  test("the remedy it does offer is the verb that runs HERE", async () => {
+    const h = harness(behindAFrontDoor(), [new Error("no route to host")]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("collie reconnect <address>");
+    expect(text(h.io)).toContain("check that the door");
+  });
+
+  test("a PEER's scheme'd address still gets the lead's own verb, on the lead", async () => {
+    const h = harness(leadStore({ peers: [member({ memberId: "nas", address: "https://nas.example" })] }), [
+      new Error("no route to host"),
+    ]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("collie pack set-address nas <host:port>");
+    expect(text(h.io)).not.toContain("collie reconnect <address>");
+  });
+});
+
+// ── the peer→lead dial is not pinned (F10) ───────────────────────────────────
+
+describe("clientFor — which dials carry a pin (§8.1) and which cannot", () => {
+  // The lab's front door, and every real one: a `tailscale serve` or a conforming reverse proxy
+  // (docs/deployment.md Variant C) that terminates TLS with a certificate that is NOT the lead's own.
+  const behindAFrontDoor = (): TrustStoreData =>
+    peerStore({ lead: member({ memberId: "desk", role: "lead", address: "https://desk.tailnet.ts.net" }) });
+
+  test("a dial to this store's LEAD carries no TLS material at all", async () => {
+    const h = harness(behindAFrontDoor(), [jsonReply({ removed: "laptop" }, 200, "desk")]);
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(h.requests[0]!.url).toBe("https://desk.tailnet.ts.net/pack/v1/leave");
+    // Pinning `ca: [desk.certPem]` here is the one thing that can never work: the certificate on the
+    // wire belongs to the front door. Unpinned means the platform verifies it the ordinary way.
+    expect(h.requests[0]!.tls).toBeUndefined();
+    // …and §8.6's second factor is on the request instead, so the link is still two-factor.
+    expect(h.requests[0]!.headers.authorization).toBe(`Bearer ${PACK.secret}`);
+    expect(h.requests[0]!.headers["x-pack-signature"]).toBeDefined();
+  });
+
+  test("…and that is a fact about its ROLE, not about its address carrying a scheme", async () => {
+    const bare = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")]);
+    expect(await cmdLeave(bare.deps)).toBe(EXIT.OK);
+    // `desk.example:8787` has no scheme, and it is still the lead — whose listener pins nothing.
+    expect(bare.requests[0]!.url).toBe("https://desk.example:8787/pack/v1/leave");
+    expect(bare.requests[0]!.tls).toBeUndefined();
+  });
+
+  test("a dial to a PEER still carries that peer's certificate as the anchor", async () => {
+    const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }), [
+      jsonReply({ protocol: 1, member: "nas" }, 200, "nas"),
+    ]);
+    expect(await cmdReconnect(h.deps, ["nas", "nas.other:1"])).toBe(EXIT.OK);
+    expect(h.requests[0]!.tls?.ca).toEqual([material("nas").certPem]);
+    expect(h.requests[0]!.tls?.cert).toBe(material("desk").certPem);
+  });
+
+  test("`pack status` on a peer probes its lead through the front door, unpinned", async () => {
+    const h = harness(behindAFrontDoor(), [jsonReply({ protocol: 1, member: "desk" }, 200, "desk")]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(h.requests[0]!.url).toBe("https://desk.tailnet.ts.net/pack/v1/hello");
+    expect(h.requests[0]!.tls).toBeUndefined();
+    expect(text(h.io)).toContain("reachable");
+  });
+
+  test("`reconnect` re-points a peer at a new front door and reaches it there", async () => {
+    const h = harness(behindAFrontDoor(), [
+      jsonReply({ protocol: 1, member: "desk" }, 200, "desk"),
+      jsonReply({}, 200, "desk"),
+    ]);
+    expect(await cmdReconnect(h.deps, ["https://desk.other.ts.net"])).toBe(EXIT.OK);
+    expect(h.requests[0]!.url).toBe("https://desk.other.ts.net/pack/v1/hello");
+    expect(h.requests.every((r) => r.tls === undefined)).toBe(true);
+    expect(text(h.io)).toContain("it answered there.");
   });
 });
 
@@ -700,6 +1044,78 @@ describe("collie leave", () => {
     expect(text(h.io)).toContain("collie pack remove laptop");
   });
 
+  // F12: `pack add` writes COLLIE_HOST=<the address the lead dials> — a wide bind. Peer mode
+  // tolerates it; solo does not. So the documented tear-down ended with the service failing every
+  // five seconds forever, under a banner that said "activating" and "yet".
+  test("the pack's wide bind is retired, so the machine comes back as a plain loopback collie", async () => {
+    const h = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")], {
+      ctx: context({ COLLIE_HOST: "192.168.77.2", COLLIE_PACK_TIMEOUT_MS: "60000" }),
+    });
+    h.files.write(`${CONFIG}/.env`, "COLLIE_HOST=192.168.77.2\nCOLLIE_PORT=8787\n");
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(h.files.read(`${CONFIG}/.env`)).toBe("COLLIE_PORT=8787\n");
+    expect(text(h.io)).toContain("COLLIE_HOST=192.168.77.2 removed");
+    expect(text(h.io)).toContain("ADR 0013");
+  });
+
+  test("a bind the operator owns is not second-guessed", async () => {
+    const env = { COLLIE_HOST: "192.168.77.2", COLLIE_ALLOW_NON_LOOPBACK_BIND: "1", COLLIE_PACK_TIMEOUT_MS: "60000" };
+    const h = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")], { ctx: context(env) });
+    h.files.write(`${CONFIG}/.env`, "COLLIE_HOST=192.168.77.2\n");
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(h.files.read(`${CONFIG}/.env`)).toBe("COLLIE_HOST=192.168.77.2\n");
+    expect(text(h.io)).not.toContain("removed from");
+  });
+
+  test("a loopback bind is left exactly as it was — the common case pays nothing", async () => {
+    const h = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")]);
+    h.files.write(`${CONFIG}/.env`, "COLLIE_PORT=8787\n");
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(h.files.read(`${CONFIG}/.env`)).toBe("COLLIE_PORT=8787\n");
+    expect(text(h.io)).not.toContain("COLLIE_HOST");
+  });
+
+  test("a bind Collie cannot reach says what will happen, and names the variable", async () => {
+    const h = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")], {
+      ctx: context({ COLLIE_HOST: "192.168.77.2", COLLIE_PACK_TIMEOUT_MS: "60000" }),
+    });
+    // The value is real, but it comes from a systemd `Environment=` rather than the .env this owns.
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("every five seconds, forever");
+    expect(text(h.io)).toContain("COLLIE_ALLOW_NON_LOOPBACK_BIND=1");
+  });
+
+  // F22: the restart below prints the health banner, and the banner resolves what it probes from
+  // `ctx.env`. Left at the value this run started with, the documented tear-down ended on
+  // `⚠ Collie isn't answering on 192.168.77.2:8787 yet` about a machine that was healthy on
+  // loopback — the same alarm F12 used to raise, now false, at the end of the same command.
+  test("the closing banner probes the bind as REWRITTEN, not the one this run started with", async () => {
+    const ctx = context({ COLLIE_HOST: "192.168.77.2", COLLIE_PACK_TIMEOUT_MS: "60000" });
+    const probed: (string | undefined)[] = [];
+    const h = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")], {
+      ctx,
+      // The banner is built INSIDE this seam (`cmdRestart` → `cmdStart`), so what it would resolve
+      // is exactly what `ctx.env` says at the instant the restart runs.
+      restart: () => {
+        probed.push(dialableBridgeHost(ctx.env));
+        return Promise.resolve(EXIT.OK);
+      },
+    });
+    h.files.write(`${CONFIG}/.env`, "COLLIE_HOST=192.168.77.2\nCOLLIE_PORT=8787\n");
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(probed).toEqual(["127.0.0.1"]);
+    expect(ctx.env.COLLIE_HOST).toBeUndefined();
+  });
+
+  test("a bind Collie could NOT remove is still the bind — the env keeps it", async () => {
+    // The other half of the same rule: the machine really does still bind that address, so a banner
+    // that probed loopback here would be the mirror-image lie. Nothing was rewritten; nothing moves.
+    const ctx = context({ COLLIE_HOST: "192.168.77.2", COLLIE_PACK_TIMEOUT_MS: "60000" });
+    const h = harness(peerStore(), [jsonReply({ removed: "laptop" }, 200, "desk")], { ctx });
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(ctx.env.COLLIE_HOST).toBe("192.168.77.2");
+  });
+
   test("a lead refuses to leave — that would strand its peers", async () => {
     const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }));
     expect(await cmdLeave(h.deps)).toBe(EXIT.STATE);
@@ -711,6 +1127,31 @@ describe("collie leave", () => {
   test("not being in a pack is a state error, not a no-op success", async () => {
     const h = harness(null);
     expect(await cmdLeave(h.deps)).toBe(EXIT.STATE);
+  });
+
+  // ── the incident: `leave` used to keep the deputy state ────────────────────
+  // A peer left pack A as its armed deputy at warrant generation 3, kept `deputy`, `warrant` and
+  // `standbyRoster`, and joined pack B. Pack B's brand-new lead read generation 3 on `hello`, parked
+  // itself over a warrant it had never minted, and its front door went dark.
+  test("it clears the deputy state, and the synced device file with it", async () => {
+    const stored = mintWarrant(leadStore({ peers: [member({ memberId: "laptop" })] }), "laptop", T0)!.result;
+    const armed = peerStore({
+      deputy: "laptop",
+      warrant: { warrant: stored, deputyCertPem: null },
+      standbyRoster: [
+        { memberId: "nas", fingerprint: fp("nas"), certPem: material("nas").certPem, address: "nas.example:8787" },
+      ],
+    });
+    const h = harness(armed, [jsonReply({ removed: "laptop" }, 200, "desk")]);
+    h.files.write("/state/standby-devices.json", "{}");
+
+    expect(await cmdLeave(h.deps)).toBe(EXIT.OK);
+    expect(h.data()!.warrant).toBeNull();
+    expect(h.data()!.deputy).toBeNull();
+    expect(h.data()!.standbyRoster).toBeNull();
+    expect(h.files.read("/state/standby-devices.json")).toBeNull();
+    // And the operator is told, because the field they cannot see is the one that did the damage.
+    expect(text(h.io)).toContain("warrant generation 1");
   });
 });
 
@@ -770,6 +1211,43 @@ describe("collie pack status", () => {
     expect(rendered).toContain("timed out after 1200ms");
     // The remedy is a budget, not a `reconnect` — the machine just answered.
     expect(rendered).toContain("COLLIE_POLL_MS");
+  });
+
+  // F21: on a PEER the roster's one entry is the LEAD, and `/pack/v1/snapshot` is deliberately not on
+  // the closed peer → lead route set (`bridge/pack/router.ts`, RFC §8.6). Asking anyway got §8.1's
+  // bare 401 back and rendered a healthy pack as `data STARVED`, under a two-budget remedy that
+  // cannot move an authorization refusal.
+  test("a peer asks its LEAD one question, and rests the row on it", async () => {
+    const h = harness(peerStore(), [jsonReply({ protocol: 1, member: "desk" }, 200, "desk")]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(h.requests.map((r) => r.url)).toEqual(["https://desk.example:8787/pack/v1/hello"]);
+    const rendered = text(h.io);
+    expect(rendered).toContain("link    reachable");
+    expect(rendered).not.toContain("data    ");
+    expect(rendered).not.toContain("STARVED");
+    expect(rendered).not.toContain("COLLIE_POLL_MS`");
+  });
+
+  test("…and the refusal it would have got is never rendered as a starved link", async () => {
+    // What the lab saw: `hello` 200, then the 401 the closed route set guarantees. Even handed that
+    // reply, the peer must not ASK — so the reply is never read, and the budget remedy never prints.
+    const h = harness(peerStore(), [
+      jsonReply({ protocol: 1, member: "desk" }, 200, "desk"),
+      jsonReply({ error: "unauthorized" }, 401, "desk"),
+    ]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(h.requests).toHaveLength(1);
+    expect(text(h.io)).not.toContain("not arriving inside the per-poll budget");
+  });
+
+  test("a LEAD still asks BOTH questions of every peer — the poll really does run that way", async () => {
+    const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }), [
+      jsonReply({ protocol: 1, member: "nas" }, 200, "nas"),
+      jsonReply({ servers: [] }, 200, "nas"),
+    ]);
+    expect(await cmdPackStatus(h.deps, [])).toBe(EXIT.OK);
+    expect(h.requests).toHaveLength(2);
+    expect(text(h.io)).toContain("served a snapshot");
   });
 
   test("--no-probe asks neither question", async () => {
@@ -1052,7 +1530,7 @@ describe("collie pack rotate", () => {
 // ── pack remove ──────────────────────────────────────────────────────────────
 
 describe("collie pack remove", () => {
-  test("unpins and forgets, and says the far side keeps its own copy", async () => {
+  test("unpins, and says the far side keeps its own copy", async () => {
     const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }));
     expect(await cmdPackRemove(h.deps, ["nas"])).toBe(EXIT.OK);
     expect(h.data()!.peers).toEqual([]);
@@ -1063,10 +1541,48 @@ describe("collie pack remove", () => {
     expect(h.restarts).toHaveLength(1);
   });
 
+  // F16: the row in pack-ops.json is `{sshHost, path, port}` — exactly the connection that finishes
+  // the tear-down on the other machine — and it was deleted in the same breath as printing the
+  // sentence that needs it. The removed peer is invisible from both ends until `collie leave` runs
+  // there, so the verb now prints the line and KEEPS the row.
+  test("it prints the ssh line that finishes the job, and keeps the record it is built from", async () => {
+    const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }), [], {
+      ops: fakeOps({
+        nas: { sshHost: "op@192.168.77.2", path: "/home/op/.collie", port: 8787, recordedAt: T0 },
+      }),
+    });
+    expect(await cmdPackRemove(h.deps, ["nas"])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("ssh op@192.168.77.2 /home/op/.collie/bin/collie leave");
+    expect(text(h.io)).toContain("/state/pack-ops.json");
+    // The row survives — this is the whole finding.
+    expect(await h.deps.ops.get("nas")).toMatchObject({ sshHost: "op@192.168.77.2" });
+  });
+
+  test("a member this lead never SSH'd to says so instead of inventing a command", async () => {
+    const h = harness(leadStore({ peers: [member({ memberId: "nas" })] }));
+    expect(await cmdPackRemove(h.deps, ["nas"])).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("has no record of how it was reached over ssh");
+    expect(text(h.io)).not.toContain("    ssh ");
+  });
+
   test("an unknown member is a state error naming the verb that lists them", async () => {
     const h = harness(leadStore());
     expect(await cmdPackRemove(h.deps, ["ghost"])).toBe(EXIT.STATE);
     expect(text(h.io)).toContain("collie pack status");
+  });
+
+  // The two surfaces used to disagree out loud: `pack status` printed `deputy nas — warrant
+  // generation 1` on a lead whose `pack deputy --revoke` answered "this pack names no deputy".
+  test("removing the DEPUTY drops the designation, and says so", async () => {
+    const armed = mintWarrant(leadStore({ peers: [member({ memberId: "nas" })] }), "nas", T0)!.next;
+    const h = harness(armed);
+    expect(await cmdPackRemove(h.deps, ["nas"])).toBe(EXIT.OK);
+    expect(h.data()!.deputy).toBeNull();
+    expect(text(h.io)).toContain("was this pack's DEPUTY");
+    // `pack status` reads the designation, so with it gone the two surfaces agree.
+    expect(leadDeputyLines(h.data()!, T0)).toEqual([]);
+    // The counter stays, so a later mint cannot re-issue a generation this pack has already used.
+    expect(h.data()!.warrant?.warrant.generation).toBe(1);
   });
 
   test("no member id is a usage error", async () => {
@@ -1427,6 +1943,19 @@ describe("collie pack", () => {
     const h = harness(leadStore());
     expect(await cmdPack(h.deps, [])).toBe(EXIT.USAGE);
     expect(text(h.io)).not.toContain("unknown pack subcommand");
+  });
+
+  // F20: `collie pack --help` answered `error: unknown pack subcommand \`--help\``. It is a spelling
+  // of the block `collie pack` already prints, not a typo and not a second surface.
+  test("`help`, `--help` and `-h` all print the block, and accuse nobody", async () => {
+    const bare = harness(leadStore());
+    expect(await cmdPack(bare.deps, [])).toBe(EXIT.USAGE);
+    for (const spelling of ["help", "--help", "-h"]) {
+      const h = harness(leadStore());
+      expect(await cmdPack(h.deps, [spelling])).toBe(EXIT.USAGE);
+      expect(text(h.io)).not.toContain("unknown pack subcommand");
+      expect(text(h.io)).toBe(text(bare.io));
+    }
   });
 
   test("it routes to the verbs", async () => {

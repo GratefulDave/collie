@@ -158,6 +158,7 @@ const updateStatus: UpdateStatus = {
   releaseAvailable: false,
   majorAvailable: null,
   majorUrl: null,
+  installKind: "detached-checkout",
   bridgeStale: false,
   checkedAt: null,
 };
@@ -292,6 +293,11 @@ const PANE_WIRE_KEYS = {
   // Also not a pack dimension: an optional sentence the bridge composes for one kind of pane
   // (M11/05). Absent on every pane in this baseline, so no golden byte moved.
   hint: true,
+  // The OTHER half of a pane's address, and the one field here that is written by a request rather
+  // than by the pane's own state: present only when the caller asked to widen (`?sessions=all`),
+  // and then on every pane in the body. Nothing in this baseline asks, so it is absent on every
+  // pane here and no golden byte moved — which is the claim, not an aside.
+  session: true,
 } satisfies Record<keyof PaneWire, true>;
 
 const DEVICE_AUTH_KEYS = {
@@ -307,8 +313,14 @@ const UPDATE_STATUS_KEYS = {
   releaseAvailable: true,
   majorAvailable: true,
   majorUrl: true,
+  installKind: true,
   bridgeStale: true,
   checkedAt: true,
+  // The detached updater's run record (M15/04). Optional on the wire: an install that has never
+  // updated through the runner sends no `run` key at all.
+  run: true,
+  // Every release newer than the running one (M15/05) — the card lists what one update folds in.
+  newerVersions: true,
 } satisfies Record<keyof UpdateStatus, true>;
 
 const WORKSPACE_KEYS = {
@@ -319,6 +331,13 @@ const WORKSPACE_KEYS = {
   activeTabId: true,
   tabCount: true,
   paneCount: true,
+  repoRoot: true,
+  isWorktree: true,
+  // A pack dimension, and the SAME one a pane and a session carry: Herdr numbers spaces per machine,
+  // so `(host, workspaceId)` is a space's identity in a pack and `workspaceId` alone collides. Like
+  // `PaneWire.host` it is present exactly when `servers` is, which is never in this baseline — the
+  // golden bodies below are the proof that no byte moved for a solo instance.
+  host: true,
 } satisfies Record<keyof WorkspaceView, true>;
 
 const TAB_KEYS = {
@@ -328,6 +347,8 @@ const TAB_KEYS = {
   label: true,
   focused: true,
   paneCount: true,
+  /** Same dimension, same rule as {@link WORKSPACE_KEYS}'s — a tab id is `w1:t1` on every install. */
+  host: true,
 } satisfies Record<keyof TabView, true>;
 
 describe("solo zero-tax — wire shapes carry no pack dimension", () => {
@@ -359,7 +380,12 @@ describe("solo zero-tax — wire shapes carry no pack dimension", () => {
     ]);
   });
 
-  test("PaneWire gained `host` and nothing else", () => {
+  // `host` and `session` are the pane's ADDRESS — the `?h=` and `?s=` halves — and they are the only
+  // two fields here a REQUEST can turn on. Both are optional-and-absent unless something asked: a
+  // host tag exists only on a merged pack body, a session tag only on a widened one
+  // (`?sessions=all`). Neither is asked for anywhere in this baseline, which is what the golden
+  // bodies below prove; this list is the tripwire that a THIRD such field cannot be added quietly.
+  test("PaneWire carries the two address dimensions and nothing else", () => {
     expect(Object.keys(PANE_WIRE_KEYS).toSorted()).toEqual([
       "agent",
       "cwd",
@@ -373,6 +399,7 @@ describe("solo zero-tax — wire shapes carry no pack dimension", () => {
       "paneId",
       "paneLabel",
       "readableLines",
+      "session",
       "sessionName",
       "status",
       "tabId",
@@ -391,23 +418,32 @@ describe("solo zero-tax — wire shapes carry no pack dimension", () => {
       "bridgeStale",
       "checkedAt",
       "current",
+      "installKind",
       "latest",
       "latestUrl",
       "majorAvailable",
       "majorUrl",
+      "newerVersions",
       "releaseAvailable",
+      // The detached updater's run record (M15/04) — optional, so an install that has never run one
+      // sends no such key at all.
+      "run",
     ]);
     expect(Object.keys(WORKSPACE_KEYS).toSorted()).toEqual([
       "activeTabId",
       "focused",
+      "host",
+      "isWorktree",
       "label",
       "number",
       "paneCount",
+      "repoRoot",
       "tabCount",
       "workspaceId",
     ]);
     expect(Object.keys(TAB_KEYS).toSorted()).toEqual([
       "focused",
+      "host",
       "label",
       "number",
       "paneCount",
@@ -507,13 +543,36 @@ describe("solo zero-tax — routes", () => {
       // the reason every other one is: a route arrives on purpose or it does not arrive.
       "/^\\/api\\/pane\\/([^/]+)(?:\\/(reply|keys|upload|close|rename|history|focus))?$/",
       "/^\\/api\\/tab\\/([^/]+)\\/(rename|close)$/",
+      "/^\\/api\\/workspace\\/([^/]+)\\/worktree(?:\\/(open))?$/",
+      "/^\\/api\\/workspace\\/([^/]+)\\/worktrees$/",
       "/api/config",
       // Device pairing (bridge/pairing.ts) — a SOLO feature that legitimately extends this list.
       // It is named here, not exempted: the guard's job is that a route arrives on purpose.
       "/api/devices",
       "/api/devices/revoke",
+      // The detached updater's probe (M15/04) — a solo feature that legitimately extends this list,
+      // named here rather than exempted. It is the one ungated `/api/*` route: the prober is a local
+      // updater holding no credential, and what it answers is `{ ok, version, deposed, mode }`.
+      "/api/health",
+      // The operator's own launcher rows (`launchers.toml`) — a SOLO route that legitimately
+      // extends this list, named here rather than exempted. It is session-scoped and write-gated
+      // through the same closure `/api/workspace` rides, and the configured rows are its allowlist:
+      // the client names a row, never a command line. An operator who declares none can call it,
+      // and every call is refused.
+      "/api/launch",
+      // This host's own launcher rows, read live off its `launchers.toml` — a SOLO route that
+      // legitimately extends this list, named here rather than exempted. Session-scoped and
+      // read-gated through the same closure `/api/launch` rides, so a `?host=` call forwards to
+      // the peer that runs the rows rather than reading the lead's own file.
+      "/api/launchers",
       "/api/notifications/prefs",
       "/api/notifications/snooze",
+      // The Pack overview (bridge/pack/status-wire.ts) — a FRONT-DOOR route, and it legitimately
+      // extends this list rather than being exempted, exactly as pairing and STT do. It is not a
+      // pack route: `/pack/v1/*` is the link a peer answers (ADR 0013), and this is the lead's own
+      // browser answering its own operator. A solo instance registers it and 404s
+      // (`pack.not_lead`) — the same shape `/api/stt` has when no provider is configured.
+      "/api/pack",
       "/api/pair",
       // "Look now" (ADR 0031) — a SOLO route that legitimately extends this list, named here rather
       // than exempted. It is session-scoped and read-gated, and it registers no pack route of its
@@ -526,15 +585,28 @@ describe("solo zero-tax — routes", () => {
       "/api/stt",
       "/api/subscribe",
       "/api/tab",
+      // Starting an update from the phone (M15/05) — a SOLO route that legitimately extends this
+      // list, named here rather than exempted. Write-gated through the same closure a send rides,
+      // and it registers no pack sibling: a peer is levelled from the lead's terminal
+      // (`collie pack update`), never over the link (ADR 0016).
+      "/api/update",
       "/api/update/check",
+      // The digest's "remind me next digest" dismiss — solo, no pack sibling: it writes the lead's
+      // own notify record, and a peer never pushes an update notification of its own.
+      "/api/update/snooze",
       "/api/workspace",
       "/auth",
       "/auth/*",
     ]);
   });
 
+  // §11's actual promise, and it is about the PREFIX: `/pack/v1/*` is not routed here on any
+  // instance, solo or otherwise — it is declared in `bridge/pack/router.ts` and reached through the
+  // `packRouter` closure, which is what lets this file prove by grep that server.ts names no pack
+  // path. A front-door route whose NAME contains "pack" (`/api/pack`) is a different thing entirely
+  // and is pinned by the list above; matching on the substring would have conflated the two.
   test("no /pack prefix is routed at all", () => {
-    expect(declaredRoutes().filter((r) => r.includes("pack"))).toEqual([]);
+    expect(declaredRoutes().filter((r) => r.startsWith("/pack"))).toEqual([]);
     expect(readFileSync(join(import.meta.dir, "server.ts"), "utf8")).not.toMatch(/"\/pack/);
   });
 });
@@ -552,9 +624,11 @@ const CONFIG_KEYS = {
   commandsFile: true,
   keysFile: true,
   quickRepliesFile: true,
+  themeFile: true,
+  fontsDir: true,
+  launchersFile: true,
   port: true,
   host: true,
-  unixSocket: true,
   pollMs: true,
   pollIdleMs: true,
   notifyDelayMs: true,
@@ -591,9 +665,11 @@ describe("solo zero-tax — config", () => {
       "deviceAllowlist",
       "deviceHeader",
       "dialMode",
+      "fontsDir",
       "host",
       "journalRoots",
       "keysFile",
+      "launchersFile",
       "multiSession",
       "mux",
       "muxEndpoint",
@@ -609,11 +685,11 @@ describe("solo zero-tax — config", () => {
       "stateDir",
       "submitKeys",
       "tailscaleHosts",
+      "themeFile",
       "tmuxBin",
       "transcript",
       "trustedUser",
       "trustedUserOptional",
-      "unixSocket",
       "vapidPrivate",
       "vapidPublic",
       "vapidSubject",
@@ -672,7 +748,6 @@ describe("solo zero-tax — config", () => {
       "COLLIE_TRANSCRIPT_ROOT",
       "COLLIE_TRUSTED_USER",
       "COLLIE_TRUSTED_USER_OPTIONAL",
-      "COLLIE_UNIX_SOCKET",
       "COLLIE_VAPID_PRIVATE",
       "COLLIE_VAPID_PUBLIC",
       "COLLIE_VAPID_SUBJECT",
@@ -705,6 +780,11 @@ const STATE_DIR_ENTRIES = [
   // the bridge — `bridge/stt/config.ts` names this path and never writes it.
   "stt.json",
   "update-state.json",
+  // The detached updater's run record and its lock (M15/04). WRITTEN BY THE CLI, never by the
+  // bridge — `bridge/update-run.ts` only reads them, so the scan below sees the names here and no
+  // writer anywhere under `bridge/`. Absent until the first `collie update`.
+  "update.json",
+  "update.lock",
   "uploads",
 ];
 

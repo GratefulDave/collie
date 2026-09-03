@@ -14,6 +14,7 @@ import type { Environment } from "./context.ts";
 import { EXIT } from "./io.ts";
 import { cmdPack, type PackDeps } from "./pack.ts";
 import {
+  bindOverwriteConfirmation,
   cmdPackAdd,
   composeStdin,
   configureScript,
@@ -26,6 +27,7 @@ import {
   probeScript,
   restartScript,
   shq,
+  shqPath,
   sshOptions,
   STDIN_MARKER,
   type PackAddDeps,
@@ -338,6 +340,22 @@ describe("the leg scripts", () => {
     expect(shq("a'b")).toBe(`'a'\\''b'`);
     expect(shq("; rm -rf /")).toBe(`'; rm -rf /'`);
   });
+
+  test("shqPath expands a leading `~` against the REMOTE $HOME, never this machine's", () => {
+    expect(shqPath("~/apps/collie-stable")).toBe(`"$HOME"/'apps/collie-stable'`);
+    expect(shqPath("~")).toBe(`"$HOME"`);
+  });
+
+  test("shqPath leaves an ordinary path exactly as `shq` would", () => {
+    expect(shqPath("/opt/collie")).toBe(shq("/opt/collie"));
+    expect(shqPath("~notauser/x")).toBe(shq("~notauser/x"));
+  });
+
+  test("the probe script never carries a literal tilde for a `~`-rooted --path", () => {
+    const script = probeScript({ path: "~/apps/collie-stable", port: 8787 });
+    expect(script).toContain(`for _d in "$HOME"/'apps/collie-stable'; do`);
+    expect(script).not.toContain("~");
+  });
 });
 
 // ── The transport contract ───────────────────────────────────────────────────
@@ -436,6 +454,16 @@ describe("collie pack add", () => {
     expect(h.calls[4]!.script).toContain("'--address' '100.64.0.9:8787'");
   });
 
+  // Q2: the probe is one `ss -ltn` at one instant. Over a unit that crash-loops on a five-second
+  // timer the port is genuinely idle for most of every cycle, so `free` claimed a durable property
+  // the probe never observed. It now reports what it saw, and when.
+  test("an idle port is reported as an observation, not as a property", async () => {
+    const h = harness();
+    expect(await run(h)).toBe(EXIT.OK);
+    expect(text(h.io)).toContain("nothing was listening just now");
+    expect(text(h.io)).not.toContain("8787 free");
+  });
+
   test("a COLLIE_PUBLIC_URL lead address is used, and named once so it is not a silent steer", async () => {
     const h = harness({ env: { COLLIE_PUBLIC_URL: "https://collie.example.com" } });
     expect(await run(h)).toBe(EXIT.OK);
@@ -465,6 +493,73 @@ describe("collie pack add", () => {
       if (call.leg !== "enroll") expect(call.stdin ?? "").not.toContain(token!);
     }
     expect(text(h.io)).not.toContain(token!);
+  });
+
+  // F8: `--peer-address 192.168.77.2:8787` was concatenated with `--port`, printed as
+  // `192.168.77.2:8787:8787`, and written into the member's COLLIE_HOST — an address `Bun.serve` can
+  // never bind. The member was left half-enrolled with a dead service.
+  test("a --peer-address that is not a bare host is refused BEFORE any ssh runs", async () => {
+    for (const bad of [
+      "192.168.77.2:8787",
+      "https://192.168.77.2",
+      "192.168.77.2/collie",
+      "op@192.168.77.2",
+      "[fd7a::1]:8787",
+      "[fd7a::1]",
+      " 192.168.77.2 ",
+    ]) {
+      const h = harness();
+      expect(await run(h, ["nas.example", "--peer-address", bad])).toBe(EXIT.USAGE);
+      // The whole point of the finding: nothing was pushed, built, written or restarted.
+      expect(h.calls).toHaveLength(0);
+      expect(h.restarts).toBe(0);
+      expect(text(h.io)).toContain("is not a bind address");
+      expect(text(h.io)).toContain("Give a BARE HOST");
+      expect(text(h.io)).toContain("--port");
+    }
+  });
+
+  test("a bare host — name, IPv4 or an unbracketed IPv6 literal — is accepted", async () => {
+    for (const good of ["192.168.77.2", "collie-2.tail1234.ts.net", "fd7a::1"]) {
+      const h = harness();
+      expect(await run(h, ["nas.example", "--peer-address", good])).toBe(EXIT.OK);
+      expect(h.calls[2]!.script).toContain(`printf 'COLLIE_HOST=%s\\n' '${good}'`);
+    }
+  });
+
+  // F9: the refusal came from `collie join` on the FAR machine, after the bundle push, the remote
+  // build, the .env write and two lead restarts — and it named `--insecure`, which `pack add` does
+  // not accept. Re-running with the flag produced the identical refusal: a closed loop with no exit.
+  test("an http:// lead address is refused at parse time, naming a remedy that exists", async () => {
+    for (const [args, env] of [
+      [["nas.example", "--address", "http://192.168.77.1:8787"], {}],
+      [["nas.example"], { COLLIE_PUBLIC_URL: "http://192.168.77.1:8787" }],
+    ] as const) {
+      const h = harness({ env });
+      expect(await run(h, [...args])).toBe(EXIT.USAGE);
+      expect(h.calls).toHaveLength(0);
+      expect(h.restarts).toBe(0);
+      const said = text(h.io);
+      expect(said).toContain("in the clear");
+      expect(said).toContain("`pack add` has no --insecure and will not get one");
+      expect(said).toContain("collie join <lead-address> <token> --insecure` THERE");
+      expect(said).toContain("Nothing was pushed, built or restarted.");
+    }
+  });
+
+  test("https:// and a scheme-less address are untouched", async () => {
+    const flagged = harness();
+    expect(await run(flagged, ["nas.example", "--address", "https://collie.example.com"])).toBe(EXIT.OK);
+    const bare = harness();
+    expect(await run(bare, ["nas.example", "--address", "collie.example.com:8787"])).toBe(EXIT.OK);
+  });
+
+  test("a value typed at the prompt is held to the same rule", async () => {
+    const h = harness({ prompt: "192.168.77.2:8787", answers: { probe: { stdout: probeOut({ address: "" }) } } });
+    expect(await run(h)).toBe(EXIT.FAIL);
+    expect(text(h.io)).toContain("is not a bind address");
+    // The prompt comes after leg 1, so the probe has run — but nothing was installed or written.
+    expect(h.calls.map((c) => c.leg)).toEqual(["probe"]);
   });
 
   test("the lead is restarted so its running bridge can answer the invite", async () => {
@@ -615,6 +710,46 @@ describe("prompts", () => {
     expect(text(h.io)).toContain("git stash");
     expect(text(h.io)).toContain("will not");
     expect(h.calls.map((c) => c.leg)).toEqual(["probe"]);
+  });
+
+  // ── F23: what an UNSET bind means, and what it does not ───────────────────
+  // `collie leave` removes COLLIE_HOST and keeps COLLIE_PORT, so a machine torn down properly reads
+  // back `envhost=""`, `envport="8787"`. That used to prompt `configured to bind (unset):8787` and
+  // hard-stop every non-interactive run — `ssh -tt` included, since a piped `y` is not a terminal.
+  describe("the bind confirmation guards an operator's value, not the absence of one", () => {
+    const probed = (over: Record<string, string>): string =>
+      probeOut({ checkout: REMOTE_CHECKOUT, commit: COMMIT, ...over });
+
+    test("re-adding a machine that LEFT needs no terminal at all", async () => {
+      // `confirm: null` is exactly a run with nowhere to ask — the shape that hard-stopped.
+      const h = harness({ confirm: null, answers: { probe: { stdout: probed({ envport: "8787" }) } } });
+      expect(await run(h)).toBe(EXIT.OK);
+      expect(h.calls.map((c) => c.leg)).toContain("configure");
+      const rendered = text(h.io);
+      expect(rendered).toContain("no COLLIE_HOST");
+      expect(rendered).not.toContain("(unset)");
+    });
+
+    test("an operator's own non-loopback bind is still guarded, port agreeing or not", async () => {
+      const h = harness({ confirm: null, answers: { probe: { stdout: probed({ envhost: "10.9.9.9", envport: "8787" }) } } });
+      expect(await run(h)).toBe(EXIT.FAIL);
+      expect(h.calls.map((c) => c.leg)).not.toContain("configure");
+    });
+
+    test("the predicate, case by case", () => {
+      const probe = (over: Record<string, string>) => parseProbe(probed(over))!;
+      // Nothing there to preserve — the post-leave state, and a fresh machine's.
+      expect(bindOverwriteConfirmation(probe({ envport: "8787" }), "100.64.0.9", 8787)).toBeNull();
+      expect(bindOverwriteConfirmation(probe({}), "100.64.0.9", 8787)).toBeNull();
+      // Already where this run would put it: nothing changes, so nothing is asked.
+      expect(bindOverwriteConfirmation(probe({ envhost: "100.64.0.9" }), "100.64.0.9", 8787)).toBeNull();
+      // A value somebody chose, about to be replaced by a different one.
+      expect(bindOverwriteConfirmation(probe({ envhost: "127.0.0.1", envport: "8787" }), "100.64.0.9", 8787)).toBe(
+        "127.0.0.1:8787",
+      );
+      // The port is a decision too, and it is named without a placeholder for the host.
+      expect(bindOverwriteConfirmation(probe({ envport: "9000" }), "100.64.0.9", 8787)).toBe("100.64.0.9:9000");
+    });
   });
 
   test("a disagreeing bind is a prompt; N is STATE", async () => {

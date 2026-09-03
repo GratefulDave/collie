@@ -29,7 +29,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File contrib\windows\collie-c
 ```
 
 `start` registers a Task Scheduler job (`herdr.collie`, override with `COLLIE_TASK_NAME`) that runs
-at logon, restarts after failures, and outlives Herdr. `status` prints the same readiness banner the
+at logon, restarts after failures, and outlives Herdr. It launches through `conhost --headless`
+so the bridge gets a pseudoconsole with no window: a bare `powershell.exe` action would surface
+on Windows 11 as a Windows Terminal tab, which kills the bridge when someone closes it. `status` prints the same readiness banner the
 POSIX script does; `logs` tails the bridge's stdout/stderr, including the pair preserved from the
 last crash. Config is the usual `.env` in the plugin config dir
 ([`.env.example`](../../.env.example) documents every key).
@@ -46,7 +48,7 @@ release from Windows.
 
 ## Security defaults
 
-The posture is the one in [§Security](../../README.md#%EF%B8%8F-security--read-before-you-run-it) —
+The posture is the one in [docs/security.md](../../docs/security.md) —
 nothing is relaxed here.
 
 - **The scheduled task runs at limited privilege.** `COLLIE_TASK_RUN_LEVEL=highest` is an explicit
@@ -57,7 +59,7 @@ nothing is relaxed here.
   touches Tailscale Serve state — not on `start`, not on `uninstall`. Create the mapping yourself,
   once, in an Administrator PowerShell (`tailscale serve --bg 8787`), or run
   `COLLIE_SKIP_SERVE=1` behind your own reverse proxy per
-  [Variant C](../../DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale). This
+  [Variant C](../../docs/deployment.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale). This
   is the [one managed front door](../../.adr/0001-one-managed-front-door.md) rule holding: Collie
   manages exactly one, and it isn't this one.
 

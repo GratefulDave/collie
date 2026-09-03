@@ -102,6 +102,21 @@ export interface AgentView {
    * ambient one, or a reply lands on the right pane name on the wrong terminal.
    */
   host?: string;
+  /**
+   * Which Herdr session on {@link host} this pane lives in — the `?s=` half of the same address.
+   * Mirrors `PaneWire.session` in bridge/types.ts.
+   *
+   * **Present exactly when the snapshot was WIDENED** (`?sessions=all`, the "All sessions" view),
+   * and then on every pane in the body including the primary session's. Absent otherwise, which is
+   * every request the app made until this feature existed — so an un-widened view reads `undefined`
+   * here and behaves exactly as it did.
+   *
+   * Pane ids collide across sessions on one machine for the same reason they collide across
+   * machines: each session is its own Herdr server. So this completes the `(host, session, paneId)`
+   * address, and a widened row must be OPENED with its own session (see `paneScope` in lib/hosts.ts)
+   * rather than with the ambient one.
+   */
+  session?: string;
 }
 
 /**
@@ -132,6 +147,23 @@ export interface WorkspaceView {
   activeTabId: string;
   tabCount: number;
   paneCount: number;
+  /**
+   * The Git repo this space sits in, when the multiplexer reports one.
+   *
+   * Absent means "no repo, or this multiplexer keeps no such mapping" — and absence is what hides
+   * the worktree rows, so no extra call is needed to decide whether to show them.
+   */
+  repoRoot?: string;
+  /** Whether this space is a linked worktree of `repoRoot`, not the repo's own checkout. */
+  isWorktree?: boolean;
+  /**
+   * Which member of the pack this space lives on — the same tag a pane and a session carry.
+   *
+   * Present exactly when `servers` is, absent otherwise, so a solo body is unchanged. Herdr numbers
+   * spaces PER MACHINE, so `(host, workspaceId)` is a space's identity in a pack — see `spaceKey`
+   * in lib/hosts.ts, and `ambientSpaces`, which narrows these rows to the address the URL is on.
+   */
+  host?: string;
 }
 
 /** A tab within a workspace (holds one or more panes). */
@@ -142,6 +174,8 @@ export interface TabView {
   label: string;
   focused: boolean;
   paneCount: number;
+  /** Which member of the pack this tab lives on — same rule as {@link WorkspaceView.host}. */
+  host?: string;
 }
 
 export type BridgeStatus = "connected" | "disconnected";
@@ -254,6 +288,80 @@ export interface ServerSummary {
 }
 
 /**
+ * `GET /api/pack` — the lead's own answer to "how is my whole pack doing?" (PACK_PROTOCOL.md §9.2,
+ * §10.2). Read-level, and read-ONLY: nothing on this response is an affordance to change the pack.
+ * Join / leave / promote / rotate stay CLI verbs (M5 non-goal), so the page it feeds has no button
+ * that mutates anything.
+ *
+ * **Only a LEAD serves it.** A solo collie and a peer both answer 404 with the app's ordinary JSON
+ * error shape, which `packLoader` (lib/loaders.ts) turns into `null` rather than a thrown error —
+ * "there is no pack here" is an answer, not a failure.
+ *
+ * Deliberately NOT folded into `SnapshotResponse.servers`: that roster is what every host-aware
+ * surface polls on the hot path, and it carries exactly the fields those surfaces need. The census
+ * below (secret generation, warrant generations, enrolment times, per-member versions) is one
+ * page's worth of detail, and putting it on the snapshot would make every phone pay for it on every
+ * poll. Where the two overlap — `health`, `lastSeenAt` — the meanings are the same ones
+ * `ServerSummary` documents, measured on the same clock.
+ */
+export interface PackStatusResponse {
+  pack: {
+    id: string;
+    /** Operator-chosen pack name. */
+    name: string;
+    /** Which rotation of the shared secret is current; a member below it has not caught up yet. */
+    secretGeneration: number;
+    /** Epoch ms on the LEAD's clock, like every other timestamp here — date it against `ts`. */
+    rotatedAt: number;
+  };
+  /** The collie answering — i.e. the lead itself. `version` is what a member is compared against. */
+  self: { id: string; name: string; version: string };
+  /**
+   * The member named ahead of time to take over if the lead goes silent (ADR 0027), or `null` when
+   * none is named. `warrantGeneration` is null when the deputy holds no warrant yet.
+   */
+  deputy: { id: string; warrantGeneration: number | null } | null;
+  /** Lead first, then peers by id — the same order the roster uses, so the two pages agree. */
+  members: PackMemberStatus[];
+  /**
+   * The LEAD's clock when it assembled this body. Every timestamp above and below is stamped on
+   * that same clock, so it is the only sound thing to age them against — never `Date.now()`
+   * (lib/host-health.ts's header has the argument in full).
+   */
+  ts: number;
+}
+
+/** One machine's row in the census. */
+export interface PackMemberStatus {
+  /** Member id — the `?h=` value, so a row can navigate straight to that machine's home. */
+  id: string;
+  name: string;
+  isLead: boolean;
+  /** How the operator reached it; absent for the lead's own entry. Rendered verbatim, in mono. */
+  address?: string;
+  /** Epoch ms on the lead's clock when this member joined; absent for the lead's own entry. */
+  enrolledAt?: number;
+  /**
+   * Four states, and the last two are the loud ones: `incompatible` is a version that must be
+   * fixed, `conflicted` is two collies both believing they lead this pack. Neither is a transient
+   * the next poll clears, so the page names them rather than folding them into "unreachable".
+   */
+  health: "reachable" | "unreachable" | "incompatible" | "conflicted";
+  /** The lead's reason, verbatim — never paraphrased, because the fix follows from the words. */
+  reason?: string;
+  /** Epoch ms, stamped by the LEAD on receipt (§10.2). `0` = never answered. */
+  lastSeenAt: number;
+  /** The Collie version this member reports; absent until it has answered once. */
+  version?: string;
+  /** Enrolled under an older secret generation and has not picked up the current one. */
+  secretBehind: boolean;
+  /** Enrolled, never reached — so nothing about it has ever been confirmed. */
+  provisional: boolean;
+  /** Set only when `health` is `conflicted`: who this member thinks leads, and under what warrant. */
+  conflict?: { leadMemberId: string; warrantGeneration: number | null };
+}
+
+/**
  * Version / upgrade status for the running Collie (mirrors UpdateInfo in bridge/types.ts). Optional
  * on the snapshot — an older bridge omits it entirely, which the client treats as "no info" (the
  * update banner renders nothing). `latest` is null when the newest upstream release isn't known.
@@ -272,10 +380,94 @@ export interface UpdateInfo {
   majorAvailable: string | null;
   /** GitHub release page for `majorAvailable`, or null when there is none. */
   majorUrl: string | null;
+  /**
+   * How this Collie is installed — decides the banner's command spelling: Herdr actions reach only a
+   * Herdr-managed (detached) checkout, every other kind is told the `collie` verbs. Absent on an
+   * older bridge (pre-M14, the git-install era), which reads as Herdr-managed.
+   */
+  installKind?: "linked-clone" | "detached-checkout" | "binary" | "unknown";
   /** The running bridge PROCESS is behind the on-disk code — a `systemctl restart` picks it up. */
   bridgeStale: boolean;
   /** When the upstream check last ran (epoch ms), or null if it hasn't. */
   checkedAt: number | null;
+  /** Every release newer than `current`, oldest first — what one update folds in. Absent on an
+   *  older bridge, which the card reads as "nothing to list". */
+  newerVersions?: string[];
+  /** The detached updater's run record. Absent when this install has never run one. */
+  run?: UpdateRun;
+}
+
+/**
+ * Where an update run is (mirrors `bridge/update-run.ts`). `done`, `rolled-back`, `stuck` and
+ * `interrupted` are terminal; the four in the middle are somebody still driving it.
+ *
+ * `restarting` and `verifying` are the states the operator stares at, and the card renders them as
+ * PROGRESS. The bridge is gone during `restarting` — that is the update working, not an outage.
+ */
+export type UpdateRunState =
+  | "idle"
+  | "preflight"
+  | "staging"
+  | "restarting"
+  | "verifying"
+  | "done"
+  | "rolled-back"
+  | "stuck"
+  | "interrupted";
+
+/** The run record the bridge and the standby door both report (mirrors `bridge/update-run.ts`). */
+export interface UpdateRun {
+  schema: number;
+  state: UpdateRunState;
+  /** The version this run started from, or null when there was none to name. */
+  from: string | null;
+  /** The version it is going to. */
+  to: string | null;
+  startedAt: number;
+  updatedAt: number;
+  pid: number;
+  attempt: number;
+  /** Why it is where it is, when that needs a sentence. */
+  reason?: string;
+  /** A bounded, credential-scrubbed tail of the service log, recorded on a failure. */
+  logTail?: string;
+  /** The command the operator runs by hand — carried only by `stuck`. */
+  recovery?: string;
+}
+
+/** One preflight check (mirrors `cli/update-check.ts`). `id` is stable; the prose is not. */
+export interface PreflightCheck {
+  id: string;
+  verdict: "green" | "amber" | "red";
+  reason: string;
+  /** The one command that clears it, where one exists. */
+  remedy?: string;
+}
+
+/** The preflight report: the worst verdict, and every check behind it. */
+export interface PreflightReport {
+  schema: number;
+  verdict: "green" | "amber" | "red";
+  checks: PreflightCheck[];
+}
+
+/**
+ * `GET /api/update/check` — the update snapshot plus the preflight the button is gated on.
+ *
+ * `preflight: null` is a fact, not an omission: it means the check could not be run here, which
+ * REFUSES an update rather than allowing one.
+ */
+export interface UpdateCheckResponse extends UpdateInfo {
+  preflight: PreflightReport | null;
+}
+
+/** `POST /api/update` — the 202. The run itself is followed on the snapshot from here. */
+export interface UpdateStartResponse {
+  ok: true;
+  /** The version the bridge is installing. */
+  to: string;
+  major: boolean;
+  run: UpdateRun | null;
 }
 
 export interface SnapshotResponse {
@@ -458,6 +650,9 @@ export const MUX_CAPABILITIES = [
   "renameTab",
   "closeTab",
   "createSpace",
+  "listWorktrees",
+  "createWorktree",
+  "openWorktree",
   "pushTopologyEvents",
   "pushPaneEvents",
 ] as const;
@@ -536,6 +731,56 @@ export interface OperatorQuickReplyRow {
   items: string[];
 }
 
+/**
+ * One operator-declared UI typeface (a `[[font]]` row in their `theme.toml`). Mirrors
+ * `OperatorFontRow` in bridge/types.ts.
+ *
+ * These ADD to the shipped faces rather than replacing them, which is where `theme.toml` parts
+ * company with the ADR 0018 trio — a font cannot fire an action, so it shadows nothing (ADR 0033).
+ *
+ * NO URL CROSSES THE WIRE, only the basename: `lib/operator-fonts.ts` builds `/api/fonts/<name>`
+ * itself, and re-validates every field here before any of it reaches a stylesheet.
+ */
+export interface OperatorFontRow {
+  /** Display name AND the CSS family name. */
+  family: string;
+  /** The file's bare name, which is also the row's identity and the tail of its URL. */
+  basename: string;
+  /** `font-weight` for the `@font-face`, e.g. `400` or `400 700`. Absent = the browser's default. */
+  weight?: string;
+}
+
+/**
+ * One operator-declared launcher row (`launchers.toml`). Mirrors Launcher in
+ * bridge/types.ts. A tap creates a throwaway Space and types this shell line verbatim
+ * into its fresh shell — herdr deletes a Space when its last pane closes, so quit → gone
+ * with nothing to clean up. The label is what the dashboard button shows; when the
+ * operator omits it the bridge defaults it to the command's first token.
+ */
+export interface Launcher {
+  /** The shell line typed into the new Space's shell, verbatim. Also the allowlist key /api/launch matches. */
+  command: string;
+  /** Button label. Defaults to the command's first whitespace-separated token. */
+  label: string;
+  /**
+   * Absolute directory the new Space (or tab) opens in. Absent means "here": from the dashboard,
+   * the bridge's home dir; from a pane, that pane's own cwd. Present, it is pinned and shown
+   * shortened under home (`shortenHome`) wherever the row's folder is displayed.
+   */
+  cwd?: string;
+}
+
+/**
+ * GET /api/launchers — the rows for ONE host (a pack has one file per member), read live off its
+ * `launchers.toml`. `home` is that host's own home dir, for shortening a pinned `cwd` without the
+ * client knowing which machine answered (a peer's home is not this browser's, and is not even
+ * necessarily the same string as the lead's).
+ */
+export interface LaunchersResponse {
+  launchers: Launcher[];
+  home: string;
+}
+
 export interface BridgeConfig {
   push: boolean;
   vapidPublicKey: string;
@@ -553,6 +798,8 @@ export interface BridgeConfig {
   operatorKeys?: OperatorKeyRow[];
   /** The operator's own Quick-dock groups. Absent when there is no `quick-replies.toml`. */
   operatorQuickReplies?: OperatorQuickReplyRow[];
+  /** The operator's own UI typefaces. Absent when there is no `theme.toml` (ADR 0033). */
+  operatorFonts?: OperatorFontRow[];
   /**
    * The multiplexer and its declared capabilities. **Absent on a bridge older than this field**, and
    * that absence is read as "everything is supported" — a mid-upgrade Herdr operator must never
@@ -610,3 +857,25 @@ export const STATUS_RANK = {
 export function statusLabel(status: AgentStatus): string {
   return t(`status.label.${status}`);
 }
+
+/** One Git worktree of the repo a space sits in. Mirrors `WorktreeView` in bridge/types.ts. */
+export interface WorktreeView {
+  path: string;
+  branch: string | null;
+  /** The space showing it, or `null` when nothing does — which is what hides its Remove row. */
+  openWorkspaceId: string | null;
+  /** `false` for the repo's own checkout: listed for context, never removable. */
+  linked: boolean;
+  prunable: boolean;
+}
+
+/** GET /api/workspace/:id/worktrees */
+export type WorktreeListResponse =
+  | { ok: true; worktrees: WorktreeView[] }
+  | { ok: false; error: string; code?: ApiErrorCode; detail?: ApiErrorDetail };
+
+/** POST /api/workspace/:id/worktree[/open] — `alreadyOpen` is an answer, never a failure. */
+export type WorktreeOpenResponse =
+  | { ok: true; pane: CreatedPane; alreadyOpen: boolean }
+  | { ok: false; error: string; code?: ApiErrorCode; detail?: ApiErrorDetail };
+

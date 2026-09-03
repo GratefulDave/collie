@@ -20,7 +20,9 @@ import {
   resolveHome,
   instanceSuffix,
   resolveInstance,
+  shadowNotes,
   tightenEnvFile,
+  upsertEnvVars,
   type Environment,
 } from "./context.ts";
 
@@ -63,8 +65,31 @@ describe("config dir precedence", () => {
     );
   });
 
-  test("the Herdr CLI is asked next", () => {
+  test("the Herdr CLI is asked next, and wins when its dir holds the .env", () => {
+    expect(resolve({ herdr: "/from-herdr", files: [join("/from-herdr", ".env")] }).dir).toBe(
+      "/from-herdr",
+    );
+  });
+
+  // The 2026-08-26 bug: a `herdr` binary on PATH answers for every Collie on the host, so a binary
+  // install's own `~/.config/collie/.env` was ignored in favour of a plugin dir nothing had written.
+  test("a Herdr answer with no .env loses to a conventional dir that has one", () => {
+    const r = resolve({ herdr: "/from-herdr", files: [join(CONVENTIONAL, ".env")] });
+    expect(r.dir).toBe(CONVENTIONAL);
+    expect(r.note).toBeNull();
+  });
+
+  test("a Herdr answer with no .env loses to ~/.config/collie's .env", () => {
+    const r = resolve({ herdr: "/from-herdr", files: [join(LEGACY, ".env")] });
+    expect(r.dir).toBe(LEGACY);
+    expect(r.note).toBeNull();
+  });
+
+  test("with no .env anywhere, Herdr's answer is still taken", () => {
     expect(resolve({ herdr: "/from-herdr" }).dir).toBe("/from-herdr");
+    expect(resolve({ herdr: "/from-herdr", files: ["/from-herdr", CONVENTIONAL] }).dir).toBe(
+      "/from-herdr",
+    );
   });
 
   test("Herdr saying nothing (or being absent) falls through", () => {
@@ -84,7 +109,12 @@ describe("config dir precedence", () => {
 
 describe("the legacy .env note", () => {
   test("fires when a legacy .env exists but is not the resolved dir", () => {
-    const r = resolve({ herdr: "/from-herdr", files: [join(LEGACY, ".env")] });
+    // Both files exist and the Herdr one is in use — the case the note was written for.
+    const r = resolve({
+      herdr: "/from-herdr",
+      files: [join("/from-herdr", ".env"), join(LEGACY, ".env")],
+    });
+    expect(r.dir).toBe("/from-herdr");
     expect(r.note).toContain(join(LEGACY, ".env"));
     expect(r.note).toContain(join("/from-herdr", ".env"));
   });
@@ -94,7 +124,7 @@ describe("the legacy .env note", () => {
   });
 
   test("stays silent when there is no legacy .env to ignore", () => {
-    expect(resolve({ herdr: "/from-herdr" }).note).toBeNull();
+    expect(resolve({ herdr: "/from-herdr", files: [join("/from-herdr", ".env")] }).note).toBeNull();
   });
 });
 
@@ -242,6 +272,74 @@ describe("parseEnvFile", () => {
 
   test("a later assignment wins, as re-assignment would in a sourced file", () => {
     expect(parseEnvFile("A=1\nA=2")).toEqual({ A: "2" });
+  });
+});
+
+// `.env` still wins the merge in `loadContext` — the precedence is load-bearing and unchanged. This
+// only tests that the win stops being silent: the pure computation `loadContext` calls at the merge
+// site, so it never has to touch the real `process.env`.
+describe("shadowNotes", () => {
+  test("a differing value gets one note naming both", () => {
+    expect(shadowNotes({ COLLIE_PORT: "8788" }, { COLLIE_PORT: "8787" })).toEqual([
+      "note: COLLIE_PORT=8788 from your environment is shadowed by .env (8787).",
+    ]);
+  });
+
+  test("an equal value says nothing", () => {
+    expect(shadowNotes({ COLLIE_PORT: "8787" }, { COLLIE_PORT: "8787" })).toEqual([]);
+  });
+
+  test("an unset ambient value says nothing — there was nothing to shadow", () => {
+    expect(shadowNotes({}, { COLLIE_PORT: "8787" })).toEqual([]);
+  });
+
+  test("a credential-shaped name is named but never valued", () => {
+    expect(
+      shadowNotes({ COLLIE_STT_API_KEY: "sk-old" }, { COLLIE_STT_API_KEY: "sk-new" }),
+    ).toEqual(["note: COLLIE_STT_API_KEY from your environment is shadowed by .env."]);
+  });
+
+  test("more than the cap collapses into a summary line", () => {
+    const ambient = Object.fromEntries(Array.from({ length: 7 }, (_, i) => [`VAR_${i}`, "old"]));
+    const fromFile = Object.fromEntries(Array.from({ length: 7 }, (_, i) => [`VAR_${i}`, "new"]));
+    const notes = shadowNotes(ambient, fromFile);
+    expect(notes).toHaveLength(6);
+    expect(notes.slice(0, 5).every((l) => l.startsWith("note: VAR_"))).toBe(true);
+    expect(notes[5]).toBe("note: 2 more environment variables shadowed by .env.");
+  });
+});
+
+// The other direction, and the only writer of a `.env` in the tree (`collie start`'s first-run mux
+// pick, M14/03). What it writes must be what `parseEnvFile` reads back, so the round trip is the
+// assertion in every case here.
+describe("upsertEnvVars", () => {
+  test("replaces an assignment where it stands and leaves everything else alone", () => {
+    const written = upsertEnvVars("# mine\nCOLLIE_PORT=8788\nCOLLIE_MUX=herdr\n# after\n", {
+      COLLIE_MUX: "tmux",
+    });
+    expect(written).toBe("# mine\nCOLLIE_PORT=8788\nCOLLIE_MUX=tmux\n# after\n");
+  });
+
+  test("appends what was not there, and ends on exactly one newline", () => {
+    expect(upsertEnvVars("", { COLLIE_MUX: "zellij" })).toBe("COLLIE_MUX=zellij\n");
+    expect(upsertEnvVars("A=1", { B: "2" })).toBe("A=1\nB=2\n");
+    expect(upsertEnvVars("A=1\n\n\n", { B: "2" })).toBe("A=1\nB=2\n");
+  });
+
+  test("an `export` prefix and indentation are kept — the operator's file, in their shape", () => {
+    expect(upsertEnvVars("  export A=1\n", { A: "2" })).toBe("  A=2\n");
+  });
+
+  test("quotes exactly what parseEnvFile would need quoted, and the pair round-trips", () => {
+    const vars = { A: "/run/user/1000/collie.sock", B: "a session", C: 'say "hi" $NOPE', D: "two\nlines" };
+    expect(upsertEnvVars("", vars)).toContain("A=/run/user/1000/collie.sock");
+    expect(parseEnvFile(upsertEnvVars("", vars))).toEqual(vars);
+  });
+
+  test("a value that looks like a comment survives the round trip", () => {
+    expect(parseEnvFile(upsertEnvVars("", { A: "8787 # not a comment" }))).toEqual({
+      A: "8787 # not a comment",
+    });
   });
 });
 

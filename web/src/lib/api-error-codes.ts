@@ -54,6 +54,20 @@ export const API_ERROR_CODES = [
   "tab.workspace_required",
   "workspace.create_failed",
 
+  // Launchers — /api/launch
+  "launch.not_allowlisted",
+  "launch.pane_unknown",
+
+  // Worktrees — /api/workspace/:id/worktree[s|/open|/remove] (ADR 0032)
+  "worktree.list_failed",
+  "worktree.create_failed",
+  "worktree.created_not_opened",
+  "worktree.open_failed",
+  "worktree.busy",
+  "worktree.ambiguous_branch",
+  "worktree.branch_required",
+  "worktree.not_a_repo",
+
   // Image upload — POST /api/pane/:id/upload
   "upload.too_large",
   "upload.no_file",
@@ -81,6 +95,19 @@ export const API_ERROR_CODES = [
   // Addressing — the `(host, session)` a request named does not exist
   "session.unknown",
   "host.unknown",
+
+  // The pack overview — this collie is not a lead with a pack (solo, or a peer)
+  "pack.not_lead",
+
+  // Starting an update from the phone — POST /api/update (M15/05)
+  "update.confirm_required",
+  "update.in_progress",
+  "update.preflight_unavailable",
+  "update.preflight_red",
+  "update.major_confirm_required",
+  "update.target_mismatch",
+  "update.none_available",
+  "update.start_failed",
 ] as const;
 
 /** Every code the bridge can send. Derived from the list, so there is exactly one place to edit. */

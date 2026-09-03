@@ -15,6 +15,15 @@ import { decodeReplyLine, decodeStreamLine, type EventData } from "../../wire.ts
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Raw wire shape of a workspace from `workspace.list`. */
+/** The repo a workspace sits in, as Herdr reports it on the workspace record itself. */
+export interface WireWorkspaceWorktree {
+  repo_root: string;
+  repo_name?: string;
+  repo_key?: string;
+  checkout_path?: string;
+  is_linked_worktree?: boolean;
+}
+
 export interface WireWorkspace {
   workspace_id: string;
   number: number;
@@ -24,6 +33,25 @@ export interface WireWorkspace {
   tab_count: number;
   active_tab_id: string;
   agent_status: AgentStatus;
+  /** Present when the workspace sits in a Git work tree — probed 2026-08-28 on herdr 0.8.2. */
+  worktree?: WireWorkspaceWorktree | null;
+}
+
+/**
+ * Raw wire shape of a worktree from `worktree.list`.
+ *
+ * `open_workspace_id` is absent (not null) when nothing shows the checkout — probed 2026-08-28
+ * against herdr 0.8.2, where closing the workspace dropped the key entirely.
+ */
+export interface WireWorktree {
+  path: string;
+  branch?: string | null;
+  label?: string;
+  is_linked_worktree: boolean;
+  is_prunable: boolean;
+  is_bare: boolean;
+  is_detached: boolean;
+  open_workspace_id?: string | null;
 }
 
 /** Raw wire shape of a tab from `tab.list`. */
@@ -198,6 +226,9 @@ export type HerdrRpc = Pick<
   | "renameTab"
   | "closeTab"
   | "createWorkspace"
+  | "listWorktrees"
+  | "createWorktree"
+  | "openWorktree"
   | "subscribeEvents"
 >;
 
@@ -500,6 +531,73 @@ export class HerdrClient {
       cwd: p.cwd,
     };
   }
+
+  /**
+   * The worktrees of the repo at `cwd` — including the repo's own checkout, which comes back with
+   * `is_linked_worktree: false`.
+   *
+   * Takes a PATH, not a workspace: probed 2026-08-28 against herdr 0.8.2, `worktree.list --cwd`
+   * answers for a repo nothing has open, which is what lets the sheet list a worktree before there
+   * is any space to name it by.
+   */
+  async listWorktrees(cwd: string): Promise<WireWorktree[]> {
+    const r = await this.request<{ worktrees: WireWorktree[] }>("worktree.list", { cwd });
+    return r.worktrees;
+  }
+
+  /**
+   * Create a worktree on a new branch and open it as its own workspace. `focus:false`, so the
+   * operator's own screen stays where they left it (the phone navigates itself).
+   *
+   * NOT ATOMIC, and the caller must know: probed 2026-08-28 against herdr 0.8.2 in a session with no
+   * window server, the checkout was created and the OPEN failed with `worktree_open_failed` — the
+   * branch exists, nothing shows it. A retry then fails as `worktree_create_failed` (the path is
+   * taken), so the recovery is to open it, never to create it again.
+   */
+  async createWorktree(opts: { cwd: string; branch: string }): Promise<CreatedShell> {
+    const r = await this.request<{ workspace: WireWorkspace; root_pane: WirePane }>(
+      "worktree.create",
+      { cwd: opts.cwd, branch: opts.branch, focus: false },
+    );
+    const p = r.root_pane;
+    return {
+      paneId: p.pane_id,
+      workspaceId: p.workspace_id,
+      workspaceLabel: r.workspace.label,
+      tabId: p.tab_id,
+      cwd: p.cwd,
+    };
+  }
+
+  /**
+   * Show a worktree that already exists on disk, by its checkout path.
+   *
+   * `cwd` (the repo) is required alongside it: probed 2026-08-28, `worktree.open` with `path` alone
+   * answers `not_git_worktree`. A worktree already open answers `already_open: true` with the space
+   * showing it — an answer, not a refusal.
+   */
+  async openWorktree(opts: {
+    cwd: string;
+    path: string;
+  }): Promise<{ shell: CreatedShell; alreadyOpen: boolean }> {
+    const r = await this.request<{
+      workspace: WireWorkspace;
+      root_pane: WirePane;
+      already_open?: boolean;
+    }>("worktree.open", { cwd: opts.cwd, path: opts.path, focus: false });
+    const p = r.root_pane;
+    return {
+      shell: {
+        paneId: p.pane_id,
+        workspaceId: p.workspace_id,
+        workspaceLabel: r.workspace.label,
+        tabId: p.tab_id,
+        cwd: p.cwd,
+      },
+      alreadyOpen: r.already_open === true,
+    };
+  }
+
 
   async readPane(
     paneId: string,

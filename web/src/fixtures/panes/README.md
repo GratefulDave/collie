@@ -42,6 +42,68 @@ and the observed commands were approved with no dialog painted.
 | `codex--ask-wizard-q1.txt` | Two-question set, `Question 1/2`; footer adds `←/→ to navigate questions`. Digit probed: answers and advances | `blocked` |
 | `codex--ask-wizard-q2.txt` | Same set, `Question 2/2`; footer `enter to submit all`. Digit probed: submits the whole set | `blocked` |
 | `codex--ask-notes-focused.txt` | Notes box open (`› Add notes`, footer `tab or esc to clear notes`): a digit would TYPE — the adapter refuses to raw | `blocked` |
+
+## Codex 0.150.1 corpus (captured 2026-08-28, herdr 0.8.2, Linux sandbox panes)
+
+Byte-faithful `format:ansi` captures from throwaway herdr tabs in `/tmp/collie-codex-sandbox`
+(a `git init` repo on `main`) and `/tmp/collie-codex-nogit`. **No scrubbing was needed** — no
+username, hostname or home path appears in any of the five files. Every session carries the
+host's `codex_apps` MCP 401 startup warning in its transcript; that is real screen output, not
+noise added here. **The headline: 0.150.1's DEFAULT status row is two fields,
+`<model-with-reasoning> · <current-dir>`, with no `Context N% left` token** — so the
+`Context`-bearing `STATUS_ROW` regex never matches. `isStatusRow` therefore also accepts the row
+by its RENDERER PAINT (unstyled two-space indent, coloured non-dim fields, dim ` · ` separators),
+which is what locates the composer on every capture below. Live-probed the same session with an explicit
+`-c 'tui.status_line=["model-with-reasoning","current-dir","git-branch","context-remaining","weekly-limit"]'`:
+`git-branch` renders `main` and `context-remaining` renders `Context 100% left`, so the Context
+field is simply absent from the default list, not suppressed by a degraded login.
+`codex--v0150-working` is MISSING: the capture host's ChatGPT auth could not refresh
+(`Your access token could not be refreshed because your refresh token was already used`), so no
+model turn could be run.
+
+| Fixture | State / what's in it | Herdr status |
+|---|---|---|
+| `codex--v0150-idle.txt` | Git sandbox, trust and hooks dialogs answered, empty dim `› Ask Codex to do anything` composer over the two-field status row. Pins that the `Context`-bearing regex does NOT match here, and that the styled acceptor does | `idle` |
+| `codex--v0150-draft-wrapped.txt` | A 571-character sentence typed into the same composer, word-wrapped onto two two-space-indented continuation rows (the pane is 216 columns, so ~350 chars would not have wrapped three ways) | `idle` |
+| `codex--v0150-nogit-idle.txt` | Same idle screen in a directory with no git repo. The status row is the SAME two fields — no branch field to lose, because the default list has none | `idle` |
+| `codex--v0150-custom-status.txt` | `-c 'tui.status_line=["model-with-reasoning","current-dir","git-branch"]'` (Context deliberately omitted) with a short draft on the `› ` row. Pins the styled custom-status design: per-field colours and dim ` · ` separators | `idle` |
+| `codex--v0150-paste-placeholder.txt` | One `pane.send_text` of exactly 3000 non-newline ASCII characters lands as `[Pasted Content 1024 chars]` — **N is 1024, not 3000**. Codex's TUI keeps only the first 1024 characters of a single burst, so `draftCarriesSend("x".repeat(3000), draft)` is **false** (it is true for a 1024-character send). See `codex/paste.ts` | `idle` |
+
+## Codex 0.151.0 capture (2026-08-29, herdr 0.8.2, Linux sandbox pane)
+
+Byte-faithful `format:ansi` capture from a throwaway herdr tab in `/tmp/collie-codex-sandbox`, with
+one length-preserving sanitization pass on the shell prompt the pane opened with (`user@sbox`, `$`).
+Status row is 0.150.1's two-field default, so the styled acceptor is what locates the composer here
+too. **The headline: a continuation row is NOT always two-space indented.** The gutter is two
+spaces, but what follows it is the operator's own text — and a draft carrying a hard line break
+whose next line begins with spaces (one shift+enter, trivial to type on a phone) paints a FOUR-space
+row. That is an ordinary draft, not a dialog.
+
+| Fixture | State / what's in it | Herdr status |
+|---|---|---|
+| `codex--v0151-draft-indented-line.txt` | Two-line draft: the `› ` row, then a hard line break whose text starts with two spaces, painted as a four-space-indented continuation above the two-field status row. `composerReady` must be TRUE — `/^ {2}\S/` refused it, `locateComposer` returned null, and the pane refused every send with "the agent's input box isn't on screen" until the draft was cleared | `idle` |
+
+## Codex mobile chrome (reconstructed 2026-09-03)
+
+**Not a capture.** This one file is RECONSTRUCTED from the two rows reported in
+[PR #144](https://github.com/AltanS/collie/pull/144), which were seen on a live Codex pane the
+contributor could reach and this repo's capture hosts could not. It carries real ESC bytes in the
+shape the report describes, and it is the ground truth for `codex/display.ts` only. Replace it with
+a real `format:ansi` capture the next time a Codex pane paints these rows, and delete this note.
+
+Two rows matter, and both are 100 columns wide:
+
+- the **submitted user message**, padded to the terminal width and filled with the truecolor
+  `48;2;240;240;240`. The mirror is authored in dark space and inverted under the light theme, so
+  that fill lands near-black: a heavy full-width bar on a phone. The two diff rows beneath it carry
+  their own backgrounds and must keep them.
+- the **labelled separator** `─ Worked for 3m 12s ──…`, a short rule, a label, then a rule to the
+  row's end. It is not a pure rule, so blocks.ts leaves it wrapping; the codex adapter clips it.
+
+| Fixture | State / what's in it | Herdr status |
+|---|---|---|
+| `codex--submitted-fill-labelled-rule.txt` | Finished turn: the near-white submitted-message row, an assistant line, two coloured diff rows, the labelled `Worked for` rule, then the idle composer and the two-field status row | `idle` |
+
 ## Grok corpus (live panes 2026-08-21–23)
 
 Grok's composer is a rounded box at the tail: `╭─…─╮` / `│ ❯ … │` / `╰─ <status> ─╯`, then a blank and a key-hint row. The status run is opaque (display name, optional effort, optional permission mode). User-message bubbles use **square** corners (`┌ ┐ └ ┘`) and must never be read as the composer. **All identifying content genericized** per the repo's public-repo rule.
@@ -144,6 +206,22 @@ is why a composer send used to be typed straight into it. Claimed by the last-re
 | `claude--menu-model-picker-moved.txt` | The same picker after `2×Down` (`❯` on row 3) — same title and actions, **different signature**. The race-guard fixture: a committing key must refuse a tap on the earlier render, an arrow must not |
 | `claude--menu-model-picker-dismissed.txt` | After `Esc`: the ordinary input box + statusline are back. The **negative control** — its statusline is `·`-separated like a key-hint footer, so only the input-box gate keeps it raw |
 
+## Slash-autocomplete corpus (captured 2026-09-01, Claude Code v2.1.257, live pane)
+
+Claude Code's **command-completion popup** — the run of rows it paints directly under the input
+box's bottom border while the draft is still a partial slash command. It is the picker's opposite
+number: the input box is **live** underneath it, so this is composer chrome plus a list, never a
+modal. Read by `harness/claude/autocomplete.ts` and peeled off the tail by `locateInputBox` before
+its own walk, because the run is far taller than `MAX_STATUS_LINES` and used to hide the box behind
+it — `composerReady` false, every send stalled, the whole 220-column grid soft-wrapped onto the
+phone. Selection inside the popup is **SGR-only** (the highlighted row is byte-identical to its
+neighbours), so the grammar matches on shape and never on colour.
+
+| Fixture | State / what's in it |
+|---|---|
+| `claude--autocomplete-slash-long.txt` | `/model` typed on a machine with many skills: 23 popup rows — 17 entries at a description column of 43, six of whose blurbs wrap onto a continuation row. **No statusline and no key-hint footer**: while the popup is open the run reaches the last line of the screen. The capture the bug was diagnosed from |
+| `claude--autocomplete-slash-short.txt` | The 3-row shape (`/re` → `/rename`, `/resume`, `/release-notes`) at a description column of 23, first row highlighted. **Derived**: written to the same layout and SGR palette as the long capture, at a width that fits the page |
+
 ## Wizard corpus (captured 2026-07-05, sandbox pane; choreography in `../../lib/grammar/WIZARD_NOTES.md`)
 
 | Fixture | State / what's in it |
@@ -211,6 +289,7 @@ Capturing it is the first thing the later Tier-2 contribution owes, ahead of any
 | `omp--done--tool-result.txt` | Completed turn ending in a boxed tool result (`╰───╯`, corner-to-corner) plus a `※ recap:` line. The negative control for the composer-bottom literal: this box closes with no gutter | `idle` |
 | `omp--draft-single.txt` | A stranded draft that fits one row, written into the bottom border: `╰─ list the files in this repo ─╯` | `idle` |
 | `omp--draft-ghost-suggestion.txt` | The same draft with omp's **inline completion suggestion** painted after it: `repo` unstyled, then `sitory` in a muted foreground, then the padding. The ghost is not in the input buffer, so `extractInputDraft` must read `list the files in this repo` — reading the row verbatim stalled every reply with "Message didn't reach the input box" (`composerGhost`, omp/markers.ts). **Derived** from `omp--draft-single.txt`: the SGR run and six ghost cells were spliced in and six padding cells taken out, so the row still measures 189 cells and every other byte is carried over | `idle` |
+| `omp--draft-ghost-suggestion-busy.txt` | The same ghost on the shape **omp 18** draws while the agent is WORKING: the draft itself carries an explicit theme foreground (`38;2;242;244;248`), so the suggestion is no longer "colour after no colour". The first `composerGhost` rule anchored on the draft being unstyled, found no anchor here, and every busy pane went back to stalling. **Derived** from `omp--draft-ghost-suggestion.txt`: one SGR run spliced in before the draft, and the welcome banner's version retargeted `v17.2.12` → `v18.0.11` (same length), so no cell is added or removed | `idle` |
 | `omp--draft-wrapped.txt` | A 355-char draft soft-wrapped over three rows — two `│  …  │` continuations ABOVE the bottom border, which carries the tail (`hand`). Regression fixture for the fold direction | `idle` |
 | `omp--menu-dismissed.txt` | The welcome panel (a 100-cell `╭───┴───╮` box) plus an MCP failure notice above an empty composer. Negative control: a second, narrower box on screen must not be spliced into the composer's geometry | `idle` |
 | `omp--slash-palette.txt` | `/` typed: the autocomplete renders BELOW the box, at the box's own width, with one wrapped entry (3 rows) — a `skill:…` row, which omp assembles from the capturing machine and which is therefore NOT an omp built-in. `extractInputDraft` reads `"/"` | `idle` |
@@ -278,8 +357,9 @@ all-LF** — never mixed, never a lone `\r`, and none ends in a trailing newline
 count always equals its `wc -l`, one FEWER than the rows it draws (27 CRLFs ⇒ 28 rows). The counts
 below are that `wc -l`, i.e. what `grep -c` reports. Twelve are all-CRLF: `menu-dismissed` 27, `select-menu` and
 `select-menu-moved` 55, `menu-model*` / `menu-resume*` / `menu-settings*` 56, `select-multi*` 58. The
-other nine — `fresh-idle`, `working`, `done`, `done--tool-result`, `draft-single`,
-`draft-ghost-suggestion`, `draft-wrapped`, `slash-palette` and `slash-palette--filtered` — are all-LF
+other ten — `fresh-idle`, `working`, `done`, `done--tool-result`, `draft-single`,
+`draft-ghost-suggestion`, `draft-ghost-suggestion-busy`, `draft-wrapped`, `slash-palette` and
+`slash-palette--filtered` — are all-LF
 with **zero**. The alternate screen is a
 good guess at which is which but not a rule: `omp--menu-dismissed.txt` paints an ordinary inline
 screen and is still all-CRLF, so re-measure rather than infer (`grep -c $'\r' <file>`). Any edit must
@@ -302,9 +382,30 @@ omp's `agent_status` stays `idle` while a picker is up; only the `ask` tool flip
 - **Menus are heterogeneous**: pointer rows (`❯ N.`), plain numbered rows, description sub-lines,
   and free-text escape rows ("Type something.", "Tell Claude what to change") all occur; footers
   are the most stable discriminator ("Enter to select/confirm", "Esc to cancel").
+
+
+## agy corpus (captured 2026-08-26, Antigravity CLI 1.1.17, sandbox panes)
+
+Byte-faithful `format:ansi` captures from running sandbox `agy` panes via `scripts/capture-fixture.sh <paneId> <name> 300`. Fastfetch system scrollback was trimmed, and all session identities were sanitized with length-preserving substitutions so row padding and column alignments stay byte-identical: account email (`developer.user@corp.test`) and session plan brain UUIDs (`00000000-0000-7000-8000-000000000000`).
+
+AGY renders a framed input box bounded by horizontal rules (`─`), with status / hint lines below the bottom border (`? for shortcuts`, `esc to cancel`, model/effort metadata). Its dialogs use standard footers (`Enter to select · ↑/↓ to navigate`, `Tab to amend · Esc to cancel`, `Enter to confirm · Esc to cancel`, `ctrl+g to edit`).
+
+| Fixture | State / what's in it | Herdr status |
+|---|---|---|
+| `agy--fresh-idle.txt` | Fresh session: Antigravity header logo and session info, idle input box between horizontal rules, statusline below (`? for shortcuts`) | `idle` |
+| `agy--working.txt` | Mid-turn: tool calls, `⣾ Loading...` spinner with tip line, input box with `esc to cancel` status line | `working` |
+| `agy--done.txt` | Completed turn: tool output, assistant summary, idle input box | `idle` |
+| `agy--select-menu.txt` | AskUserQuestion single-select dialog: question, numbered options 1..3 with description sub-lines, free-text row "4. Write-in...", "↑/↓ Navigate · enter Select · esc Skip" footer | `blocked` |
+| `agy--permission-bash.txt` | Bash execution permission dialog: command, "Requesting permission for: ls -la /tmp", options 1..4 (Yes / allow in conversation / persist / No), "↑/↓ Navigate · tab Amend · ctrl+g edit/expand command" footer | `blocked` |
+| `agy--permission-edit.txt` | File edit / multi-line write permission dialog: multi-line heredoc preview, options 1..4, "↑/↓ Navigate · tab Amend · ctrl+g edit/expand command · ctrl+r Review" footer | `blocked` |
+| `agy--trust-prompt.txt` | Workspace folder trust prompt: "Do you trust the contents of this project?", options "Yes, I trust this folder" / "No, exit", "↑/↓ Navigate · enter Confirm" footer | `blocked` |
+| `agy--plan-approval.txt` | Plan approval dialog: plan question, options 1..3 (Execute plan / Request changes / Cancel) + "4. Write-in...", "↑/↓ Navigate · enter Select · esc Skip · ctrl+r Review" footer | `blocked` |
+
+
 - **A free-text row's LABEL is not a stable marker**: it is the placeholder only while the box is
   empty. Type into the plan dialog's row 4 and the label becomes the user's own sentence. Its
   static `shift+tab to approve with this feedback` description is what identifies it in both
   states — and `❯` sitting on it means the field has focus, where every digit is swallowed as
   text rather than answering ([`PLAN_FEEDBACK_NOTES.md`](../../lib/grammar/PLAN_FEEDBACK_NOTES.md)).
   The row's DIGIT is install-dependent too (3 or 4), so it is read off the screen, never assumed.
+

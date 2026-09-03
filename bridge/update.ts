@@ -4,6 +4,7 @@ import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "./config.ts";
 import type { UpdateStatus } from "./types.ts";
+import type { UpdateRun } from "./update-run.ts";
 
 // Update-availability signal, surfaced on the (access-gated) /api/snapshot as `update`. Two
 // independent questions the running plugin can answer about itself:
@@ -23,45 +24,127 @@ import type { UpdateStatus } from "./types.ts";
 // the NotificationCoordinator/Snooze injection style.
 
 const SEMVER_TAG = /^v(\d+)\.(\d+)\.(\d+)$/;
+// The same anchor with an OPTIONAL `-prerelease` tail (`v1.0.0-beta.44`, `v1.0.0-rc.1`). Dot-separated
+// identifiers of `[0-9A-Za-z-]` only, anchored at both ends, so a ref name with a slash, an empty
+// identifier (`v1.0.0-beta..1`) or a bare trailing hyphen (`v1.0.0-`) is still rejected — remote refs
+// stay untrusted input.
+const PRERELEASE_SEMVER_TAG = /^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 // The upstream tag check is bounded — a hung request must never wedge the monitor's timer.
 const TAGS_TIMEOUT_MS = 10_000;
 // bridgeStale is read on every snapshot poll; recompute the on-disk stamp at most this often so a
 // busy poll loop doesn't stat the source tree dozens of times a second (the value barely changes).
 const STALE_TTL_MS = 5_000;
+// The digest window: after one update push, no second one for a day. Sibling of STALE_TTL_MS above —
+// a time-bounded recheck, not a new mechanism. Releases inside a closed window are folded, not dropped.
+const DIGEST_WINDOW_MS = 24 * 60 * 60 * 1000;
+// The patch window: a delta that is ONLY a patch bump rides a WEEKLY digest instead of the daily one.
+// It is a wait, not a mute — an install that only ever sees patch releases is still nudged, once a
+// week. A minor or major keeps the daily cadence, because it is the kind of release worth reading
+// notes for; a patch train is not, until enough of it has piled up to be worth one interruption.
+const DIGEST_PATCH_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// The earliest HOST-LOCAL hour a digest may be pushed. A release published at 03:00 waits for morning;
+// the update banner is already showing it, so nothing is lost by not buzzing a phone at night.
+const DIGEST_EARLIEST_HOUR = 9;
 
 // ── Pure helpers (unit-tested) ────────────────────────────────────────────────
 
-/** Parse a strict `vX.Y.Z` tag into its numeric parts, or null (prereleases like `v1.0.0-rc` and any
- *  non-release ref are rejected by the anchor). Remote ref names are untrusted input.
+/** Parse a STRICT `vX.Y.Z` tag into its numeric parts, or null. A prerelease (`v1.0.0-beta.44`) is
+ *  rejected here on purpose — this is the "strict releases only" question, and every caller that asks
+ *  it means it. Remote ref names are untrusted input. Ask {@link parsePrereleaseTag} for the wider one.
  *
- *  The consequence is deliberate and larger than one tag: for the WHOLE length of a prerelease train
- *  (`v1.0.0-beta.1…N`) no installed Collie sees an update banner at all, and the first banner a 0.x
- *  user gets is `v1.0.0` itself. Accepted — the banner only offers, and the 0.x→1.x crossing is
- *  consented to separately by `update --major`
- *  (ADR 0020, amended 2026-08-20). Anything outside Collie resolving "the newest release" must read
- *  git tags, never `releases/latest`: README → *Resolving the newest release from a script*. */
+ *  THE RULE THIS SERVES (ADR 0020, amended 2026-08-30): prerelease-following is a property of the
+ *  INSTALLED version, never a flag. An install on a strict release only ever sees strict release tags
+ *  — the banner and `update` both stay blind to the whole `v1.0.0-beta.N` train. An install that
+ *  carries a prerelease tail PREFERS strict releases too, and falls back to its own major's train
+ *  only when no strict release of that major is newer than it. The consent taken with a beta was to
+ *  the road TO its release, not to that major's prereleases forever — so the final release supersedes
+ *  every beta that led to it, and a LATER minor's prerelease is as invisible to a beta install as it
+ *  is to a stable one. See {@link followsTrain}. Crossing a major is still `update --major`, and
+ *  still strict-only.
+ *
+ *  Anything outside Collie resolving "the newest release" must read git tags, never
+ *  `releases/latest`: docs/upgrading.md -> *Resolving the newest release from a script*. */
 export function parseSemverTag(tag: string): [number, number, number] | null {
   const m = SEMVER_TAG.exec(tag.trim());
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
 }
 
-/** The numeric triple of a dotted version, with any `-prerelease` / `+build` tail dropped. The tail
- *  is reported separately because a prerelease sorts BELOW the release it leads to. */
+/** A tag parsed by {@link parsePrereleaseTag}: the numeric triple, plus the `-` tail kept apart
+ *  because a prerelease sorts BELOW the release it leads to. */
+export interface PrereleaseTag {
+  triple: [number, number, number];
+  /** `beta.44`, `rc.1` — or null when the tag is a strict release. */
+  prerelease: string | null;
+}
+
+/** Parse `vX.Y.Z` OR `vX.Y.Z-<tail>` into its parts, or null. The prerelease-aware sibling of
+ *  {@link parseSemverTag}, and just as strict about everything else: both ends are anchored, so
+ *  `v1.0.0-`, `v1.0.0-beta..1` and any ref with a slash are rejected. */
+export function parsePrereleaseTag(tag: string): PrereleaseTag | null {
+  const m = PRERELEASE_SEMVER_TAG.exec(tag.trim());
+  if (!m) return null;
+  const tail = m[4];
+  return {
+    triple: [Number(m[1]), Number(m[2]), Number(m[3])],
+    prerelease: tail === undefined ? null : tail,
+  };
+}
+
+/** The dotted version a parsed tag names (`1.0.0`, `1.0.0-beta.44`) — what {@link compareSemver} eats. */
+export function versionOfTag(parsed: PrereleaseTag): string {
+  const triple = parsed.triple.join(".");
+  return parsed.prerelease === null ? triple : `${triple}-${parsed.prerelease}`;
+}
+
+/** The numeric triple of a dotted version, with any `+build` tail dropped. The `-prerelease` tail is
+ *  reported separately, AS A STRING, because a prerelease sorts BELOW the release it leads to and
+ *  prereleases sort among themselves (`beta.9` < `beta.10`). Null means "no tail". */
 function versionParts(v: string) {
   const m = /^(\d+)\.(\d+)\.(\d+)(?:-([^+]*))?/.exec(v.trim());
-  if (!m) return { triple: [0, 0, 0] as const, prerelease: false };
+  if (!m) return { triple: [0, 0, 0] as const, prerelease: null };
+  const tail = m[4];
   return {
     triple: [Number(m[1]), Number(m[2]), Number(m[3])] as const,
-    prerelease: m[4] !== undefined && m[4] !== "",
+    prerelease: tail === undefined || tail === "" ? null : tail,
   };
+}
+
+const NUMERIC_IDENTIFIER = /^\d+$/;
+
+/**
+ * Compare two `-prerelease` tails by semver §11. Split on `.`; a numeric identifier compares
+ * numerically and sorts BELOW an alphanumeric one; alphanumerics compare as strings; and when one
+ * tail is a prefix of the other the shorter sorts first (`beta` < `beta.1`). `null` — no tail at all
+ * — sorts ABOVE every tail, which is what makes `1.0.0` an update from `1.0.0-beta.44`.
+ */
+function comparePrereleaseTails(a: string | null, b: string | null): number {
+  if (a === b) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  const xs = a.split(".");
+  const ys = b.split(".");
+  const shared = Math.min(xs.length, ys.length);
+  for (let i = 0; i < shared; i++) {
+    const x = xs[i] ?? "";
+    const y = ys[i] ?? "";
+    if (x === y) continue;
+    const xNum = NUMERIC_IDENTIFIER.test(x);
+    const yNum = NUMERIC_IDENTIFIER.test(y);
+    if (xNum && yNum) return Number(x) < Number(y) ? -1 : 1;
+    if (xNum !== yNum) return xNum ? -1 : 1;
+    return x < y ? -1 : 1;
+  }
+  if (xs.length === ys.length) return 0;
+  return xs.length < ys.length ? -1 : 1;
 }
 
 /**
  * Compare two dotted `X.Y.Z` versions (no leading `v`). Returns -1 / 0 / 1.
  *
- * The running version can be a PRERELEASE (`1.0.0-beta.5`) while every tag we compare it against is
- * strict, so the tail is parsed rather than fed to `Number` — and `1.0.0-beta.5` sorts below
- * `1.0.0`, which is what makes the release that follows a beta read as an upgrade.
+ * The running version can be a PRERELEASE (`1.0.0-beta.44`), and so can the tags it is compared
+ * against, so the tail is compared by semver §11 rather than reduced to "has one / has none":
+ * `1.0.0-beta.9` < `1.0.0-beta.10` < `1.0.0-rc.1` < `1.0.0`. That last step is what makes the release
+ * at the end of a beta train read as an upgrade from the last beta.
  */
 export function compareSemver(a: string, b: string): number {
   const pa = versionParts(a);
@@ -73,8 +156,7 @@ export function compareSemver(a: string, b: string): number {
   ] as const) {
     if (x !== y) return x < y ? -1 : 1;
   }
-  if (pa.prerelease === pb.prerelease) return 0;
-  return pa.prerelease ? -1 : 1;
+  return comparePrereleaseTails(pa.prerelease, pb.prerelease);
 }
 
 /** The major of a dotted version (`1.0.0-beta.5` → 1), or null when it names none (`unknown`). */
@@ -83,13 +165,61 @@ export function majorOf(version: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
-/** The newest release WITHIN `major`, dotted, or null — the target a routine `update` may take
+/** Whether a dotted version carries a `-prerelease` tail (`1.0.0-beta.44` -> true, `1.0.0` -> false,
+ *  `unknown` -> false). THE one predicate that decides whether an install follows a prerelease train:
+ *  the answer is a property of the installed version, never a flag (ADR 0020, amended 2026-08-30). */
+export function isPrereleaseVersion(version: string): boolean {
+  return versionParts(version).prerelease !== null;
+}
+
+/** The newest STRICT release WITHIN `major`, dotted, or null — the target a routine `update` may take
  *  (ADR 0020). */
 export function latestReleaseInMajor(tags: string[], major: number): string | null {
   return latestReleaseTag(tags.filter((t) => parseSemverTag(t)?.[0] === major));
 }
 
-/** The newest release of any major ABOVE `major`, dotted, or null. Crossing to it is consented to by
+/**
+ * Whether the prerelease TRAIN is in play for this install — THE one place the rule lives, shared by
+ * the banner ({@link latestUpdateInMajor}) and the `update` verb (`cli/update.ts`'s `planUpdate`), so
+ * the two can never drift.
+ *
+ * A prerelease install PREFERS strict releases and falls back to its train only when strict offers it
+ * nothing: `strictBest` is the highest strict release in the installed major, and the train applies
+ * only when there is none, or none newer than what is installed.
+ *
+ * The consent taken with a beta was to the road TO its release, not to that major's prereleases
+ * forever. So `1.0.0-beta.5` with `v1.0.0` published lands on `v1.0.0` and a sibling `v1.1.0-rc.1`
+ * stays as invisible to it as it is to every stable install; `1.0.0-beta.44` with only
+ * `v1.0.0-beta.45` published lands on `v1.0.0-beta.45`; and once `v1.0.0` exists it supersedes every
+ * beta that led to it, so beta.44 goes straight there and skips beta.45.
+ */
+export function followsTrain(installed: string, strictBest: string | null): boolean {
+  if (!isPrereleaseVersion(installed)) return false;
+  return strictBest === null || compareSemver(strictBest, installed) <= 0;
+}
+
+/**
+ * The newest tag inside `major` that an install running `installed` may take on a ROUTINE update —
+ * the ONE resolver behind both the banner ({@link UpdateMonitor}) and the `update` verb.
+ *
+ * A strict install sees strict releases only: byte-for-byte the old behaviour, and the regression to
+ * guard hardest. A prerelease install sees strict releases first and its own major's train only as a
+ * fallback — see {@link followsTrain} for the rule and why it is that way round.
+ */
+export function latestUpdateInMajor(tags: string[], major: number, installed: string): string | null {
+  const strict = latestReleaseInMajor(tags, major);
+  if (!followsTrain(installed, strict)) return strict;
+  let best: string | null = null;
+  for (const tag of tags) {
+    const parsed = parsePrereleaseTag(tag);
+    if (parsed === null || parsed.triple[0] !== major) continue;
+    const v = versionOfTag(parsed);
+    if (best === null || compareSemver(v, best) > 0) best = v;
+  }
+  return best;
+}
+
+/** The newest STRICT release of any major ABOVE `major`, dotted, or null. Crossing to it is consented to by
  *  `update --major`, never inherited — so it is reported separately from {@link latestReleaseInMajor}. */
 export function latestReleaseAboveMajor(tags: string[], major: number): string | null {
   return latestReleaseTag(
@@ -113,17 +243,89 @@ export function latestReleaseTag(tags: string[]): string | null {
   return best;
 }
 
-/** Whether a NEW-version push should fire: a strictly-newer release we haven't already notified for.
- *  Comparing against `current` (not the raw `latest`) means a restart after updating self-heals — the
- *  new `current` catches up and the condition falls false with no state reset. */
+/** Every version among `tags` that this install may routinely update TO and that is strictly newer
+ *  than `current`, oldest first. The list form of {@link latestUpdateInMajor} — same visibility rule
+ *  (own major only; that major's prereleases IFF this install is on one), so its last element IS what
+ *  that function returns whenever anything is newer. The digest needs the whole list, not the top of
+ *  it: a push has to be able to name the releases it folded. */
+export function updatesNewerThan(tags: string[], current: string): string[] {
+  const major = majorOf(current);
+  const train = major !== null && followsTrain(current, latestReleaseInMajor(tags, major));
+  const seen = new Set<string>();
+  for (const tag of tags) {
+    const parsed = parsePrereleaseTag(tag);
+    if (parsed === null) continue;
+    if (parsed.prerelease !== null && !train) continue;
+    if (major !== null && parsed.triple[0] !== major) continue;
+    const v = versionOfTag(parsed);
+    if (compareSemver(v, current) <= 0) continue;
+    seen.add(v);
+  }
+  return [...seen].toSorted(compareSemver);
+}
+
+/** Whether two dotted versions differ ONLY in their patch component — `1.3.0` vs `1.3.1`, but not
+ *  `1.3.0` vs `1.4.0` and not `1.0.0-beta.44` vs `1.0.0-beta.45` (same patch, different train stop). */
+function isPatchOnlyDelta(current: string, candidate: string): boolean {
+  const a = versionParts(current);
+  const b = versionParts(candidate);
+  if (a.triple[0] !== b.triple[0] || a.triple[1] !== b.triple[1]) return false;
+  return a.triple[2] !== b.triple[2];
+}
+
+/** The gate's answer: send nothing, or send a digest naming every folded version (oldest first). */
+export type NotifyVerdict = { send: false } | { send: true; versions: string[] };
+
+/**
+ * Whether a NEW-version push should fire, and what it should name. Pure, and time-aware: `now` is an
+ * argument, so the whole rule is testable without a timer.
+ *
+ * The push is a DAILY DIGEST, not a per-release announcement:
+ *   • nothing to say — no `latest`, or `latest` is not newer than `current`, or we already announced
+ *     it. Comparing against `current` (not the raw `latest`) means a restart after updating self-heals;
+ *   • the window — one push per {@link DIGEST_WINDOW_MS}, measured from `lastPushedAt`;
+ *   • the hour — never before {@link DIGEST_EARLIEST_HOUR} host-local;
+ *   • patch alone waits LONGER — a delta that is only a patch bump needs {@link DIGEST_PATCH_WINDOW_MS}
+ *     since the last push, not 24 h, so a patch train folds into a weekly digest. It is a wait, not a
+ *     mute: with no push on record it goes out at once, and a minor or major arriving meanwhile carries
+ *     the waiting patches with it. Releases held back this way are folded, never dropped;
+ *   • the payload is every version newer than what we last announced, so the operator can tell a patch
+ *     train from a feature release without opening the app.
+ */
 export function shouldNotify(a: {
   current: string;
   latest: string | null;
+  newerVersions: readonly string[];
   lastNotified: string | null;
-}): boolean {
-  if (!a.latest) return false;
-  if (compareSemver(a.latest, a.current) <= 0) return false;
-  return a.latest !== a.lastNotified;
+  lastPushedAt: string | null;
+  now: Date;
+}): NotifyVerdict {
+  if (!a.latest) return { send: false };
+  if (compareSemver(a.latest, a.current) <= 0) return { send: false };
+  if (a.latest === a.lastNotified) return { send: false };
+
+  const candidates = a.newerVersions.length > 0 ? [...a.newerVersions] : [a.latest];
+  const patchOnly = candidates.every((v) => isPatchOnlyDelta(a.current, v));
+
+  const pushedAt = a.lastPushedAt === null ? Number.NaN : Date.parse(a.lastPushedAt);
+  // An unreadable stamp reads as "no push yet" — the same fail-open a legacy record gets, and the one
+  // that lets a first-ever patch digest go out instead of waiting a week for a push that never was.
+  const window = patchOnly ? DIGEST_PATCH_WINDOW_MS : DIGEST_WINDOW_MS;
+  if (!Number.isNaN(pushedAt) && a.now.getTime() - pushedAt < window) return { send: false };
+  if (a.now.getHours() < DIGEST_EARLIEST_HOUR) return { send: false };
+
+  const announced = a.lastNotified;
+  const folded =
+    announced === null ? candidates : candidates.filter((v) => compareSemver(v, announced) > 0);
+  return { send: true, versions: folded.length > 0 ? folded : [a.latest] };
+}
+
+/** The push body for a digest: one version names itself, several name the count AND every version —
+ *  a count alone can't tell a patch train from a feature release. */
+export function updateDigestBody(current: string, versions: readonly string[]): string {
+  const first = versions[0];
+  if (versions.length <= 1) return `Collie ${first ?? current} is available`;
+  return `${versions.length} updates since ${current}: ${versions.join(", ")}`;
 }
 
 /** A stable, comparable stamp of source files by (path, mtime, size). Order-independent. Equality is
@@ -169,28 +371,118 @@ export function githubReleaseUrl(repo: string, version: string): string {
   return `https://github.com/${repo}/releases/tag/v${version}`;
 }
 
-/** Anonymous HTTPS fetch of a GitHub repo's tags → their names (`["v0.11.0", …]`). Throws on a
- *  non-OK response or timeout so the caller keeps its previous result and retries next tick. */
-export function githubTagsFetcher(repo: string): () => Promise<string[]> {
-  const url = `https://api.github.com/repos/${repo}/tags?per_page=100`;
+/** One tag as GitHub's `/tags` endpoint reports it: the ref name and the commit it points at. */
+export interface ApiTag {
+  name: string;
+  /** `commit.sha` — carried so the CLI can fill a `ReleaseTag` without a second request. */
+  sha: string;
+}
+
+/** The endpoint the banner AND the binary updater read — never `releases/latest`, which hides
+ *  prereleases and stalls a whole beta train (docs/upgrading.md). */
+export function githubTagsUrl(repo: string): string {
+  return `https://api.github.com/repos/${repo}/tags?per_page=100`;
+}
+
+/**
+ * GitHub's `/tags` payload → {@link ApiTag}[]. The ONE parser of that document: the bridge's banner
+ * fetches it over `fetch`, and `collie update`'s binary path fetches it through the CLI's `net`
+ * seam, and both land here (M14/01 §2.3).
+ *
+ * A tag with no readable name is dropped, and so is one with no `commit.sha`: an EMPTY sha is worse
+ * than a missing tag, because `planUpdate`'s "already there" arm compares the candidate's commit
+ * against the installed head — and on a binary install that head is `""`, so an empty sha would
+ * match it and report a real update as "already current".
+ */
+export function parseTagsResponse(data: JsonValue): ApiTag[] {
+  if (!Array.isArray(data)) return [];
+  return data.flatMap((t) => {
+    if (t === null || typeof t !== "object" || Array.isArray(t)) return [];
+    if (typeof t.name !== "string" || t.name === "") return [];
+    const commit = t.commit;
+    if (commit === null || typeof commit !== "object" || Array.isArray(commit)) return [];
+    if (typeof commit.sha !== "string" || commit.sha === "") return [];
+    return [{ name: t.name, sha: commit.sha }];
+  });
+}
+
+/** Anonymous HTTPS fetch of a GitHub repo's tags. Throws on a non-OK response or timeout so the
+ *  caller keeps its previous result and retries next tick. */
+export function githubTagsFetcher(repo: string): () => Promise<ApiTag[]> {
+  const url = githubTagsUrl(repo);
   return async () => {
     const res = await fetch(url, {
       headers: { accept: "application/vnd.github+json", "user-agent": "collie-update-check" },
       signal: AbortSignal.timeout(TAGS_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`github tags: HTTP ${res.status}`);
-    // SAFETY: `Response.json()` output IS a JsonValue by construction; every tag name below is
-    // checked to be a string before it is kept.
-    const data = (await res.json()) as JsonValue;
-    if (!Array.isArray(data)) return [];
-    return data
-      .map((t) =>
-        t !== null && typeof t === "object" && !Array.isArray(t) && typeof t.name === "string"
-          ? t.name
-          : "",
-      )
-      .filter(Boolean);
+    // SAFETY: `Response.json()` output IS a JsonValue by construction; every field below is checked
+    // before it is kept.
+    return parseTagsResponse((await res.json()) as JsonValue);
   };
+}
+
+// ── The per-release integrity manifest (M14/01 §2.1) ─────────────────────────
+// One document per release, attached to the GitHub Release and copied into every tarball as
+// `RELEASE.json`. It carries NO URLs: every download URL is constructed from (repo, version, name),
+// so a manifest can never redirect a download to another host. The trust boundary stays "which
+// repo", which is exactly what COLLIE_UPDATE_REPO names.
+
+/** The schema this build understands. An unknown one aborts loudly — never "try anyway". */
+export const MANIFEST_SCHEMA_VERSION = 1;
+
+export interface ReleaseArtifact {
+  /** The release asset's filename, e.g. `collie-1.1.0-linux-x64.tar.gz`. */
+  name: string;
+  /** The canonical platform id (`linux-x64`, `macos-arm64`) — see `cli/update.ts`'s `platformId`. */
+  platform: string;
+  sha256: string;
+  /** Byte length, cross-checked against the download. Null when the manifest omits it. */
+  size: number | null;
+  /** The single top-level directory inside the tarball — asserted after extraction. */
+  payloadRoot: string;
+}
+
+export interface ReleaseManifest {
+  schemaVersion: number;
+  version: string;
+  tag: string;
+  artifacts: ReleaseArtifact[];
+}
+
+export type ManifestVerdict =
+  | { ok: true; manifest: ReleaseManifest }
+  /** Readable JSON, wrong shape — a truncated or foreign document. */
+  | { ok: false; reason: "unreadable" }
+  /** A schema this build does not understand. `schemaVersion` is reported so the message can say so. */
+  | { ok: false; reason: "schema"; schemaVersion: number };
+
+/** The release manifest, parsed and schema-gated. Unknown FIELDS are ignored — additive is free;
+ *  a `schemaVersion` we do not know is not. */
+export function parseReleaseManifest(data: JsonValue): ManifestVerdict {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return { ok: false, reason: "unreadable" };
+  const schema = data.schemaVersion;
+  if (typeof schema !== "number") return { ok: false, reason: "unreadable" };
+  if (schema !== MANIFEST_SCHEMA_VERSION) return { ok: false, reason: "schema", schemaVersion: schema };
+  const { version, tag, artifacts } = data;
+  if (typeof version !== "string" || typeof tag !== "string" || !Array.isArray(artifacts)) {
+    return { ok: false, reason: "unreadable" };
+  }
+  const parsed = artifacts.flatMap((a) => {
+    if (a === null || typeof a !== "object" || Array.isArray(a)) return [];
+    if (typeof a.name !== "string" || typeof a.platform !== "string" || typeof a.sha256 !== "string") return [];
+    if (typeof a.payloadRoot !== "string") return [];
+    return [
+      {
+        name: a.name,
+        platform: a.platform,
+        sha256: a.sha256,
+        size: typeof a.size === "number" ? a.size : null,
+        payloadRoot: a.payloadRoot,
+      },
+    ];
+  });
+  return { ok: true, manifest: { schemaVersion: schema, version, tag, artifacts: parsed } };
 }
 
 // ── Persistence (edge-trigger de-dupe across restarts) ────────────────────────
@@ -199,6 +491,7 @@ export function githubTagsFetcher(repo: string): () => Promise<string[]> {
  *  same version. Its own tiny store (NOT piggybacked on push-subscriptions.json), owner-only. */
 export class UpdateStateStore {
   private lastVersion: string | null = null;
+  private pushedAt: string | null = null;
   private readonly file: string;
 
   constructor(private readonly cfg: Config) {
@@ -207,12 +500,16 @@ export class UpdateStateStore {
 
   async load(): Promise<void> {
     try {
-      // SAFETY: `Bun.file().json()` output IS a JsonValue by construction; `lastNotified` is
-      // checked before it is believed.
+      // SAFETY: `Bun.file().json()` output IS a JsonValue by construction; both fields are checked
+      // before they are believed.
       const raw = (await Bun.file(this.file).json()) as JsonValue;
-      const last =
-        raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw.lastNotified : undefined;
+      const rec = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+      const last = rec === null ? undefined : rec.lastNotified;
+      const pushed = rec === null ? undefined : rec.lastPushedAt;
       this.lastVersion = typeof last === "string" ? last : null;
+      // A LEGACY record carries no timestamp. It reads as "no push yet" — the window opens at once
+      // rather than crashing the monitor or pinning it shut for a day.
+      this.pushedAt = typeof pushed === "string" ? pushed : null;
     } catch {
       /* none saved yet */
     }
@@ -222,13 +519,21 @@ export class UpdateStateStore {
     return this.lastVersion;
   }
 
-  async setLastNotified(version: string): Promise<void> {
+  /** When the last update push went out, ISO-8601, or null when none ever did. */
+  lastPushedAt(): string | null {
+    return this.pushedAt;
+  }
+
+  async setLastNotified(version: string, pushedAt: string): Promise<void> {
     this.lastVersion = version;
+    this.pushedAt = pushedAt;
     await mkdir(this.cfg.stateDir, { recursive: true, mode: 0o700 });
     // Atomic write (tmp + rename), matching Push/NotifyPrefs/Snooze — a crash mid-write can't leave a
     // corrupt file that would re-nag (or worse) on the next load.
     const tmp = `${this.file}.tmp`;
-    await writeFile(tmp, JSON.stringify({ lastNotified: version }, null, 2), { mode: 0o600 });
+    await writeFile(tmp, JSON.stringify({ lastNotified: version, lastPushedAt: pushedAt }, null, 2), {
+      mode: 0o600,
+    });
     await rename(tmp, this.file);
   }
 }
@@ -238,7 +543,9 @@ export class UpdateStateStore {
 /** Persistence seam — just what the monitor needs from {@link UpdateStateStore}. */
 export interface UpdateStore {
   lastNotified(): string | null;
-  setLastNotified(version: string): Promise<void>;
+  /** ISO-8601 stamp of the last push, or null — the digest window is measured from it. */
+  lastPushedAt(): string | null;
+  setLastNotified(version: string, pushedAt: string): Promise<void>;
 }
 
 export interface UpdateMonitorDeps {
@@ -249,20 +556,37 @@ export interface UpdateMonitorDeps {
   current: string;
   /** The bridge source stamp captured at process start (see {@link bridgeStampSync}). */
   startupStamp: string;
-  /** Fetch the upstream release tag names (throws on failure — the monitor is fail-soft). */
-  fetchTags: () => Promise<string[]>;
+  /** Fetch the upstream release tags (throws on failure — the monitor is fail-soft). One fetcher and
+   *  one JSON parser, shared with `collie update`'s binary path; this consumer maps to names at its
+   *  own edge and its pure resolver chain is untouched. */
+  fetchTags: () => Promise<readonly ApiTag[]>;
   /** Recompute the on-disk bridge source stamp for the staleness check. */
   bridgeStamp: () => string;
+  /** How this Collie is installed, probed once at startup — it cannot change under a running process
+   *  (an update restarts the service), so the monitor just reports it. */
+  installKind: UpdateStatus["installKind"];
   store: UpdateStore;
   now: () => number;
   /** Whether update pushes are enabled (the `updates` notify pref — the user's off-switch). */
   updatesEnabled: () => boolean;
-  /** Fire the update-available push for `latest`. */
-  notify: (latest: string) => void;
+  /** Fire the update-available push for the digest — every version folded into it, oldest first.
+   *  Never empty; the last element is the newest available version. */
+  notify: (versions: string[]) => void;
+  /**
+   * The detached updater's run record, read from disk (M15/04). Injected rather than read here so
+   * the monitor stays a pure poller over seams — and read PER CALL, never cached, because the file
+   * is written by another process and the whole point is to notice its transitions.
+   *
+   * **The bridge reads it at startup through this.** A bridge coming up mid-update must resume
+   * reporting `verifying` or `rolled-back`, not come up with nothing to say: the operator taps
+   * update, the app goes blank, and it comes back claiming there was no update.
+   */
+  runState: () => UpdateRun | null;
 }
 
 export class UpdateMonitor {
   private latest: string | null = null;
+  private newerVersions: string[] = [];
   private majorAvailable: string | null = null;
   private checkedAt: number | null = null;
   private staleAt = Number.NEGATIVE_INFINITY;
@@ -293,28 +617,52 @@ export class UpdateMonitor {
   private async runCheck(): Promise<void> {
     let tags: string[];
     try {
-      tags = await this.deps.fetchTags();
+      tags = (await this.deps.fetchTags()).map((t) => t.name);
     } catch {
       return; // network / timeout — keep prior state, retry next tick
     }
-    // Two answers, never one (ADR 0020): the newest release the operator can take on a routine
-    // `update` — which stays inside the running major — and, separately, whether a MAJOR is out at
-    // all. A version we can't parse a major out of (`unknown`) falls back to the old "newest of
+    // Two answers, never one (ADR 0020): the newest tag the operator can take on a routine `update` —
+    // which stays inside the running major, and which includes that major's prereleases IFF this
+    // install is itself on one — and, separately, whether a MAJOR is out at all. The banner and the
+    // verb share `latestUpdateInMajor`, so the verb can never land where the banner would not have
+    // announced. A version we can't parse a major out of (`unknown`) falls back to the old "newest of
     // anything", because an install that can't name its major can't be gated on it either.
     const major = majorOf(this.deps.current);
-    this.latest = major === null ? latestReleaseTag(tags) : latestReleaseInMajor(tags, major);
+    this.latest =
+      major === null ? latestReleaseTag(tags) : latestUpdateInMajor(tags, major, this.deps.current);
     this.majorAvailable = major === null ? null : latestReleaseAboveMajor(tags, major);
+    // The whole list, not just its top: a digest has to be able to NAME the releases it folded.
+    this.newerVersions = updatesNewerThan(tags, this.deps.current);
     this.checkedAt = this.deps.now();
 
     const { current, store } = this.deps;
-    if (
-      this.latest &&
-      this.deps.updatesEnabled() &&
-      shouldNotify({ current, latest: this.latest, lastNotified: store.lastNotified() })
-    ) {
-      await store.setLastNotified(this.latest);
-      this.deps.notify(this.latest);
-    }
+    // The snapshot above is already updated — suppressing a push must never suppress state.
+    if (!this.deps.updatesEnabled()) return;
+    const verdict = shouldNotify({
+      current,
+      latest: this.latest,
+      newerVersions: this.newerVersions,
+      lastNotified: store.lastNotified(),
+      lastPushedAt: store.lastPushedAt(),
+      now: new Date(this.deps.now()),
+    });
+    if (!verdict.send) return;
+    await store.setLastNotified(verdict.versions[verdict.versions.length - 1] ?? current, this.nowIso());
+    this.deps.notify(verdict.versions);
+  }
+
+  private nowIso(): string {
+    return new Date(this.deps.now()).toISOString();
+  }
+
+  /**
+   * "Remind me next digest" — the dismiss seam the PWA can call on the update card. It closes the
+   * window and marks the current `latest` as announced, so the next push waits for BOTH a newer
+   * release and a fresh window. It is not a mute: `updatesEnabled()` remains the only off switch.
+   */
+  async snoozeDigest(): Promise<void> {
+    if (this.latest === null) return;
+    await this.deps.store.setLastNotified(this.latest, this.nowIso());
   }
 
   /** Recompute (throttled) whether the running process is behind the on-disk bridge source. */
@@ -329,7 +677,8 @@ export class UpdateMonitor {
   /** The snapshot-facing status. Cheap: `latest` is cached from the last check, `bridgeStale` throttled. */
   status(): UpdateStatus {
     const { current } = this.deps;
-    return {
+    const run = this.deps.runState();
+    const status: UpdateStatus = {
       current,
       latest: this.latest,
       latestUrl: this.latest ? githubReleaseUrl(this.deps.repo, this.latest) : null,
@@ -339,8 +688,16 @@ export class UpdateMonitor {
         this.majorAvailable === null
           ? null
           : githubReleaseUrl(this.deps.repo, this.majorAvailable),
+      installKind: this.deps.installKind,
       bridgeStale: this.bridgeStale(),
       checkedAt: this.checkedAt,
+      // The whole list, oldest first — the card names what a single update folds in (M15/05). Empty
+      // until the first successful check, which reads as "nothing to name", the same as up to date.
+      newerVersions: this.newerVersions,
     };
+    // Assigned, never conditionally spread: an install that has never updated through the runner
+    // must carry NO `run` key rather than one whose value is `undefined`.
+    if (run !== null) status.run = run;
+    return status;
   }
 }

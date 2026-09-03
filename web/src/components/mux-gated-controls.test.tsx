@@ -1,10 +1,12 @@
 import type { ComponentProps } from "react";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
 
 import { server } from "@/test/setup";
 import { fixtureAgents } from "@/test/handlers";
+import { withHeaderHost } from "@/test/header-host";
 import { __resetOperatorCommands } from "@/lib/operator-config";
 import type { MuxCapability, MuxConfig } from "@/lib/types";
 import { AgentChat } from "./agent-chat";
@@ -248,16 +250,16 @@ describe("Pane actions — renamePane and closePane", () => {
     expect(screen.getByText("Close pane")).toBeInTheDocument();
   });
 
-  it("offers 'Show in terminal' only where the multiplexer can move focus", async () => {
+  it("offers 'Focus in <mux>' only where the multiplexer can move focus", async () => {
     declares({ renamePane: true, closePane: true, setFocus: true });
     paneSheet();
-    expect(await screen.findByText("Show in terminal")).toBeInTheDocument();
+    expect(await screen.findByText("Focus in reference")).toBeInTheDocument();
   });
 
-  it("drops 'Show in terminal' where it is declared absent — the other rows stay", async () => {
+  it("drops 'Focus in <mux>' where it is declared absent — the other rows stay", async () => {
     declares({ renamePane: true, closePane: true, setFocus: false });
     paneSheet();
-    await waitFor(() => expect(screen.queryByText("Show in terminal")).toBeNull());
+    await waitFor(() => expect(screen.queryByText("Focus in reference")).toBeNull());
     expect(screen.getByText("Rename")).toBeInTheDocument();
     expect(screen.getByText("Close pane")).toBeInTheDocument();
   });
@@ -343,14 +345,22 @@ function chat(agentOver: Partial<(typeof fixtureAgents)[number]> = {}) {
     onBack: vi.fn(),
     onSelect: vi.fn(),
   };
-  const router = createMemoryRouter([{ path: "/", element: <AgentChat {...props} /> }]);
+  const router = createMemoryRouter([{ path: "/", element: withHeaderHost(<AgentChat {...props} />) }]);
   render(<RouterProvider router={router} />);
+}
+
+// History is a ROW in the pane's actions sheet now, not a header icon — the header spends one ⋮ on
+// the whole menu. So the capability gate is read through that door.
+async function openPaneMenu() {
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Pane actions" }));
 }
 
 describe("Pane history — agentSessionRef", () => {
   it("is reachable when the multiplexer can name an agent's session", async () => {
     declares({ agentSessionRef: true });
     chat();
+    await openPaneMenu();
     expect(await screen.findByRole("button", { name: "Conversation history" })).toBeInTheDocument();
   });
 
@@ -361,12 +371,14 @@ describe("Pane history — agentSessionRef", () => {
     );
     chat();
     expect(await screen.findByText(/keeps no agent session log/i)).toBeInTheDocument();
+    await openPaneMenu();
     expect(screen.queryByRole("button", { name: "Conversation history" })).toBeNull();
   });
 
   it("says nothing when the capability is there — no Herdr operator gains an explanation", async () => {
     declares({ agentSessionRef: true });
     chat();
+    await openPaneMenu();
     await screen.findByRole("button", { name: "Conversation history" });
     expect(screen.queryByText(/keeps no agent session log/i)).toBeNull();
   });

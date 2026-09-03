@@ -147,6 +147,52 @@ export function parseEnvFile(text: string): EnvVars {
   return out;
 }
 
+/**
+ * `text` with every name in `vars` assigned: an assignment already there is REPLACED where it
+ * stands, a new one is appended.
+ *
+ * In place rather than appended-and-shadowed, because a `.env` is a file the operator reads and
+ * edits: two `COLLIE_MUX=` lines where the last one silently wins is a file that lies to whoever
+ * opens it next. Comments, blank lines and every other setting survive untouched — this is the only
+ * writer of a file nobody else in Collie writes, and it must not become a rewriter of one.
+ */
+export function upsertEnvVars(text: string, vars: EnvVars): string {
+  const lines = text === "" ? [] : text.split("\n");
+  const pending = new Map(Object.entries(vars));
+  const written = lines.map((line) => {
+    const m = /^(\s*)(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=/.exec(line);
+    const key = m?.[2];
+    if (key === undefined || !pending.has(key)) return line;
+    const value = pending.get(key)!;
+    pending.delete(key);
+    return `${m?.[1] ?? ""}${key}=${quoteEnvValue(value)}`;
+  });
+  if (pending.size > 0) {
+    // Past the last line that says anything, so an appended key lands under the file's content
+    // rather than under whatever blank lines the last editor left at the bottom.
+    written.length = written.findLastIndex((line) => line.trim() !== "") + 1;
+    for (const [key, value] of pending) written.push(`${key}=${quoteEnvValue(value)}`);
+  }
+  if (written.length === 0) return "";
+  // Exactly one trailing newline, whatever the file arrived with: the next append must not land on
+  // the end of somebody else's assignment.
+  return `${written.join("\n").replace(/\n+$/u, "")}\n`;
+}
+
+/** The bare characters {@link parseEnvFile} reads back unquoted, exactly as it reads them. */
+const BARE_ENV_VALUE = /^[A-Za-z0-9_@%+=:,./-]*$/;
+
+/**
+ * A value as {@link parseEnvFile} would read it back — the round trip is the contract, and
+ * `context.test.ts` pins it. Double quotes rather than single, because the escapes the parser
+ * already understands live in that branch and a single-quoted value has no way to carry a `'`.
+ */
+function quoteEnvValue(value: string): string {
+  if (BARE_ENV_VALUE.test(value)) return value;
+  const escaped = value.replaceAll(/([\\"$`])/gu, "\\$1").replaceAll("\n", "\\n").replaceAll("\r", "\\r");
+  return `"${escaped}"`;
+}
+
 // ── Config dir ───────────────────────────────────────────────────────────────
 
 export interface ConfigDirDeps {
@@ -164,9 +210,15 @@ export interface ConfigDirResult {
 }
 
 /**
- * Injected env → Herdr CLI → Herdr's conventional path (only if it has a `.env`) → `~/.config/collie`.
- * Mirrors the pre-shim `collie-ctl.sh` including the legacy-`.env`-ignored note, so config applied
- * one way is never silently dropped the other.
+ * Injected env → the Herdr CLI's answer → Herdr's conventional path → `~/.config/collie`, where
+ * every step past the injected one counts ONLY when that directory actually holds a `.env`. Mirrors
+ * the pre-shim `collie-ctl.sh` including the legacy-`.env`-ignored note, so config applied one way
+ * is never silently dropped the other.
+ *
+ * **A dir with no `.env` is not in use, and may not out-rank one that is.** The `.env` test used to
+ * apply to the conventional path and not to Herdr's answer, so a `herdr` binary merely present on
+ * PATH captured the config dir of a Collie it does not manage. Nothing changes for a real
+ * Herdr-managed install, where the plugin dir is the one holding the `.env`.
  *
  * **A named instance short-circuits the middle of that chain.** `deps.env` is the PROCESS env, read
  * before any `.env` merge, so a `COLLIE_INSTANCE` here is the operator's own — see the amendment at
@@ -202,11 +254,18 @@ export function resolveConfigDir(deps: ConfigDirDeps): ConfigDirResult {
           "HERDR_PLUGIN_CONFIG_DIR explicitly. Refusing to fall back to another instance's config.",
       );
     }
+    // Herdr's answer wins only when it is IN USE. A `herdr` binary anywhere on PATH answers this
+    // question for every Collie on the host, including one Herdr does not manage — and trusting it
+    // unconditionally made a binary install ignore the `~/.config/collie/.env` its own installer
+    // had just told the operator to write, under a note that called that file legacy.
     const asked = deps.askHerdr()?.trim();
-    if (asked) return asked;
+    if (asked && deps.fileExists(join(asked, ".env"))) return asked;
     const conventional = conventionalFor("");
     if (deps.fileExists(join(conventional, ".env"))) return conventional;
-    return legacy;
+    if (deps.fileExists(join(legacy, ".env"))) return legacy;
+    // No `.env` anywhere: nothing is in use, so there is nothing to get wrong. Herdr's answer is
+    // still the best guess at where a config would go on a host that runs Herdr.
+    return asked || legacy;
   }
 }
 
@@ -377,6 +436,40 @@ export function resolveHome(env: Environment): string {
   }
 }
 
+/** A variable name shaped like a credential — its value never appears in a diagnostic. */
+const SENSITIVE_ENV_NAME = /(KEY|TOKEN|SECRET|PASSWORD|PRIVATE)$/;
+
+/** How many per-variable shadow notes {@link shadowNotes} prints before it collapses into a summary. */
+const SHADOW_NOTE_CAP = 5;
+
+/**
+ * The stderr lines to say when a `.env` value SILENTLY overrides a different value the ambient
+ * process environment already carried — `.env` still wins (see {@link loadContext}'s merge
+ * comment), this only stops that win from being silent.
+ *
+ * A name absent from `ambient`, or equal in both, says nothing: nothing was shadowed. A name shaped
+ * like a credential ({@link SENSITIVE_ENV_NAME}) is named but never valued, so the note itself never
+ * becomes a leak. Past {@link SHADOW_NOTE_CAP} differing names — an `EnvironmentFile=` re-exporting
+ * the same `.env`, say — the notes collapse into one summary line rather than flooding stderr.
+ */
+export function shadowNotes(ambient: Environment, fromFile: EnvVars): string[] {
+  const shadowed = Object.keys(fromFile).filter((key) => {
+    const before = ambient[key];
+    return before !== undefined && before !== fromFile[key];
+  });
+  const lines = shadowed.slice(0, SHADOW_NOTE_CAP).map((key) => {
+    if (SENSITIVE_ENV_NAME.test(key)) {
+      return `note: ${key} from your environment is shadowed by .env.`;
+    }
+    return `note: ${key}=${ambient[key]} from your environment is shadowed by .env (${fromFile[key]}).`;
+  });
+  const remaining = shadowed.length - lines.length;
+  if (remaining > 0) {
+    lines.push(`note: ${remaining} more environment variable${remaining === 1 ? "" : "s"} shadowed by .env.`);
+  }
+  return lines;
+}
+
 /**
  * Resolve the context once. `warn` receives diagnostics destined for stderr (the caller owns the
  * stream, so this stays testable).
@@ -399,7 +492,9 @@ export function loadContext(warn: (line: string) => void = (l) => console.error(
   if (dotenv !== null) {
     const tightened = tightenEnvFile(envPath, diskEnvPerms);
     if (tightened !== null) warn(tightened);
-    Object.assign(env, parseEnvFile(dotenv));
+    const fromFile = parseEnvFile(dotenv);
+    for (const line of shadowNotes(process.env, fromFile)) warn(line);
+    Object.assign(env, fromFile);
   }
 
   // Resolved from the MERGED env, so a `.env` may name the instance — the second instance's config

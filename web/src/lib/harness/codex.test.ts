@@ -6,10 +6,11 @@ import { parseAnsi } from "../ansi";
 import { splitLines } from "../blocks";
 import { codexAdapter } from "./codex";
 import { locateComposer, stripChrome } from "./codex/chrome";
-import { lineText } from "./codex/markers";
+import { isStatusRow, lineText, PLACEHOLDER } from "./codex/markers";
 import { detectApprovalRegion } from "./codex/approval";
 import { detectAskRegion } from "./codex/ask";
 import { detectTrustRegion } from "./codex/trust";
+import { decorateCodexDisplay } from "./codex/display";
 import { describeAdapterConformance } from "./conformance";
 
 const PANES_DIR = join(import.meta.dirname, "..", "..", "fixtures", "panes");
@@ -36,7 +37,14 @@ const PINNED = [
   "codex--draft-wrapped.txt",
   "codex--draft.txt",
   "codex--fresh-idle.txt",
+  "codex--submitted-fill-labelled-rule.txt",
   "codex--trust-prompt.txt",
+  "codex--v0150-custom-status.txt",
+  "codex--v0150-draft-wrapped.txt",
+  "codex--v0150-idle.txt",
+  "codex--v0150-nogit-idle.txt",
+  "codex--v0150-paste-placeholder.txt",
+  "codex--v0151-draft-indented-line.txt",
   "codex--working.txt",
 ];
 
@@ -71,7 +79,13 @@ function fixtureLines(name: string) {
 }
 
 describe("composerReady — the gate the reply path pre-flights on", () => {
-  it.each(["codex--fresh-idle.txt", "codex--draft.txt", "codex--draft-wrapped.txt", "codex--working.txt"])(
+  it.each([
+    "codex--fresh-idle.txt",
+    "codex--draft.txt",
+    "codex--draft-wrapped.txt",
+    "codex--v0151-draft-indented-line.txt",
+    "codex--working.txt",
+  ])(
     "%s: the composer is on screen ⇒ true",
     (name) => {
       expect(codexAdapter.composerReady!(fixtureLines(name))).toBe(true);
@@ -98,10 +112,46 @@ describe("chrome", () => {
     expect(codexAdapter.extractInputDraft(fixtureLines("codex--fresh-idle.txt"))).toBeNull();
   });
 
+  it("keeps the same words when they are an ordinary non-dim draft", () => {
+    // The placeholder's text is something an operator may deliberately type. Codex tells the two
+    // apart by painting its empty hint dim, so the dim style — not the words — is what makes the
+    // box empty.
+    const dim = fixtureLines("codex--fresh-idle.txt")
+      .flatMap((line) => line.segments)
+      .find((segment) => segment.text.includes(PLACEHOLDER))?.dim;
+    expect(dim).toBe(true);
+
+    const typed = splitLines(
+      parseAnsi(
+        [
+          "some output",
+          "",
+          `\u203a ${PLACEHOLDER}`,
+          "",
+          "  model-example · demo-project · Context 99% left",
+        ].join("\n"),
+      ),
+    );
+    expect(codexAdapter.extractInputDraft(typed)).toBe(PLACEHOLDER);
+  });
+
   it("joins a wrapped draft back into the typed sentence", () => {
     expect(codexAdapter.extractInputDraft(fixtureLines("codex--draft-wrapped.txt"))).toBe(
       "please summarize the architecture of this project in detail covering every module and its purpose and how they interact together and also explain the security model plus the deployment story across each environment we support today",
     );
+  });
+
+  it("binds composerPrompt to the whole wrapped draft run, not just the `\u203a` row", () => {
+    // The bridge matches the region against a bounded tail window. Naming only the first `\u203a`
+    // row would leave the wrap rows below it unmatched and 409 every legitimate sweep.
+    const region = codexAdapter.composerPrompt!(fixtureLines("codex--draft-wrapped.txt"))!;
+    const rows = region.split("\n");
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows[0]).toMatch(/^\u203a please summarize the architecture/);
+    expect(rows.slice(1).every((row) => /^ {2}\S/.test(row))).toBe(true);
+    expect(rows.at(-1)).toContain("we support today");
+    // Trailing layout blanks between the draft and the status row stay out of the region.
+    expect(rows.at(-1)!.trim()).not.toBe("");
   });
 
   it("re-surfaces the status row and pairs composerPrompt with the ready screens", () => {
@@ -130,6 +180,56 @@ describe("chrome", () => {
     expect(locateComposer(splitLines(parseAnsi(real)))).not.toBeNull();
   });
 
+  it("locates the v0.150.1 status row with Context directly after the model", () => {
+    const screen = [
+      "› a message waiting to send",
+      "",
+      "  gpt-5.6-sol high · Context 68% left · main · +295 -1 · weekly 94% left",
+    ].join("\n");
+    const lines = splitLines(parseAnsi(screen));
+
+    expect(locateComposer(lines)).not.toBeNull();
+    expect(codexAdapter.composerReady!(lines)).toBe(true);
+    expect(codexAdapter.extractInputDraft(lines)).toBe("a message waiting to send");
+  });
+
+  it("a wrapped row whose own text starts with spaces is still a continuation", () => {
+    // The shape, pinned without a capture: two spaces of gutter, then the operator's own text,
+    // which may itself begin with spaces. `codex--v0151-draft-indented-line.txt` below is the
+    // real render of it and carries the reasoning.
+    const screen = [
+      "\u203a move everything across including the images and",
+      "    then take the originals down",
+      "",
+      "  gpt-5.6-sol high · /home/user · Context 50% left",
+    ].join("\n");
+    const lines = splitLines(parseAnsi(screen));
+
+    expect(locateComposer(lines)).not.toBeNull();
+    expect(codexAdapter.composerReady!(lines)).toBe(true);
+    expect(codexAdapter.extractInputDraft(lines)).toBe(
+      "move everything across including the images and then take the originals down",
+    );
+  });
+
+  it("locates a draft whose continuation row is indented deeper than the gutter", () => {
+    // The gutter is two spaces; what FOLLOWS it is the operator's own text, and that text may
+    // itself begin with spaces. This capture is the everyday way it happens: a draft carrying a
+    // hard line break (shift+enter, one tap on a phone keyboard) whose next line starts with two
+    // spaces paints a FOUR-space continuation row. `/^ {2}\\S/` demanded a non-space at column 2,
+    // read that healthy row as foreign, and locateComposer returned null — so the pane refused
+    // EVERY send with "the agent's input box isn't on screen" for as long as the draft sat there.
+    // A deadlock, not a transient: the refusal is itself what keeps the draft from being sent, so
+    // the pane never recovers on its own.
+    const lines = fixtureLines("codex--v0151-draft-indented-line.txt");
+
+    expect(locateComposer(lines)).not.toBeNull();
+    expect(codexAdapter.composerReady!(lines)).toBe(true);
+    expect(codexAdapter.extractInputDraft(lines)).toBe(
+      "please move all the images across to the new blog then take the originals down once the copy is verified",
+    );
+  });
+
   it("a draft that wraps past 8 rows is still a composer", () => {
     // The old bound of 8 stranded a phone wrap: locateComposer returned null and the pane
     // reported a dialog. 1 prompt + 8 continuations is 9 rows, the first case that failed.
@@ -153,6 +253,160 @@ describe("chrome", () => {
     expect(
       locateComposer(splitLines(parseAnsi(["› start", ...cont.slice(1), "", status].join("\n")))),
     ).not.toBeNull();
+  });
+});
+
+// 0.150.1's DEFAULT `tui.status_line` carries no `context-remaining` field, so its status row is
+// just `  <model> · <cwd>`. These captures pin that the composer is found anyway, off the paint.
+const V0150 = [
+  "codex--v0150-custom-status.txt",
+  "codex--v0150-draft-wrapped.txt",
+  "codex--v0150-idle.txt",
+  "codex--v0150-nogit-idle.txt",
+  "codex--v0150-paste-placeholder.txt",
+];
+
+const V0150_WRAPPED_DRAFT =
+  "The quick brown fox jumps over the lazy dog while the composer wraps this sentence onto " +
+  "several continuation rows so that the fixture pins how Codex word-wraps a long stranded " +
+  "draft across the prompt region and keeps every continuation row indented by exactly two " +
+  "spaces beneath the arrow, which is the shape the adapter folds back into one space-joined " +
+  "line when it verifies that a reply actually reached the composer before the bridge presses " +
+  "enter on the operator's behalf, and this last clause is here only to push the draft past " +
+  "the third wrapped row on a wide pane.";
+
+describe("the 0.150.1 default status row", () => {
+  it.each(V0150)("%s: the composer is located on a Context-less row", (name) => {
+    const lines = fixtureLines(name);
+    expect(codexAdapter.composerReady!(lines)).toBe(true);
+
+    const status = codexAdapter.extractStatusLines(lines);
+    expect(status).toHaveLength(1);
+    expect(lineText(status[0]!)).not.toContain("Context");
+    expect(lineText(status[0]!).trimEnd()).toMatch(/^ {2}\S.* · \S/);
+    // The located row is the LAST non-blank row — the status row, not a transcript line.
+    expect(status[0]).toBe(lines[locateComposer(lines)!.statusRow]);
+  });
+
+  it.each(["codex--v0150-idle.txt", "codex--v0150-nogit-idle.txt"])(
+    "%s: an empty composer reports no draft",
+    (name) => {
+      expect(codexAdapter.extractInputDraft(fixtureLines(name))).toBeNull();
+    },
+  );
+
+  it("folds the wrapped draft back into the typed sentence", () => {
+    const lines = fixtureLines("codex--v0150-draft-wrapped.txt");
+    expect(codexAdapter.extractInputDraft(lines)).toBe(V0150_WRAPPED_DRAFT);
+
+    const rows = codexAdapter.composerPrompt!(lines)!.split("\n");
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toMatch(/^› The quick brown fox/);
+    expect(rows.at(-1)).toContain("on a wide pane.");
+  });
+
+  it("reads a three-field custom status row and its draft", () => {
+    const lines = fixtureLines("codex--v0150-custom-status.txt");
+    expect(codexAdapter.extractInputDraft(lines)).toBe("check the status row styling");
+    expect(lineText(codexAdapter.extractStatusLines(lines)[0]!).trimEnd()).toMatch(
+      / · main$/,
+    );
+  });
+
+  it("keeps the paste placeholder verbatim as the draft", () => {
+    expect(codexAdapter.extractInputDraft(fixtureLines("codex--v0150-paste-placeholder.txt"))).toBe(
+      "[Pasted Content 1024 chars]",
+    );
+  });
+});
+
+describe("the styled status-row acceptor fails closed", () => {
+  const FG = "\u001b[38;5;223m";
+  const FG2 = "\u001b[38;5;151m";
+  const DIM = "\u001b[2m";
+  const BOLD = "\u001b[1m";
+  const OFF = "\u001b[0m";
+  const SEP = `${DIM} · ${OFF}`;
+
+  function row(raw: string) {
+    const line = splitLines(parseAnsi(raw))[0]!;
+    return { text: lineText(line), line };
+  }
+
+  /** A row painted the way Codex paints one; each case varies exactly one property. */
+  function painted(fields: string[], sep: string = SEP, indent = "  ") {
+    return row(indent + fields.map((f) => `${FG}${f}${OFF}`).join(sep));
+  }
+
+  it("accepts the shape it was built for", () => {
+    const { text, line } = painted(["gpt-5.6-sol default", "/tmp/collie-codex-sandbox"]);
+    expect(isStatusRow(text, line)).toBe(true);
+  });
+
+  it("accepts Codex's dim final status field", () => {
+    // Current Codex paints the final collaboration-mode field together with its separator:
+    // `...<coloured cwd><dim> · Main [default]</dim>`. This is the live shape that left Collie's
+    // composer visible but made the reply pre-flight report that no input box was on screen.
+    const { text, line } = row(
+      `  ${FG}gpt-5.6-sol medium${OFF}${SEP}${FG2}/tmp/project${OFF}${DIM} · Main [default]${OFF}`,
+    );
+    expect(isStatusRow(text, line)).toBe(true);
+  });
+
+  it("accepts the dim suffix only after two painted fields and only at the end", () => {
+    const tooEarly = row(`  ${FG}model${OFF}${DIM} · Main [default]${OFF}`);
+    expect(isStatusRow(tooEarly.text, tooEarly.line)).toBe(false);
+
+    const notFinal = row(
+      `  ${FG}model${OFF}${SEP}${FG2}/dir${OFF}${DIM} · Main [default]${OFF}${SEP}${FG}extra${OFF}`,
+    );
+    expect(isStatusRow(notFinal.text, notFinal.line)).toBe(false);
+  });
+
+  it("refuses the same text with no styling at all", () => {
+    const { text, line } = row("  gpt-5.6-sol default · /tmp/collie-codex-sandbox");
+    expect(isStatusRow(text, line)).toBe(false);
+    // …and refuses it just as flatly when no styled line is offered.
+    expect(isStatusRow(text)).toBe(false);
+  });
+
+  it("refuses coloured fields whose separator is not dim", () => {
+    const { text, line } = painted(["model", "/dir"], " · ");
+    expect(isStatusRow(text, line)).toBe(false);
+  });
+
+  it("refuses a separator that is not exactly ` · `", () => {
+    const { text, line } = painted(["model", "/dir"], `${DIM} - ${OFF}`);
+    expect(isStatusRow(text, line)).toBe(false);
+  });
+
+  it("refuses an indent that is not exactly two spaces", () => {
+    const { text, line } = painted(["model", "/dir"], SEP, "   ");
+    expect(isStatusRow(text, line)).toBe(false);
+  });
+
+  it("refuses a bold field", () => {
+    const { text, line } = row(`  ${BOLD}${FG2}model${OFF}${SEP}${FG}/dir${OFF}`);
+    expect(isStatusRow(text, line)).toBe(false);
+  });
+
+  it("holds the field count between two and twelve", () => {
+    const fields = (n: number) => Array.from({ length: n }, (_, i) => `f${i}`);
+    const one = painted(fields(1));
+    expect(isStatusRow(one.text, one.line)).toBe(false);
+    const twelve = painted(fields(12));
+    expect(isStatusRow(twelve.text, twelve.line)).toBe(true);
+    const thirteen = painted(fields(13));
+    expect(isStatusRow(thirteen.text, thirteen.line)).toBe(false);
+  });
+
+  it("refuses unstyled prose that merely contains ` · `", () => {
+    const { text, line } = row("  some prose · with a middle · and an end");
+    expect(isStatusRow(text, line)).toBe(false);
+  });
+
+  it("still accepts a Context-bearing row on text alone — the old fast path", () => {
+    expect(isStatusRow("  model x · /some/dir · Context 50% left")).toBe(true);
   });
 });
 
@@ -319,5 +573,79 @@ describe("codexBuildBlocks", () => {
       "  Press enter to continue",
     ].join("\n");
     expect(detectTrustRegion(splitLines(parseAnsi(spoof)))).toBeNull();
+  });
+});
+
+describe("Codex mobile display cleanup", () => {
+  // The fixture carries both rows as real ESC bytes, so a change in the parser fails here rather
+  // than silently un-fixing the phone. It is RECONSTRUCTED from PR #144's report, not captured.
+  // fixtures/panes/README.md says so, and says to replace it with a capture when one is reachable.
+  const FIXTURE = "codex--submitted-fill-labelled-rule.txt";
+
+  function decoratedFixture() {
+    return decorateCodexDisplay(fixtureLines(FIXTURE));
+  }
+
+  it("clips the fixture's labelled rule, and nothing else on the screen", () => {
+    const clipped = decoratedFixture().filter((line) => line.noWrap);
+    expect(clipped).toHaveLength(1);
+    expect(lineText(clipped[0]!)).toContain("Worked for 3m 12s");
+  });
+
+  it("marks the fixture's submitted-message fill, and leaves both diff rows alone", () => {
+    const marked = decoratedFixture().filter((line) =>
+      line.segments.some((segment) => segment.mobileTransparentBg),
+    );
+    expect(marked).toHaveLength(1);
+    expect(lineText(marked[0]!)).toContain("move the screenshots across to the new blog post");
+
+    const diffBackgrounds = decoratedFixture()
+      .flatMap((line) => line.segments)
+      .filter((segment) => segment.bg && segment.bg !== "rgb(240,240,240)")
+      .map((segment) => segment.bg);
+    expect(diffBackgrounds).toEqual(["rgb(33,58,43)", "rgb(74,34,34)"]);
+  });
+
+  it("changes not one byte of the fixture's visible text", () => {
+    const lines = fixtureLines(FIXTURE);
+    expect(decorateCodexDisplay(lines).map(lineText)).toEqual(lines.map(lineText));
+  });
+
+  it("returns the same array when a screen carries neither row", () => {
+    const lines = fixtureLines("codex--fresh-idle.txt");
+    expect(decorateCodexDisplay(lines)).toBe(lines);
+  });
+
+  it("clips a labelled rule without changing its text", () => {
+    const rule = `\u2500 Worked for 31m 11s ${"\u2500".repeat(80)}`;
+    const [decorated] = decorateCodexDisplay(splitLines(parseAnsi(rule)));
+
+    expect(decorated!.noWrap).toBe(true);
+    expect(lineText(decorated!)).toBe(rule);
+  });
+
+  // The shape is the guard: a long rule run somewhere inside a row is ordinary Codex output, and
+  // clipping it would hide the row's right edge on a phone.
+  it.each([
+    ["a table row with a long inner rule", `| id | ${"\u2500".repeat(40)} | note |`],
+    ["a rule with text after it", `${"\u2500".repeat(40)} and then some prose about it`],
+    ["a labelled rule whose tail is too short", `\u2500 Worked for 3s ${"\u2500".repeat(8)}`],
+    ["a label carrying its own rule glyph", `\u2500 a \u2500 b ${"\u2500".repeat(40)}`],
+    ["a long leading rule before the label", `${"\u2500".repeat(9)} label ${"\u2500".repeat(40)}`],
+  ])("leaves %s wrapping", (_name, text) => {
+    const [decorated] = decorateCodexDisplay(splitLines(parseAnsi(text)));
+    expect(decorated!.noWrap).toBeUndefined();
+  });
+
+  it("marks only Codex's observed user-message fill for mobile transparency", () => {
+    const user = `${String.fromCharCode(27)}[48;2;240;240;240m\u203a submitted message${" ".repeat(40)}${String.fromCharCode(27)}[0m`;
+    const diff = `${String.fromCharCode(27)}[48;2;33;58;43m+ semantic diff${String.fromCharCode(27)}[0m`;
+    const [userLine, diffLine] = decorateCodexDisplay(splitLines(parseAnsi(`${user}\n${diff}`)));
+
+    expect(userLine!.segments[0]!.bg).toBe("rgb(240,240,240)");
+    expect(userLine!.segments[0]!.style.backgroundColor).toBe("rgb(240,240,240)");
+    expect(userLine!.segments[0]!.mobileTransparentBg).toBe(true);
+    expect(diffLine!.segments[0]!.bg).toBe("rgb(33,58,43)");
+    expect(diffLine!.segments[0]!.mobileTransparentBg).toBeUndefined();
   });
 });

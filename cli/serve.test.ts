@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
+import { leadStore, member, peerStore } from "../bridge/pack/fixtures.ts";
+import { serializeTrustStore } from "../bridge/pack/trust-store.ts";
 import {
   capture,
   CONFIG,
   context,
+  STATE,
   type FakeExec,
   fakeExec,
   type FakeFiles,
@@ -14,6 +17,7 @@ import {
 import { EXIT } from "./io.ts";
 import {
   cmdServe,
+  cmdServeVerb,
   cmdUnserve,
   fingerprintRoot,
   formatRecord,
@@ -387,7 +391,70 @@ describe("serve — COLLIE_SERVE_PORT (one tailnet name, a listener port per dev
   });
 });
 
-describe("serve — COLLIE_SKIP_SERVE (DEPLOYMENT.md Variants C/E)", () => {
+describe("serve — a peer publishes no front door (ADR 0013, §3)", () => {
+  const PEER_STORE = `${STATE}/pack-trust.json`;
+  const peerOnDisk = () => ({ [PEER_STORE]: serializeTrustStore(peerStore()) });
+
+  test("publishes nothing on a machine whose trust store says peer", () => {
+    const h = harness({ files: peerOnDisk() });
+    expect(cmdServe(h.deps)).toBe(EXIT.OK);
+    expect(h.exec.calls.some((c) => c.includes("--bg"))).toBe(false);
+    expect(h.io.stdout.join("\n")).toContain("a peer publishes no front");
+    expect(h.io.stdout.join("\n")).toContain("ADR 0013");
+  });
+
+  test("it is OK, not a failure — `start` must not print a door that never should have come up", () => {
+    // A peer that skipped the publish is correct, so `cmdStart`'s "the tailnet front door did not
+    // come up" note must not fire. The exit code is the only thing that decides that.
+    const h = harness({ files: peerOnDisk(), absent: ["tailscale"] });
+    expect(cmdServe(h.deps)).toBe(EXIT.OK);
+  });
+
+  test("…and it still tears down the door this machine published as a lead", () => {
+    const h = harness({
+      files: { ...peerOnDisk(), [HANDLER_FILE]: "https:443|host.example:443|http://127.0.0.1:8787\n" },
+      serveStatus: `{${tcp(443, "HTTPS")},${web("host.example:443", "/", OURS)}}`,
+    });
+    expect(cmdServe(h.deps)).toBe(EXIT.OK);
+    expect(h.exec.calls).toContain("tailscale serve --https=443 --set-path=/ off");
+    expect(h.files.exists(HANDLER_FILE)).toBe(false);
+  });
+
+  // F24: `collie serve` typed by hand ends on "where to point a phone". On a peer that line landed
+  // one row under the sentence saying a peer publishes no front door, and offered a loopback URL
+  // that is not even a peer's bind — the refusal contradicted in the next breath.
+  test("the refusal stands alone — a peer's `serve` prints no `open:` line", () => {
+    const h = harness({ files: peerOnDisk() });
+    expect(cmdServeVerb(h.deps)).toBe(EXIT.OK);
+    const out = h.io.stdout.join("\n");
+    expect(out).toContain("a peer publishes no front");
+    expect(out).not.toContain("open:");
+  });
+
+  test("…and a solo collie still gets it, unchanged", () => {
+    const h = harness();
+    expect(cmdServeVerb(h.deps)).toBe(EXIT.OK);
+    expect(h.io.stdout.join("\n")).toContain("open: ");
+  });
+
+  test("a LEAD publishes exactly as it always did", () => {
+    const h = harness({ files: { [PEER_STORE]: serializeTrustStore(leadStore({ peers: [member({ memberId: "nas" })] })) } });
+    expect(cmdServe(h.deps)).toBe(EXIT.OK);
+    expect(h.exec.calls.some((c) => c.includes("--bg"))).toBe(true);
+  });
+
+  test("no store, or a store this build cannot read, is solo — and solo publishes", () => {
+    const none = harness();
+    expect(cmdServe(none.deps)).toBe(EXIT.OK);
+    expect(none.exec.calls.some((c) => c.includes("--bg"))).toBe(true);
+    // A corrupt file must never cost a solo machine its front door.
+    const corrupt = harness({ files: { [PEER_STORE]: "{ this is not a trust store" } });
+    expect(cmdServe(corrupt.deps)).toBe(EXIT.OK);
+    expect(corrupt.exec.calls.some((c) => c.includes("--bg"))).toBe(true);
+  });
+});
+
+describe("serve — COLLIE_SKIP_SERVE (docs/deployment.md Variants C/E)", () => {
   test("publishes nothing", () => {
     const h = harness({ env: { COLLIE_SKIP_SERVE: "1" } });
     expect(cmdServe(h.deps)).toBe(EXIT.OK);

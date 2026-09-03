@@ -4,6 +4,7 @@
 import type { ApiErrorDetail, ErrorCode } from "./error-codes.ts";
 import type { AgentSessionRef, TranscriptEntry } from "./journal/types.ts";
 import type { MuxCapability, MuxSpaceCapacity, MuxTopologyLatency } from "./mux/capabilities.ts";
+import type { UpdateRun } from "./update-run.ts";
 
 // Re-exported so the wire surface has ONE import site: a consumer of PaneHistoryResponse gets the
 // entry shape from here too, without reaching into an adapter module.
@@ -45,6 +46,15 @@ export interface AgentView {
    * client-supplied one. What the client gets is the presence flag `hasSession`.
    */
   agentSession?: AgentSessionRef;
+  /**
+   * Which harness wrote {@link agentSession}, when the pane no longer names one — the pane whose
+   * agent EXITED (its beacon expired, so it reads as a plain shell again). SERVER-SIDE ONLY, and
+   * carried for one consumer: the history route's journal lookup, which is keyed by harness name.
+   *
+   * Deliberately invisible. Nothing on the wire is derived from it, so a pane holding one is
+   * byte-identical to any other shell pane (see `bridge/beacon/decorate.ts` § decoratePane).
+   */
+  sessionAgent?: string;
   /**
    * Upper bound on the lines a `recent` read of this pane can return — Herdr's scrollback depth plus
    * the viewport. This is the ONLY reliable "is there more scrollback" signal: `PaneRead.truncated`
@@ -114,7 +124,7 @@ export interface AgentView {
  * NOTE the `Omit` is opt-OUT: a future server-only field on AgentView goes on the wire unless it is
  * added to the omit list here. If you add one, strip it here in the same change.
  */
-export type PaneWire = Omit<AgentView, "agentSession"> & {
+export type PaneWire = Omit<AgentView, "agentSession" | "sessionAgent"> & {
   /** True when this pane's history is actually offerable: the agent named a session AND its harness
    *  has a journal adapter. Says nothing about whether the log is readable — a named session whose
    *  file is missing still answers `available:false` with reason `no-log`. */
@@ -126,6 +136,21 @@ export type PaneWire = Omit<AgentView, "agentSession"> & {
    * merged list must carry this and why the phone's per-pane cache keys on it.
    */
   host?: string;
+  /**
+   * Which Herdr session on {@link host} this pane lives in — the `?s=` half of the same address.
+   *
+   * Present exactly when the snapshot was asked to WIDEN (`?sessions=all`), and then on EVERY pane
+   * in the body including the primary session's. Absent otherwise, which is every request that has
+   * ever been made until now, so a solo body is unchanged to the byte.
+   *
+   * Tagging all of them rather than only the non-primary ones is deliberate. The alternative rule —
+   * "absent means primary" — makes an untagged pane mean two different things depending on whether
+   * the body was widened, and the client's `findPane` deliberately lets an untagged pane match ANY
+   * scope so that solo lookups stay exactly today's. Those two rules together would let a primary
+   * pane answer a lookup for a named session's identically-numbered pane. Every pane tagged, or
+   * none: there is no third state to get wrong.
+   */
+  session?: string;
 };
 
 /**
@@ -135,8 +160,24 @@ export type PaneWire = Omit<AgentView, "agentSession"> & {
  * read it (Herdr detects more agents than Collie has journals for). Keying the flag on the ref alone
  * would advertise a History affordance that always comes back empty, so the registry gets a vote.
  */
+/**
+ * Which harness's journal adapter reads THIS pane's transcript.
+ *
+ * The pane's own agent, all but one time. The exception is the pane whose agent EXITED: it reads as
+ * a shell again (its beacon expired — `bridge/beacon/decorate.ts`), and the conversation it left is
+ * still on disk under the harness that wrote it. Asking `agent` alone would answer `"shell"` and
+ * lose a readable log the moment the process ended.
+ *
+ * It is a LOOKUP KEY and nothing else. Nothing display-facing may be derived from it — `toPaneWire`
+ * deliberately keys `hasSession` off `agent`, so a dead agent's pane offers no History affordance
+ * and reads exactly like every other shell pane.
+ */
+export function journalAgentOf(pane: AgentView): string {
+  return pane.sessionAgent ?? pane.agent;
+}
+
 export function toPaneWire(pane: AgentView, hasJournal: (agent: string) => boolean): PaneWire {
-  const { agentSession, ...rest } = pane;
+  const { agentSession, sessionAgent: _sessionAgent, ...rest } = pane;
   return agentSession && hasJournal(pane.agent) ? { ...rest, hasSession: true } : rest;
 }
 
@@ -150,6 +191,30 @@ export interface WorkspaceView {
   activeTabId: string;
   tabCount: number;
   paneCount: number;
+  /**
+   * The Git repo this space sits in, when the multiplexer reports one (MuxSpace.repoRoot).
+   *
+   * Absent means "no repo here, or this multiplexer does not keep the mapping" — the phone reads
+   * absence as "no worktree rows", which is the fail-closed direction and needs no extra call.
+   */
+  repoRoot?: string;
+  /**
+   * Whether this space is a linked worktree of `repoRoot` rather than the repo's own checkout.
+   *
+   * Travels with `repoRoot` and is absent wherever that is. It is what lets the spaces list nest a
+   * worktree under the space showing the repo itself.
+   */
+  isWorktree?: boolean;
+  /**
+   * Which member of the pack this space lives on — the same tag panes and sessions carry.
+   *
+   * **Present exactly when {@link SnapshotResponse.servers} is**, and absent otherwise (§11), so a
+   * solo body is unchanged to the byte. It is not decoration: Herdr numbers spaces PER MACHINE, so
+   * two default installs both call theirs `w1` and a merged list keyed on `workspaceId` alone
+   * collapses them into one row carrying one machine's counts. The identity of a space in a pack is
+   * `(host, workspaceId)`, and every join against a pane must use both halves.
+   */
+  host?: string;
 }
 
 /** A tab within a workspace (a layout/view holding one or more panes). From `tab.list`. */
@@ -160,6 +225,12 @@ export interface TabView {
   label: string;
   focused: boolean;
   paneCount: number;
+  /**
+   * Which member of the pack this tab lives on — see {@link WorkspaceView.host}, which this mirrors
+   * exactly. A tab id is `w1:t1` on every default install, so `(host, tabId)` is the identity, and
+   * `(host, workspaceId)` is the parent it belongs to.
+   */
+  host?: string;
 }
 
 export type BridgeStatus = "connected" | "disconnected";
@@ -271,6 +342,76 @@ export interface ServerSummary {
 }
 
 /**
+ * GET /api/pack — what the RUNNING lead already knows about its own pack, for the phone's Pack
+ * overview page. The read-only browser spelling of `collie pack status` (cli/pack.ts).
+ *
+ * **It is a report, never a probe.** Every field below is answered from state this process already
+ * holds: the trust store it read at startup (`TrustStore.current()`, no disk touched per request)
+ * and the {@link PeerState} the lead's existing sweep maintains (bridge/pack/registry.ts). Nothing
+ * in this shape can make the lead dial a member — which is what lets a phone poll it beside the
+ * snapshot without adding a second call rate to every peer (PACK_PROTOCOL.md §10.1, §11).
+ *
+ * **Only a lead answers it.** A solo instance and a peer 404 (`pack.not_lead`): a peer is not a
+ * front door (ADR 0013), and a solo instance has no pack to describe.
+ *
+ * Nothing here is a secret. Fingerprints, certificates, the pack secret and pairing credentials are
+ * absent by construction, exactly as {@link ServerSummary} keeps them off the snapshot.
+ */
+export interface PackStatusResponse {
+  /** The pack itself, as the trust store records it (`PackIdentity`). */
+  pack: { id: string; name: string; secretGeneration: number; rotatedAt: number };
+  /** This lead. `version` per bridge/version.ts, the same string `hello` answers with. */
+  self: { id: string; name: string; version: string };
+  /**
+   * The named deputy (ADR 0027), or null when none is named.
+   *
+   * The DESIGNATION is the source, never the warrant: after a takeover the new lead keeps a warrant
+   * naming itself, so reading the deputy off it reports a lead as its own deputy (cli/
+   * pack-status-deputy.ts says so at length). `warrantGeneration` is the generation of the warrant
+   * this lead currently holds, and it is **nullable rather than omitted**: a designation with no
+   * warrant behind it is a state the operator has to see, not a key to go missing.
+   */
+  deputy: { id: string; warrantGeneration: number | null } | null;
+  /** The lead's own entry FIRST, then peers by member id — the exact order of `servers[]` (§9.2). */
+  members: PackMemberStatus[];
+  /** The LEAD's clock, like every other timestamp the lead publishes (§10.2). */
+  ts: number;
+}
+
+/**
+ * One member's row on the Pack overview page.
+ *
+ * Mostly {@link PeerState} re-spelled for the browser, plus the three roster facts the registry does
+ * not carry (`address`, `enrolledAt`, `secretBehind`). Optional keys are OMITTED when absent and
+ * never sent as null (PACK_PROTOCOL.md §11) — the lead's own entry therefore carries no `address`
+ * and no `enrolledAt`, because a lead is not in its own roster.
+ */
+export interface PackMemberStatus {
+  /** Member id — the same value `?h=` takes and `servers[].id` reports. */
+  id: string;
+  name: string;
+  isLead: boolean;
+  /** The enrolled address as stored — never re-derived, never probed. Omitted for the lead itself. */
+  address?: string;
+  /** Omitted for the lead, for the reason `address` is. */
+  enrolledAt?: number;
+  /** {@link PeerState.health} verbatim (§10.2, §18.10). The lead's own entry is always `reachable`. */
+  health: "reachable" | "unreachable" | "incompatible" | "conflicted";
+  /** {@link PeerState.reason}, verbatim and unparaphrased, when there is one. */
+  reason?: string;
+  /** The lead's receipt time of the last successful call; `0` = never (§10.2). */
+  lastSeenAt: number;
+  /** What this member last reported over `hello` (§7.1), when it has reported one. */
+  version?: string;
+  /** This member has not picked up the current pack secret (§8.4). False for the lead. */
+  secretBehind: boolean;
+  /** Enrolled but never once reachable — the shape a half-finished join takes (§8.2). */
+  provisional: boolean;
+  /** Who a `conflicted` member says it follows instead (§18.10). Present only in that state. */
+  conflict?: { leadMemberId: string; warrantGeneration: number | null };
+}
+
+/**
  * GET /api/snapshot `update` — whether the running plugin is behind (see bridge/update.ts). Both a
  * newer upstream RELEASE (`releaseAvailable` + `latest`) and a rebuilt-but-not-restarted bridge
  * PROCESS (`bridgeStale`) surface here; the client shows one banner, `bridgeStale` taking precedence.
@@ -292,10 +433,32 @@ export interface UpdateStatus {
   majorAvailable: string | null;
   /** GitHub release page for `majorAvailable`, or null when there is none. */
   majorUrl: string | null;
+  /**
+   * How this Collie is installed (`cli/install-kind.ts`'s classifier, flattened to its kind) — the
+   * banner's command spelling is a function of it: Herdr actions reach only a Herdr-managed
+   * (detached) checkout; every other kind is told the `collie` verbs (M14/01 §5.3).
+   */
+  installKind: "linked-clone" | "detached-checkout" | "binary" | "unknown";
   /** The running process is behind the on-disk bridge source — needs `systemctl --user restart collie`. */
   bridgeStale: boolean;
   /** When the upstream check last completed (epoch ms), or null if it hasn't run yet. */
   checkedAt: number | null;
+  /**
+   * Every release newer than the running one, oldest first — the same list the daily digest names.
+   *
+   * The update card lists them so the operator can see WHAT they are about to fold in, rather than
+   * only the top of the pile. Versions and nothing else: the phone never fetches release notes from
+   * GitHub, so what is not already on this wire is not shown (M15/05).
+   */
+  newerVersions?: string[];
+  /**
+   * The detached updater's run record (`<state dir>/update.json`, M15/04) — read from disk on every
+   * snapshot, so a bridge that has just been restarted BY an update reports the run it is part of
+   * instead of coming up with nothing to say. Absent when this install has never updated through the
+   * runner. The staleness rule is applied before it gets here: a run nobody is driving reads as
+   * `interrupted`, never as still in flight.
+   */
+  run?: UpdateRun;
 }
 
 /** GET /api/pane/:id — recent terminal output for one agent (ANSI/SGR, rendered colored). */
@@ -371,6 +534,41 @@ export interface CreatedPane {
 export type CreateResponse =
   | { ok: true; pane: CreatedPane }
   | { ok: false; error: string; code?: ErrorCode; detail?: ApiErrorDetail };
+
+/** One Git worktree of the repo a space sits in (ADR 0032). */
+export interface WorktreeView {
+  /** Absolute checkout path — the identity, and what `open` is asked with. */
+  path: string;
+  /** The branch checked out there; `null` for a detached head. */
+  branch: string | null;
+  /**
+   * The space showing it, or `null` when it exists on disk and nothing does.
+   *
+   * `null` is what hides the Remove row: removal is addressed by space, so a checkout nothing shows
+   * cannot be removed from the phone at all.
+   */
+  openWorkspaceId: string | null;
+  /** `false` for the repo's own checkout, which is listed for context and is never removable. */
+  linked: boolean;
+  /** The multiplexer believes the checkout is gone and its administrative files could be pruned. */
+  prunable: boolean;
+}
+
+/** GET /api/workspace/:id/worktrees — the worktrees of the repo that space sits in. */
+export type WorktreeListResponse =
+  | { ok: true; worktrees: WorktreeView[] }
+  | { ok: false; error: string; code?: ErrorCode; detail?: ApiErrorDetail };
+
+/**
+ * POST /api/workspace/:id/worktree[/open] — the space now showing the checkout.
+ *
+ * `alreadyOpen` says the space was already there, which is an ANSWER and not a failure: the phone
+ * navigates to `pane` either way.
+ */
+export type WorktreeOpenResponse =
+  | { ok: true; pane: CreatedPane; alreadyOpen: boolean }
+  | { ok: false; error: string; code?: ErrorCode; detail?: ApiErrorDetail };
+
 
 /**
  * Which role this collie plays in a pack (PACK_PROTOCOL.md §3). `solo` is a lead with zero peers —
@@ -496,6 +694,20 @@ export interface MuxConfig {
 export const MUX_LOGO_PATH = "/api/mux/logo.svg";
 
 /**
+ * Where an operator's own font files are served — one file per request, appended:
+ * `/api/fonts/<basename>`.
+ *
+ * A CONSTANT for the reason {@link MUX_LOGO_PATH} is one, and a PREFIX rather than a whole path
+ * because the last segment is the only variable the surface has. It carries a basename the bridge
+ * already declared in {@link BridgeConfig.operatorFonts} and nothing else — the client builds the
+ * URL, the bridge looks the name up, and no path is built from either (ADR 0033).
+ *
+ * It lives under `/api/` deliberately: the service worker registers no runtime route there, so
+ * these files are never precached and never swept, unlike the shipped faces under `/fonts/`.
+ */
+export const OPERATOR_FONTS_PATH = "/api/fonts/";
+
+/**
  * One operator-declared Quick-dock group (a `[[replies]]` row in their `quick-replies.toml`). A
  * pane any of these rows address shows them INSTEAD of the shipped groups; a pane none of them
  * address keeps the shipped ones (ADR 0018, the same rule `commands.toml` and `keys.toml` follow).
@@ -511,6 +723,58 @@ export interface OperatorQuickReplyRow {
   title: string;
   /** The literal strings sent — each is typed into the pane and submitted verbatim. */
   items: string[];
+}
+
+/**
+ * One operator-declared UI typeface (a `[[font]]` row in their `theme.toml`, the fourth operator
+ * file beside `commands.toml`). The Typeface setting offers these UNDER the shipped faces — fonts
+ * ADD to the shipped list, they never replace it, which is where this file parts company with the
+ * ADR 0018 trio (ADR 0033: a font cannot fire an action, so there is nothing to shadow).
+ *
+ * Every field here enters CSS on the phone, so every field is validated on BOTH sides — the bridge
+ * skips a bad row and the web re-validates and drops one. See {@link OPERATOR_FONT_FAMILY_PATTERN}.
+ */
+export interface OperatorFontRow {
+  /** Display name AND the CSS family name. Quoted at the point it enters CSS text. */
+  family: string;
+  /**
+   * The file's BARE NAME inside `<config-dir>/fonts`, never a path — `GET /api/fonts/<basename>`
+   * looks this up in the declared set and builds nothing from the request (ADR 0033).
+   */
+  basename: string;
+  /** `font-weight` for the `@font-face`, e.g. `400` or `400 700`. Omitted = the browser's default. */
+  weight?: string;
+}
+
+/**
+ * One operator-declared launcher row (`launchers.toml`). A phone tap creates a new herdr workspace
+ * (a Space) labelled with the row's label, running in the row's cwd, and types the command into its
+ * fresh shell — the whole security story of `POST /api/launch` is that the bridge matches the client's
+ * `command` string EXACTLY against this list and 400s anything else before herdr is touched.
+ */
+export interface Launcher {
+  /** The shell line typed into the new Space's shell, verbatim. Also the allowlist key /api/launch matches. */
+  command: string;
+  /** Button label. Defaults to the command's first whitespace-separated token. */
+  label: string;
+  /**
+   * Absolute directory the new Space (or tab) opens in. Absent means "here": from the dashboard,
+   * the operator's home dir; from a pane, that pane's own cwd. Present, it is pinned and wins
+   * either way.
+   */
+  cwd?: string;
+}
+
+/**
+ * GET /api/launchers — this HOST's own launcher rows, read live off its `launchers.toml`. Session-
+ * scoped so a `?host=` call forwards to the peer that runs the rows, exactly like `/api/launch`
+ * (PACK_PROTOCOL.md §5): rows must come from the machine that will run them, never from the lead's
+ * own file. `home` is that host's operator home dir, so the client can shorten a pinned `cwd` with a
+ * leading `~` without knowing which machine answered.
+ */
+export interface LaunchersResponse {
+  launchers: Launcher[];
+  home: string;
 }
 
 /** GET /api/config — bridge capabilities and the build id (push setup + stale-cache detection). */
@@ -532,6 +796,12 @@ export interface BridgeConfig {
   operatorKeys?: OperatorKeyRow[];
   /** The operator's own Quick-dock groups. Absent/empty when there is no `quick-replies.toml`. */
   operatorQuickReplies?: OperatorQuickReplyRow[];
+  /**
+   * The operator's own UI typefaces. Absent/empty when there is no `theme.toml`. Carries the
+   * BASENAME and never a URL: the client builds `/api/fonts/<basename>` itself, so no path this
+   * bridge resolved is ever echoed to a phone (ADR 0033).
+   */
+  operatorFonts?: OperatorFontRow[];
   /**
    * The multiplexer this collie drives, and what it can do. Absent only on a bridge older than
    * M10/06 — which a client reads as "every capability present", i.e. exactly today's Herdr app.

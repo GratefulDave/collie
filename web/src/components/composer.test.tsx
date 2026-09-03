@@ -11,8 +11,8 @@ import { loadDraft } from "@/lib/drafts";
 import { server } from "@/test/setup";
 import { fixtureServers, recordReply } from "@/test/handlers";
 import { PackProvider } from "./pack-provider";
-import { Composer } from "./composer";
-import type { ServerSummary } from "@/lib/types";
+import { Composer, TUI_SETTLE_MS } from "./composer";
+import { statusLabel, type ServerSummary } from "@/lib/types";
 
 // A guarded send is TWO reply calls: type (submit:false), then — once the text is verified on the
 // input line — submit-only (empty text). Overriding the reply handler therefore has to keep the fake
@@ -26,6 +26,26 @@ function replyHandler(onTyped: (text: string) => void, onSubmit?: () => void) {
     else onTyped(body.text);
     return HttpResponse.json({ ok: true });
   });
+}
+
+/**
+ * A footer strip whose condition has just lifted.
+ *
+ * Every in-flow strip in this composer arrives and leaves through `ui/collapse.tsx` (DESIGN.md §1),
+ * which HOLDS its last child for the 240ms exit so the box slides shut on the words that explain it
+ * rather than on nothing. So "gone" is two frames, not one: still in the tree, inside a `Collapse`
+ * whose `data-state` is `closed`. A bare `not.toBeInTheDocument()` on the tick after the tap is the
+ * assertion that would pass again if someone reverted the wrapper — it says "torn out of the flow",
+ * which is the exact fault the wrapper exists to stop.
+ *
+ * jsdom runs no transitions and measures no heights, so the state attribute is the thing there IS to
+ * read; the height half is CSS (`grid-rows-[0fr]`) and `collapse.test.tsx` pins that.
+ */
+function expectLeaving(el: HTMLElement | null) {
+  if (el === null) return; // the exit already finished and it unmounted — also gone
+  const row = el.closest('[data-slot="collapse"]');
+  expect(row).not.toBeNull();
+  expect(row!.getAttribute("data-state")).toBe("closed");
 }
 
 // Composer owns the send flow (draft → api.sendReply → clear/error) plus the destructive-command
@@ -47,7 +67,7 @@ function renderComposer(overrides: Partial<ComponentProps<typeof Composer>> = {}
     text: "pane output",
     terminalDraft: null,
     rawTerminalDraft: null,
-    prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+    prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
     setWrap: vi.fn(),
     stepFontSize: vi.fn(),
     setRawTerminal: vi.fn(),
@@ -98,7 +118,7 @@ function renderComposerWithStatus(
     text: "pane output",
     terminalDraft: null,
     rawTerminalDraft: null,
-    prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+    prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
     setWrap: vi.fn(),
     stepFontSize: vi.fn(),
     setRawTerminal: vi.fn(),
@@ -291,6 +311,32 @@ describe("Composer — send", () => {
     await awaitTerminalStall(); // see the helper: an unawaited stall lands in a later test
   }, 15000);
 
+  // The sweep is a burst of keystrokes into a live TUI; the reply must not overtake its redraw. The
+  // wait is measured on the wall clock (this file runs on real timers, with msw in front of the two
+  // requests), so the assertion is a floor: the reply request cannot leave before the settle elapsed.
+  it("waits TUI_SETTLE_MS between the clearing keys and the reply", async () => {
+    const user = userEvent.setup();
+    const at: Record<string, number> = {};
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/keys$/, () => {
+        at.keys ??= Date.now();
+        return HttpResponse.json({ ok: true });
+      }),
+      http.post(/\/api\/pane\/[^/]+\/reply$/, () => {
+        at.reply ??= Date.now();
+        return HttpResponse.json({ ok: true });
+      }),
+    );
+    renderComposerWithStatus({ terminalDraft: null, rawTerminalDraft: "leftover" });
+
+    await user.type(screen.getByPlaceholderText(/type a reply/i), "new message");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(at.reply).toBeDefined());
+    expect(at.reply! - at.keys!).toBeGreaterThanOrEqual(TUI_SETTLE_MS);
+    await awaitTerminalStall(); // see the helper: an unawaited stall lands in a later test
+  }, 15000);
+
   // The burst is the only destructive keystroke path in the app not bound to the screen that
   // authorised it. Ordering ("the read happens first") is not a freshness bound: the read's answer
   // describes the pane at the moment the BRIDGE snapshotted it, and the keys go out when the answer
@@ -447,7 +493,7 @@ describe("Composer — send", () => {
               text="pane output"
               terminalDraft={null}
               rawTerminalDraft="leftover"
-              prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+              prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
               setWrap={vi.fn()}
               stepFontSize={vi.fn()}
               setRawTerminal={vi.fn()}
@@ -540,7 +586,7 @@ describe("Composer — send", () => {
       text: "pane output",
       terminalDraft: null,
       rawTerminalDraft: null,
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
@@ -636,7 +682,7 @@ describe("Composer — typing into the terminal", () => {
             text="pane output"
             terminalDraft={null}
             rawTerminalDraft={null}
-            prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
             setWrap={vi.fn()}
             stepFontSize={vi.fn()}
             setRawTerminal={vi.fn()}
@@ -768,7 +814,7 @@ describe("Composer — typing into the terminal", () => {
             text="pane output"
             terminalDraft={null}
             rawTerminalDraft={null}
-            prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
             setWrap={vi.fn()}
             stepFontSize={vi.fn()}
             setRawTerminal={vi.fn()}
@@ -959,7 +1005,7 @@ describe("Composer — typing into the terminal", () => {
             text="pane output"
             terminalDraft={null}
             rawTerminalDraft={null}
-            prefs={{ wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true }}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
             setWrap={vi.fn()}
             stepFontSize={vi.fn()}
             setRawTerminal={vi.fn()}
@@ -1050,6 +1096,111 @@ describe("Composer — blocked pre-flight override", () => {
   }, 15000);
 });
 
+// ── THE DRAFT FIELD'S SIZE ────────────────────────────────────────────────────────────────────
+//
+// The field used to be pinned to the primitive's 16px — not as a design choice, but because a
+// sub-16px focused input makes iOS Safari zoom the whole page and never zoom back. That fact is now
+// a floor inside `applyDraftFontSize`, so everywhere else gets the operator's own number.
+//
+// PINNED ON THE STYLE, not on a measurement: jsdom lays nothing out, so `getComputedStyle` would
+// only read back the inline value anyway. The inline style IS the contract here — it is what
+// outranks the `.font-mono` class (hooks/use-display-prefs.ts says why that class cannot be
+// re-pointed with a custom property).
+describe("Composer — the draft field wears its own size", () => {
+  it("applies the operator's draft size, merged with the terminal face and not replacing it", () => {
+    renderComposerWithStatus({
+      prefs: {
+        wrap: true,
+        fontSize: 11,
+        draftFontSize: 13,
+        fontFamily: "jetbrains",
+        rawTerminal: false,
+        tapToFocus: true,
+      },
+    });
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    expect(box.style.fontSize).toBe("13px");
+    expect(box.style.fontFamily).toContain("JetBrains Mono");
+  });
+
+  it("writes the size even for the default family, where no font-family is written at all", () => {
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    expect(box.style.fontSize).toBe("14px"); // the fixture's default
+    // The stylesheet's own `--font-mono` still applies, byte for byte as before the size existed.
+    expect(box.style.fontFamily).toBe("");
+    expect(box.className).toMatch(/(?:^|\s)font-mono(?=\s|$)/);
+  });
+
+  // The three things the field's class list already promises, unchanged by the size landing on it:
+  // the attach button's reserved strip, the wrap rule, and the fact that only ONE pr-* may exist
+  // (tailwind-merge keeps the last, DESIGN.md §7).
+  it("leaves the attach-button gutter and the wrap rule exactly where they were", () => {
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    expect(box.className.match(/(?:^|\s)pr-\S+/g)).toHaveLength(1);
+    expect(box.className).toMatch(/(?:^|\s)pr-11(?=\s|$)/);
+  });
+});
+
+// ── §1: EVERY IN-FLOW STRIP IN THIS FOOTER ARRIVES THROUGH `Collapse` ─────────────────────────
+//
+// These were bare conditionals, so each one teleported the composer up by its own height the moment
+// its condition flipped — reported from the outside as "a notification in the footer pushed content
+// up". The rule is DESIGN.md §1's: an in-flow surface appears and disappears through
+// `ui/collapse.tsx` and through nothing else.
+//
+// PINNED STRUCTURALLY, because jsdom measures no heights and runs no transitions: the assertion
+// walks up from the strip's own text to the nearest `[data-slot="collapse"]` and requires it to be
+// there and OPEN. Every other test in this file passes with the wrapper removed; these do not.
+describe("Composer — the footer's strips animate in, never jump in", () => {
+  const rowOf = (el: HTMLElement) => el.closest('[data-slot="collapse"]');
+
+  // `open` lands one tick after the mount, deliberately: `Collapse` paints the collapsed state
+  // first so the browser has something to transition FROM (setting both in one commit is a jump with
+  // extra steps). So the wait is the animation being real, not test flake.
+  async function expectArrivedThroughCollapse(el: HTMLElement) {
+    const row = rowOf(el);
+    expect(row).not.toBeNull();
+    await waitFor(() => expect(row!.getAttribute("data-state")).toBe("open"));
+  }
+
+  it("wraps the oversize-draft line", async () => {
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    fireEvent.change(box, { target: { value: "# heading\n".repeat(1200) } });
+    await expectArrivedThroughCollapse(
+      await screen.findByText(/too long to keep as a saved draft/i),
+    );
+  });
+
+  it("wraps the armed-mode slot the direct-typing strip stands in", async () => {
+    renderComposerWithStatus();
+    fireEvent.click(screen.getByRole("button", { name: /^type into terminal$/i }));
+    // The strip's own words, not the button that armed it — the button is in the controls row and
+    // is not in flow the way the strip is.
+    await expectArrivedThroughCollapse(await screen.findByText(/typing into terminal/i));
+  });
+
+  it("wraps the pending-send preview, which stays in the footer as a VERIFICATION surface", async () => {
+    // It is not moved to the top pills, and the reason is in composer.tsx at the strip: the "sent"
+    // EVENT is already a pill (`composer.status.sent`, asserted here too), while this half holds the
+    // words that were sent on screen until the mirror echoes them back, so the operator can check
+    // what landed rather than tapping Send twice. That outlives a pill's 2.5s and would be truncated
+    // by one.
+    const user = userEvent.setup();
+    renderComposerWithStatus();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await user.type(box, "ship it");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const preview = await screen.findByText(/ship it/i, { selector: "span" });
+    await expectArrivedThroughCollapse(preview);
+    // The event half really is in the pills, so the footer is carrying only the verification half.
+    expect(screen.getByTestId("status")).toHaveTextContent(/sent/i);
+  }, 15000);
+});
+
 // A draft too big for the disk tier survives a pane switch but not the app closing, and the only
 // thing that makes that difference visible is this row. Before it, the oversize write was skipped
 // and a remount silently restored an OLDER, SHORTER draft — text the user never wrote.
@@ -1136,7 +1287,7 @@ describe("Composer — password prompt", () => {
       expect(screen.getByPlaceholderText(/type into the terminal/i)).toHaveValue(""),
     );
     expect(localStorage.getItem("collie:draft:default:w1:p1")).toBeNull();
-    expect(screen.queryByRole("button", { name: /use type/i })).not.toBeInTheDocument();
+    expectLeaving(screen.queryByRole("button", { name: /use type/i }));
     expect(calls).toEqual([]); // nothing was ever typed by the reply path
   });
 
@@ -1208,10 +1359,12 @@ describe("Composer — destructive-input confirm", () => {
     expect(screen.getByTestId("status")).toHaveTextContent(
       "Destructive: sudo (runs as root) on workshop — tap Send again to confirm",
     );
-    // The status line above Send already names the machine ("… on workshop", asserted above) — the
-    // pane-view header is the single machine indicator now, so no standalone chip renders above the
-    // input to duplicate it.
-    expect(screen.queryByLabelText("Sends to host: workshop")).not.toBeInTheDocument();
+    // …and the SAME machine is named at the box the words were typed into. Two statements of one
+    // fact is right here and only here: the chip answers "where will this land" before you commit,
+    // the confirm answers it at the moment you do, and a destructive command on the wrong machine is
+    // the failure both exist to prevent. It is one node, docked inside the field, not a standalone
+    // row above it — the row above the input is the status line's.
+    expect(screen.getByLabelText("Sends to host: workshop")).toBeInTheDocument();
   });
 
   it("does not arm the confirm for innocent input", async () => {
@@ -1225,6 +1378,330 @@ describe("Composer — destructive-input confirm", () => {
     // Sent straight away — no "Really send?" ever appeared, and the draft cleared.
     expect(screen.queryByRole("button", { name: /really send/i })).not.toBeInTheDocument();
     await waitFor(() => expect(box).toHaveValue(""));
+  });
+});
+
+// THE MACHINE, ON THE COMPOSER'S STATUS STRIP. For one round it was docked inside the text box; the
+// reasoning survives ("which machine will this land on" is asked while writing, not while reading)
+// but the 60px it took out of the typing area does not. The strip above the controls row is the same
+// write surface and its space was already reserved and already empty.
+//
+// Four claims, each failing in BOTH directions — a chip that never renders passes none of them, a
+// chip that always renders fails the solo case, and a chip put back in the field fails the second.
+describe("Composer — the machine and the state, on a band of their own", () => {
+  const box = () => screen.getByPlaceholderText(/type a reply/i);
+  const row = () => document.querySelector<HTMLElement>('[data-slot="composer-controls"]')!;
+  /** The status band above it: the host run, the status slot, or both. */
+  const band = () => document.querySelector<HTMLElement>('[data-slot="composer-status"]')!;
+  /** The reserved word slot — the band's last child (`ui/one-of.tsx`).
+   *  SAFETY: the band renders exactly two children in this order, the host run then the slot, and
+   *  the host run is `null` on a solo install — so its last child is always the slot's element. */
+  const slot = () => band().lastElementChild as HTMLElement;
+  /** Every alternative the slot is holding open space for, in order. */
+  const words = () => Array.from(slot().children).map((l) => l.textContent);
+  /** The one it is actually SHOWING. */
+  const shown = () => slot().querySelector<HTMLElement>("[data-active]")?.textContent ?? null;
+  /** The field's own reserved strip. Read off the class, because the jsdom render has no layout. */
+  const reserved = (el: HTMLElement) => /(?:^|\s)pr-(\d+)(?=\s|$)/.exec(el.className)?.[1];
+
+  it("names the machine on the band above the controls row, and renders NOTHING on a solo install", () => {
+    // Solo — every install that exists today. There is no "which machine" question to answer, so the
+    // band carries the word alone. Scoped by data-slot, never a bare role query: `ui/strip-host`
+    // mounts two permanent sr-only live regions, so a role sweep is ambiguous in any tree with a host.
+    renderComposerWithStatus({ scope: { host: "workshop" } });
+    expect(band().querySelector('[aria-label*="host" i]')).toBeNull();
+    cleanup();
+
+    // Pack — the chip appears, INSIDE the band and nowhere else. Not inside the controls group: it
+    // names a machine, not a run of five buttons, and `role="group"` is named "Controls".
+    renderComposerWithStatus({ scope: { host: "workshop" } }, fixtureServers);
+    const chip = screen.getByLabelText("Sends to host: workshop");
+    expect(band().contains(chip)).toBe(true);
+    expect(row().contains(chip)).toBe(false);
+  });
+
+  it("is NOT in the composer field: no chip in the box, and the typing width is the attach strip alone", async () => {
+    // The revision this round is. `pr-11` and only `pr-11` — MEASURED at 254px of typing width at a
+    // true 390px content width and 184px at 320px, on a pack exactly as on a solo install; docked,
+    // the pack figures were 194px and 124px. A second conditional `pr-*` would not stack
+    // (tailwind-merge keeps the last padding-right), which is why the number is read off the class.
+    const user = userEvent.setup();
+    renderComposerWithStatus({ scope: { host: "workshop" } }, fixtureServers);
+    expect(reserved(box())).toBe("11");
+    // …and nothing in the field's own relative box carries the host, by either route: no chip node
+    // inside it, and no `aria-describedby` pointing the textarea at one.
+    const field = box().parentElement!;
+    expect(field.querySelector('[aria-label*="host" i]')).toBeNull();
+    expect(box().getAttribute("aria-describedby")).toBeNull();
+    // The placeholder is still the field's whole accessible name, unshared.
+    expect(box().getAttribute("aria-label")).toBeNull();
+    expect(box().getAttribute("aria-labelledby")).toBeNull();
+    // A wrapping draft still grows the field and nothing else claims a height in the box.
+    await user.type(box(), "a draft that wraps onto a second line in the composer");
+    expect(box().className).not.toMatch(/(?:^|\s)h-\d/);
+  });
+
+  it("keeps the controls group NAMED once the visible word is gone", () => {
+    // "Controls" was doing two jobs and only one of them was visual. Sighted it labelled five
+    // self-labelling buttons; in the accessibility tree it is the ONLY thing naming the group. So it
+    // is `sr-only`, not deleted — which is also why `composer.controls.label` is still a live key in
+    // all six dictionaries. Delete the label and this group announces as an unnamed run of buttons.
+    renderComposerWithStatus({ scope: { host: "workshop" } }, fixtureServers);
+    expect(screen.getByRole("group", { name: "Controls" })).toBe(row());
+    expect(row().getAttribute("aria-labelledby")).toBe("composer-controls-label");
+    const label = document.getElementById("composer-controls-label")!;
+    expect(label.className).toMatch(/(?:^|\s)sr-only(?=\s|$)/);
+  });
+
+  it("holds host + word on a pack, the word ALONE on a solo install, in that order", () => {
+    // THE MOVE THIS ROUND MADE. The pane header's caption line carried the status word by itself, so
+    // the top of a 60px row was spent on one word; it came down here, beside the machine, where
+    // "which machine, and what is it doing" reads as one sentence at the surface being typed into.
+    // It was MOVED and not deleted: on the app's own tokens a deuteranope reads blocked / working /
+    // done as one colour in light theme, so the header's dot cannot carry the range alone
+    // (status-badge.tsx holds the measurement, agent-chat.test.tsx pins the dot's survival).
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "blocked" }, fixtureServers);
+    expect(band().firstElementChild).toHaveTextContent("workshop"); // machine first…
+    expect(shown()).toBe("needs you"); // …then what it is doing
+    cleanup();
+
+    // Solo — every install that exists today. HostChip renders null, so the word stands alone.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "blocked" });
+    expect(shown()).toBe("needs you");
+    expect(band().querySelector('[aria-label*="host" i]')).toBeNull();
+    cleanup();
+
+    // A bare shell has no agent and therefore no agent status, and still owes the band a word.
+    renderComposerWithStatus({ isShell: true, scope: { host: "workshop" } });
+    expect(shown()).toBe("shell");
+  });
+
+  it("reserves the WORD's slot, so no status can change its width", () => {
+    // THE BUG THE OPERATOR FOUND. The band is right-aligned and the word is variable-width, so every
+    // status change slid the host sideways — DESIGN.md §2, verbatim: a state may repaint, it may not
+    // re-lay-out. MEASURED in the playground at a true 390px content width, pack pane, host chip's
+    // left edge: it was 262.92 / 271.89 / 290.86 / 296.28 / 267.33px for the five statuses (a 33.4px
+    // swing) and is 262.92px for all five now. In German the swing was 41.3px and is zero.
+    //
+    // jsdom has no layout, so what is pinned here is the STRUCTURE that makes it true: the slot
+    // renders every word it could ever hold, always, and a status change only moves `data-active`
+    // between them. Render one word alone and the DOM below differs per status; the test fails.
+    const dom = new Map<string, string>();
+    for (const status of ["blocked", "working", "done", "idle", "unknown"] as const) {
+      renderComposerWithStatus({ scope: { host: "workshop" }, status }, fixtureServers);
+      expect(words()).toEqual(["needs you", "working", "done", "idle", "unknown"]);
+      expect(shown()).toBe(statusLabel(status));
+      // Everything except which layer is in front is byte-identical across the five.
+      // Normalise away the marks whose whole job is to say WHICH layer is in front — everything
+      // else, the five words and the boxes they stand in, has to be identical.
+      const front = /(?: data-active=""| inert=""| aria-hidden="true"|opacity-\d+|pointer-events-none)/g;
+      dom.set(status, slot().innerHTML.replace(front, "").replace(/\s+/g, " "));
+      cleanup();
+    }
+    expect(new Set(dom.values()).size).toBe(1);
+
+    // …and the reserve is NOT a number. A pixel width could not do this job: the same slot is
+    // "braucht dich" (72.2px) in German and "desconocido" (70.0px) in Spanish against "needs you"
+    // at 54.6px, so any constant clips one locale or wastes another's space. The layout engine
+    // measures the real glyphs of the real dictionary instead.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "done" }, fixtureServers);
+    expect(slot().className).not.toMatch(/(?:^|\s)(?:min-)?w-\[/);
+    expect(slot().className).not.toMatch(/(?:^|\s)(?:min-)?w-\d/);
+    cleanup();
+
+    // A GONE pane shows no word at all — and keeps the slot, because "shows nothing" is a state too
+    // and a pane dying under you must not slide the machine's name at the moment you are reading it.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: undefined }, fixtureServers);
+    expect(shown()).toBeNull();
+    expect(words()).toHaveLength(5);
+    cleanup();
+
+    // A SHELL pane reserves only what it can become. Its word is "shell" forever, so reserving the
+    // agent set would buy a solo shell ~24px of permanent emptiness for states it can never enter.
+    renderComposerWithStatus({ isShell: true, scope: { host: "workshop" } }, fixtureServers);
+    expect(words()).toEqual(["shell"]);
+  });
+
+  it("carries exactly ONE rule at each seam, and draws each from above", () => {
+    // DESIGN.md §4: where two chrome regions stack, ONE component draws the boundary. Two drawing it
+    // gives a 2px line where the language says 1px — a fault this codebase has already fixed twice
+    // (space-strip / tab-strip).
+    //
+    // THE BAND NOW CLOSES BOTH OF ITS OWN EDGES, and that is the operator's third report answered:
+    // it had a rule below and the dock's 10px `pt-2.5` above, so the box the EYE drew ran from the
+    // dock's top rule to the band's bottom one — ~23px of unbroken ground with the words sitting at
+    // the bottom of it. Bounded on both edges the band IS the box it is centred in. The 10px moved
+    // BELOW, onto the controls row, where it separates the band from the buttons.
+    //
+    // The dock therefore draws NOTHING: its top rule and fill moved out to the chrome block in
+    // agent-chat.tsx, which also carries the swipe handle, so the boundary against the terminal is
+    // drawn once above everything the thumb operates. agent-chat.test.tsx pins that half.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "working" }, fixtureServers);
+    expect(band().className).toMatch(/(?:^|\s)border-y(?=\s|$)/);
+    // `border-border`, not `border-rule` — the band's edges are component edges inside ONE chrome
+    // surface (handle above, controls below); the regional cut is the chrome block's top rule. The
+    // operator read the 24% pair as too loud around 10px type; 12% still states the box.
+    expect(band().className).toMatch(/(?:^|\s)border-border(?=\s|$)/);
+    expect(band().className).not.toMatch(/(?:^|\s)border-rule(?=\s|$)/);
+    // …stated as ONE utility. `border-b border-t` would paint the same two lines and read as two
+    // decisions, and a later `border-b` in the same cn() would silently drop the top one.
+    expect(band().className).not.toMatch(/(?:^|\s)border-[bt](?=\s|$)/);
+    // The row below draws nothing at all: no edge of its own, in any direction.
+    expect(row().className).not.toMatch(/(?:^|\s)border/);
+    // …and the dock around them draws no edge either — the chrome block above it does.
+    const dock = band().parentElement!;
+    expect(dock.className).not.toMatch(/(?:^|\s)border/);
+    // The 10px the dock used to spend above the band is now below it, on the controls row.
+    expect(dock.className).not.toMatch(/(?:^|\s)pt-/);
+    expect(row().className).toMatch(/(?:^|\s)mt-2(?=\s|$)/);
+    // A border colour with no width paints nothing (DESIGN.md §7 trap 1) — so the width is asserted
+    // beside the colour, and this pin fails if either is dropped.
+  });
+
+  it("stands at ONE height — solo, pack, shell, gone, and across every status", () => {
+    // MEASURED in the browser on the pane screen at a true 390px viewport, both themes: the band is
+    // 14.00px — 1 + 12 + 1 — with the word alone (solo), with host + word (pack), on a shell, with
+    // no word at all (a gone pane) and on every one of the five statuses. The five buttons below
+    // still measure 44.00px, DESIGN.md §6's floor.
+    //
+    // THE STACK GOT 9px SHORTER in the same edit: the dock's 10px of top padding went away and the
+    // band's new top rule cost 1px back.
+    //
+    // The height is STATED (`h-[14px]`) rather than summed from whatever stands in the band. It used
+    // to be 12px of line box plus the rules, i.e. equal solo and on a pack only because the occupants
+    // happened to agree; an occupant that ever measured 13 would have grown the band and nothing
+    // would have said so. Pinning the border box makes solo and pack identical by construction.
+    //
+    // jsdom has no layout, so what is pinned are the facts that make that true and that a refactor
+    // could quietly undo.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "working" });
+    const soloBand = band().className;
+    const soloRow = row().className;
+    expect(soloBand).toMatch(/(?:^|\s)h-\[14px\](?=\s|$)/);
+    // The 12px line box is stated on the BAND, not just on the runs inside it, and that is
+    // load-bearing: a block layer in the slot takes its line box from its own inherited strut, so
+    // without this the 14px page strut wins and the band measures 25px instead of 14px. One utility
+    // and never `text-[10px] leading-3` — tailwind-merge drops an earlier `leading-*` when a later
+    // `text-<size>` lands in the same cn(), which once rendered the host run at a 15px line and grew
+    // the pane header to 63px.
+    expect(soloBand).toContain("text-[10px]/3");
+    expect(soloBand).not.toMatch(/(?:^|\s)leading-/);
+    // Nothing PADS the row of buttons — the 10px above it is a margin, outside the band's box, so
+    // the band's own height stays a fact about the band.
+    expect(soloRow).not.toMatch(/(?:^|\s)pt-/);
+    expect(soloRow).not.toMatch(/(?:^|\s)py-/);
+    // And the band carries NO vertical padding in any direction: it is 1 + 12 + 1 exactly, and a
+    // pixel spent on either side would push a rule off the height the row was argued down to. The
+    // `pt-px` that used to sit here is gone with the reason for it — see the centring test below.
+    expect(soloBand).not.toMatch(/(?:^|\s)(?:pt|pb|py)-/);
+    cleanup();
+
+    for (const overrides of [
+      { scope: { host: "workshop" }, status: "blocked" as const },
+      { scope: { host: "workshop" }, status: "done" as const },
+      { scope: { host: "workshop" }, status: undefined },
+    ]) {
+      renderComposerWithStatus(overrides, fixtureServers);
+      expect(band().className).toBe(soloBand); // the pack pays nothing for the chip
+      expect(row().className).toBe(soloRow);
+      // Both runs state the same 12px line box, as ONE utility.
+      for (const run of [band().firstElementChild!, slot().firstElementChild!.firstElementChild!]) {
+        expect(run.className).toContain("text-[10px]/3");
+        expect(run.className).not.toMatch(/(?:^|\s)leading-/);
+      }
+      cleanup();
+    }
+  });
+
+  it("centres both occupants on the band's OWN middle, not on its content box's", () => {
+    // THE OPERATOR'S THIRD REPORT: "content in the bottom status row is still not vertically
+    // centered." The second report had already been answered with `h-[13px] pt-px`, and the numbers
+    // said it worked — so the third report is the useful one, because it says the numbers were
+    // answering the wrong question.
+    //
+    // THE BOX WAS WRONG, NOT THE CENTRING. The band had a rule below it and the dock's `pt-2.5`
+    // above it, on the dock's own ground: nothing marked where the band started, so the box the eye
+    // drew ran from the dock's top rule to the band's bottom rule — about 23px of unbroken surface
+    // with the two runs sitting in the last 13 of it. No amount of centring inside the 13px can fix
+    // a 23px box. `border-y` states the box instead, and the 10px goes below the band as the
+    // controls row's top margin (mt-2 since the 2026-08-31 shave), separating rather than
+    // pretending to belong.
+    //
+    // AND THE 1px NUDGE GOES WITH IT. `pt-px` existed to pay for a hairline on ONE edge. With both
+    // edges ruled the box is symmetric by construction and a compensation still applied tips it the
+    // other way. MEASURED on the page at 390px, DPR 3, dark, as ink rows in the band's own 14px
+    // border box (rules at 0 → 1 and 13 → 14), by sampling rendered pixels rather than boxes:
+    //
+    //                            WITH pt-px        WITHOUT
+    //   caps, both runs          4.00 → 11.00      3.00 → 10.00
+    //   caps centroid            7.33              6.33
+    //   ALL ink centroid         7.83              6.83
+    //   band centre              7.00              7.00
+    //
+    // The eye centres the CLUSTER, not the capital letters — the host's 10px glyph is part of the
+    // line and sits lower than the caps do — so the all-ink row is the one that decides: 0.83px low
+    // becomes 0.17px high. `items-center` over a stated height does the whole job.
+    //
+    // jsdom has no layout — it cannot measure any of the above — so what is pinned is the mechanism
+    // that produces it, and every clause fails in both directions: drop `items-center` and nothing
+    // centres, drop a rule and the box stops being the one the eye reads, put `pt-px` back and the
+    // cluster sits low again, put the glyph back to `size-3` and it fills the content box entirely.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "working" }, fixtureServers);
+    expect(band().className).toMatch(/(?:^|\s)items-center(?=\s|$)/);
+    expect(band().className).toMatch(/(?:^|\s)h-\[14px\](?=\s|$)/);
+    expect(band().className).toMatch(/(?:^|\s)border-y(?=\s|$)/);
+    // No compensating pixel, in either direction. This is the clause that fails if someone reads
+    // the old comment and "restores" the nudge.
+    expect(band().className).not.toMatch(/(?:^|\s)(?:pt|pb|py)-/);
+    // One height utility — a second `h-*` would win under tailwind-merge and the stated box would
+    // quietly become someone else's.
+    expect(band().className.match(/(?:^|\s)h-\S+/g)).toEqual([" h-[14px]"]);
+    // The glyph beside the host name is 10px here and nothing else. At 12px it was the band's whole
+    // content box, so it could not be centred in it — there was no room either side to centre into.
+    const glyph = band().querySelector("svg")!;
+    expect(glyph.getAttribute("class")).toMatch(/(?:^|\s)size-2\.5(?=\s|$)/);
+    expect(glyph.getAttribute("class")).not.toMatch(/(?:^|\s)size-3(?=\s|$)/);
+    // And the line box is still ONE utility on the band, unsplit — the whole geometry above is a
+    // sum of stated boxes, and a `leading-*` that tailwind-merge could delete would undo it.
+    expect(band().className).toContain("text-[10px]/3");
+    expect(band().className).not.toMatch(/(?:^|\s)leading-/);
+    cleanup();
+
+    // A SOLO install renders no host at all, so the band's only occupant is the word — and the
+    // centring must not be a fact about the pack. Same utilities, same class string.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "working" });
+    expect(band().querySelector("svg")).toBeNull();
+    expect(band().className).toMatch(/(?:^|\s)items-center(?=\s|$)/);
+    expect(band().className).toMatch(/(?:^|\s)h-\[14px\](?=\s|$)/);
+    expect(band().className).toMatch(/(?:^|\s)border-y(?=\s|$)/);
+    expect(band().className).not.toMatch(/(?:^|\s)(?:pt|pb|py)-/);
+  });
+
+  it("runs the ground and the rule edge to edge, and still insets the content by 10px", () => {
+    // The operator asked for a different background AND a bottom border. Both halves are read off
+    // the class because jsdom has no layout.
+    //
+    // FULL-BLEED: `-mx-3` cancels the dock's `px-3`, so the fill and the rule reach both viewport
+    // edges. A fill that stopped 12px short would read as a floating bar, and a rule that stopped
+    // short would not separate the two regions it sits between. `px-2.5` then puts the content back
+    // at the 10px inset the controls row asked for — which is also what absorbed the row's old
+    // `-mx-0.5`: as a 2px overhang on a TRANSPARENT strip it was invisible, and on a filled one it
+    // would not have been. The controls row keeps its own `-mx-0.5`, which is the 1px per button it
+    // was bought for. tailwind-merge keeps only the LAST padding-* in one cn(), which is why the
+    // band's inset is one `px-*` and not two.
+    //
+    // NO FILL. `--card` was tried here and measured against DESIGN.md §4, which says chrome is the
+    // page colour separated by a rule and never a fill band: 1.19:1 against the dock below in both
+    // themes, 1.09:1 / 1.10:1 against the mirror above, against a `border-b border-rule` doing
+    // 1.45:1 light and 2.19:1 dark. The rule was doing the separating; the fill was dropped. The
+    // band is page colour, per §4 — no `bg-*` utility of its own.
+    renderComposerWithStatus({ scope: { host: "workshop" }, status: "working" }, fixtureServers);
+    expect(band().className).toMatch(/(?:^|\s)-mx-3(?=\s|$)/);
+    expect(band().className).toMatch(/(?:^|\s)px-2\.5(?=\s|$)/);
+    expect(band().className).not.toMatch(/(?:^|\s)bg-/);
+    expect(band().className).toMatch(/(?:^|\s)justify-end(?=\s|$)/);
+    expect(row().className).toMatch(/(?:^|\s)-mx-0\.5(?=\s|$)/);
+    expect(row().className).not.toMatch(/(?:^|\s)px-/); // the row's inset is the dock's, trimmed
   });
 });
 
@@ -1246,7 +1723,7 @@ function renderDraftHarness(overrides: Partial<ComponentProps<typeof Composer>> 
       readOnly: false,
       dialogPresent: false,
       text: "pane output",
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
@@ -1412,7 +1889,7 @@ describe("Composer — terminal-draft preview", () => {
 
     await user.click(screen.getByRole("button", { name: /take over/i }));
     expect(box).toHaveValue("take me over"); // the text lands, one-shot
-    expect(screen.queryByText(/draft in terminal/i)).not.toBeInTheDocument(); // preview hidden
+    expectLeaving(screen.queryByText(/draft in terminal/i)); // preview sliding shut
     expect(keyCalls).toEqual([]); // takeover writes NOTHING to the terminal
   });
 
@@ -1423,7 +1900,7 @@ describe("Composer — terminal-draft preview", () => {
     await screen.findByText(/draft in terminal/i);
 
     await user.click(screen.getByRole("button", { name: /take over/i }));
-    expect(screen.queryByText(/draft in terminal/i)).not.toBeInTheDocument();
+    expectLeaving(screen.queryByText(/draft in terminal/i));
 
     // The host keeps typing → a DIFFERENT draft → the preview returns with the new text.
     strandDraft("original plus more");
@@ -1440,7 +1917,7 @@ describe("Composer — terminal-draft preview", () => {
     await screen.findByText(/draft in terminal/i);
 
     await user.click(screen.getByRole("button", { name: /take over/i }));
-    expect(screen.queryByText(/draft in terminal/i)).not.toBeInTheDocument();
+    expectLeaving(screen.queryByText(/draft in terminal/i));
 
     strandDraft(""); // the host line empties (submitted/wiped on the host)
     strandDraft("continue"); // …and later the very same text strands again
@@ -1517,7 +1994,7 @@ describe("Composer — in-flight echo suppression (match-last-sent)", () => {
       text: "pane output",
       terminalDraft: draft,
       rawTerminalDraft: draft,
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
@@ -2059,7 +2536,7 @@ describe("Composer — draft persistence", () => {
       text: "pane output",
       terminalDraft: null,
       rawTerminalDraft: null,
-      prefs: { wrap: true, fontSize: 11, rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
@@ -2138,5 +2615,72 @@ describe("Composer — draft persistence", () => {
 
     mount();
     expect(screen.getByPlaceholderText(/type a reply/i)).toHaveValue("");
+  });
+});
+
+// A placeholder is a LABEL, and it may not decide how tall this control is.
+//
+// `ui/chat/chat-input.tsx` carries `field-sizing-content`, so an EMPTY textarea takes its height
+// from the placeholder — measured in Chrome at a 390px viewport, 46px with a one-line placeholder
+// and 70px with a wrapping one. That put the composer at a different height in different LOCALES
+// (9 of the 36 composer placeholder strings in the six dictionaries overrun the 252px this field
+// leaves), which is DESIGN.md §2 with a translated string as the state. The two classes below are
+// what stop it, and they are a pair: `whitespace-nowrap` keeps it to one line, `overflow-hidden`
+// clips that line at the CONTENT box so it cannot paint out through `pr-11` and under the attach
+// button. Pinned here because both look like tidy-away decoration at the call site.
+describe("Composer — the placeholder cannot resize the field", () => {
+  it("keeps the placeholder to one clipped line, whatever the locale gave it", () => {
+    renderComposer({ readOnly: true });
+    const box = screen.getByPlaceholderText(/read-only/i);
+
+    expect(box.className).toMatch(/placeholder:whitespace-nowrap/);
+    expect(box.className).toMatch(/placeholder:overflow-hidden/);
+  });
+});
+
+// An uploaded host path may not push Send off the screen.
+//
+// A COUPLING TEST. jsdom computes no layout, so neither of the classes below can be *observed*
+// working here — what each one pins is a fact about a real browser that only a class can carry
+// into this file.
+//
+// The fact behind `wrap-anywhere`: `overflow-wrap: anywhere` and `overflow-wrap: break-word` paint
+// identically, and differ in exactly one place — `anywhere` participates in INTRINSIC sizing and
+// `break-word` (the textarea's UA default) does not. `ui/chat/chat-input.tsx` carries
+// `field-sizing-content`, which is the property that turns an intrinsic width into a laid-out one,
+// so under the default the field's min-content width was the width of the longest unbreakable
+// token. `uploadImage()` appends exactly such a token — the bridge's host path for the attached
+// image — so the composer row was laid out wider than the screen and Send, its last element,
+// landed past the right edge. Measured in Chrome at 390px; reported as "the Send button
+// disappeared after I uploaded a picture".
+//
+// The other half is on the wrapper (`ui/collapse.tsx`, pinned in `collapse.test.tsx`): the bottom
+// region is a Collapse grid item, and a grid item's automatic minimum is `auto` on the width axis
+// too, so the giant intrinsic width propagated all the way up. Both classes are needed and both
+// look like tidy-away decoration at their call sites.
+describe("Composer — a long upload path cannot widen the field", () => {
+  it("wraps the VALUE anywhere, so no unbreakable token sets the field's intrinsic width", () => {
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+
+    expect(box.className).toMatch(/(?:^|\s)wrap-anywhere(?:\s|$)/);
+    // …and the placeholder contract above is untouched by it: `white-space` beats `overflow-wrap`,
+    // so the placeholder is still the one clipped line it was.
+    expect(box.className).toMatch(/placeholder:whitespace-nowrap/);
+  });
+
+  it("still takes the appended path verbatim — the fix is layout, not the text", async () => {
+    const path = "/home/operator/.local/share/collie/uploads/2026-08-31T09-14-22-a1b2c3d4e5f6.png";
+    server.use(http.post(/\/api\/pane\/[^/]+\/upload$/, () => HttpResponse.json({ ok: true, path })));
+    renderComposer();
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    const file = new File(["x"], "shot.png", { type: "image/png" });
+
+    fireEvent.paste(box, {
+      clipboardData: { items: [{ kind: "file", type: "image/png", getAsFile: () => file }] },
+    });
+
+    await waitFor(() => expect(box).toHaveValue(path));
+    expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();
   });
 });

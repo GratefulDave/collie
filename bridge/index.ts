@@ -3,13 +3,16 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 
+import { classifyInstall, probeInstall } from "../cli/install-kind.ts";
+import { realLinkFs } from "../cli/link.ts";
+import { realExec, realFiles } from "../cli/sys.ts";
 import { ActivityLedger } from "./activity.ts";
 import { AuditLog, fileAuditAppender } from "./audit.ts";
 import { beaconReader, hooksInstalledProbe } from "./beacon-io.ts";
 import { withAgentBeacons } from "./beacon/decorate.ts";
 import { withAgentHints } from "./beacon/hint.ts";
 import { loadConfig, nonLoopbackBindRefusal, resolveConfigDir, type Config } from "./config.ts";
-import type { PackMode } from "./types.ts";
+import type { PackMode, PackStatusResponse } from "./types.ts";
 import { EventPoker } from "./event-poker.ts";
 import {
   instanceSuffixOf,
@@ -38,12 +41,20 @@ import { filePairingIo, PairingStore } from "./pairing.ts";
 import { createSttGate } from "./stt/index.ts";
 import { runBootGate } from "./pack/boot-gate.ts";
 import { PEER_BROWSER_ENV, resolvePackRuntime, warnsOnWildcardBind } from "./pack/config.ts";
-import { deposedAnswer, deposedStateFrom, outcomeNow, selfHeal, type DeposedState } from "./pack/deposed.ts";
+import {
+  deposedAnswer,
+  deposedStateFrom,
+  isDepositionProof,
+  outcomeNow,
+  selfHeal,
+  type DeposedState,
+} from "./pack/deposed.ts";
 import { LeadContact } from "./pack/lead-contact.ts";
 import { deputyAnchorOf, dialTls, peerListenerTls } from "./pack/transport.ts";
 import { commitPackChange } from "./pack/enrollment.ts";
 import { PackLead } from "./pack/lead.ts";
 import { leadLabel } from "./pack/merge.ts";
+import { packStatusBody } from "./pack/status-wire.ts";
 import { herdPushGate, PeerNotifier } from "./pack/notify.ts";
 import { packHelloBudget, packTimeoutBudget, packTimeoutClampWarning, PeerClient } from "./pack/peer-client.ts";
 import { PackRegistry } from "./pack/registry.ts";
@@ -68,6 +79,8 @@ import {
   silenceOf,
   STANDBY_PREFIX,
   standbyPortOf,
+  standbyUpdateAnswer,
+  withStandbyVersion,
   warrantNamesSelf,
   type StandbyFacts,
 } from "./pack/standby.ts";
@@ -87,15 +100,16 @@ import {
   pendingRePin,
   runTakeover,
   rosterRowsOf,
+  takeoverDialTls,
   takeoverMessage,
   TAKEOVER_RESTART_EXIT,
   type CommitOutcome,
 } from "./pack/takeover.ts";
 import { enrollmentOf, TrustStore, type TrustStoreData, type Warrant } from "./pack/trust-store.ts";
-import { currentWarrant, refreshWarrant, type WarrantPush } from "./pack/warrant.ts";
+import { currentWarrant, discardForeignWarrant, refreshWarrant, type WarrantPush } from "./pack/warrant.ts";
 import { Push } from "./push.ts";
 import { pluginRoot } from "./root.ts";
-import { startServer } from "./server.ts";
+import { buildId, startServer } from "./server.ts";
 import {
   deriveConfigRoot,
   herdTagFor,
@@ -109,8 +123,16 @@ import {
   githubTagsFetcher,
   UpdateMonitor,
   UpdateStateStore,
+  updateDigestBody,
 } from "./update.ts";
 import { SWEEP_INTERVAL_MS, sweepUploads } from "./uploads.ts";
+import { readUpdateRun, updateLockHeld } from "./update-run.ts";
+import {
+  parsePreflightReport,
+  PreflightCache,
+  preflightCommand,
+  updateStartCommand,
+} from "./update-action.ts";
 import { collieVersionBare } from "./version.ts";
 
 // How often the registry rescans the filesystem for sessions that appeared/disappeared after boot.
@@ -313,6 +335,27 @@ async function applyDeposition(proof: Warrant | null, reason: string): Promise<D
   return state;
 }
 
+// ── A warrant from a pack this collie is not in is discarded, at boot ────────
+// Belt and braces behind `leavePack`, which now clears the deputy fields. A store written by an
+// older build can still hold a warrant for a pack this machine has left — and holding it makes this
+// machine report a generation its own lead never minted, which is what the far end reads as a
+// takeover. Cheap, local, and it runs before the gate below so the gate reads a clean store.
+{
+  const held = trustStore.current();
+  const foreign = held === null ? null : discardForeignWarrant(held);
+  if (foreign !== null) {
+    const dropped = await commitPackChange(trustStore, audit, (current) =>
+      current === null ? null : discardForeignWarrant(current),
+    );
+    if (dropped !== null) {
+      console.warn(
+        `[pack] discarded a stored warrant for pack "${dropped.packId}" (generation ${dropped.generation}): ` +
+          "this collie is in a different pack, so that warrant proves nothing here.",
+      );
+    }
+  }
+}
+
 // ── The boot-time gate against a split brain (§18.11) ────────────────────────
 // A collie booting into `lead` mode with a non-empty roster asks its members ONCE, concurrently, on
 // the patient budget, BEFORE it publishes anything. Silence publishes; a conflicting answer deposes.
@@ -327,6 +370,10 @@ async function applyDeposition(proof: Warrant | null, reason: string): Promise<D
         .map((p) => ({ memberId: p.memberId, address: p.address })),
       hello: (link) => client.hello(link),
       generation: currentWarrant(data)?.warrant.generation ?? 0,
+      packId: data.pack?.packId ?? "",
+      // The gate's whole deposition test, and it is this collie's own: a warrant it signed itself,
+      // for this pack, at a generation not behind the one it holds. Nothing weaker deposes a lead.
+      verifies: (warrant) => isDepositionProof(data, warrant),
     });
     if (verdict.kind === "deposed") {
       const state = await applyDeposition(verdict.proof, verdict.reason);
@@ -334,6 +381,11 @@ async function applyDeposition(proof: Warrant | null, reason: string): Promise<D
       // this process comes up as an ordinary peer in the very same boot, having published nothing in
       // between. That is the common case and the whole reason the gate sits at boot (§18.11).
       deposed = state.outcome === "healed" ? null : state;
+    } else {
+      // A claim that could not be proved. It is printed ONCE, here, at the boot that read it — the
+      // lead keeps leading, so nothing else in this process will ever mention it, and an operator
+      // who never sees the line has a peer quietly refusing this pack for the rest of its uptime.
+      for (const warning of verdict.warnings) console.warn(`[pack] warn: ${warning}`);
     }
   }
 }
@@ -502,9 +554,17 @@ await updateStore.load();
 // The repo the release check + release links point at. Defaults to Collie's own; overridable for a
 // fork (or a synthetic test target) via COLLIE_UPDATE_REPO.
 const updateRepo = process.env.COLLIE_UPDATE_REPO?.trim() || "AltanS/collie";
+// How this Collie is installed — the ONE shared classifier (`cli/install-kind.ts`), probed once at
+// startup because the answer cannot change under a running process (an update restarts the service).
+// The banner spells its commands from this: Herdr actions for a Herdr-managed checkout, the `collie`
+// verbs for everything else (M14/01 §5.3).
+const installKind = classifyInstall(
+  probeInstall({ exec: realExec(process.env, homedir()), files: realFiles, link: realLinkFs }, rootDir),
+).kind;
 const updateMonitor = new UpdateMonitor({
   repo: updateRepo,
   current: currentVersion,
+  installKind,
   startupStamp: bridgeStampSync(bridgeDir, rootDir),
   fetchTags: githubTagsFetcher(updateRepo),
   bridgeStamp: () => bridgeStampSync(bridgeDir, rootDir),
@@ -512,17 +572,107 @@ const updateMonitor = new UpdateMonitor({
   now: Date.now,
   // The `updates` notify pref is the off-switch — update pushes bypass snooze, so this is their gate.
   updatesEnabled: () => notifyPrefs.current().updates,
-  notify: (latest) =>
+  // Read from disk on every snapshot, never cached: the file is written by the DETACHED UPDATER, a
+  // different process, and noticing its transitions is the whole job (M15/04). Reading it here is
+  // also what makes a bridge restarted BY an update resume reporting that run at startup instead of
+  // saying nothing happened.
+  runState: () => readUpdateRun(cfg.stateDir),
+  // One push a DAY, naming every release folded into it — the digest decides that; this only renders it.
+  notify: (versions) =>
     void push.send({
       type: "update",
       tag: "collie:update",
       // No command in the body — the tap opens Settings (target below), and the update banner / linked
       // release page carry the location-independent Herdr actions. Keeps this off the cwd-dependent path.
       title: "Collie update available",
-      body: `Version ${latest} is available`,
+      body: updateDigestBody(currentVersion, versions),
       target: "settings",
     }),
 });
+
+// ── The update ACTION's two spawns (M15/05) ──────────────────────────────────
+// The bridge decides nothing about an update: it runs the operator's own verb and reads the
+// operator's own preflight. Both are subprocesses, and a subprocess is index.ts's business — the
+// same arrangement the mux adapters and the front door already have. `bridge/server.ts` sees three
+// functions (`UpdateActionDeps`) and no `Bun.spawn` at all.
+//
+// WHICH BINARY. `bin/collie` in the checkout when there is one — that is what the operator's own
+// `collie update` would run, and on a compiled install it is exactly `process.execPath`. The
+// fallback matters for the source-mode bridge (`bun bridge/index.ts`), where `execPath` is Bun
+// itself: there, with no compiled binary present, there is nothing honest to spawn, and the route
+// answers 503 rather than shelling out to something that is not Collie.
+const collieBinary = join(rootDir, "bin", "collie");
+const canRunUpdate = existsSync(collieBinary);
+// How long `collie update --check --json` may take before the bridge stops waiting. It asks git for
+// the remote's tags over the network, so it is not instant; past this, "no report" is the answer,
+// which REFUSES an update rather than allowing one.
+const PREFLIGHT_TIMEOUT_MS = 30_000;
+const preflightCache = new PreflightCache({
+  now: Date.now,
+  run: async () => {
+    // `--local`: this instance only. The card updates the lead alone (ADR 0016), and the member
+    // walk would run over an SSH agent this service does not have — see `preflightCommand`.
+    const child = Bun.spawn(preflightCommand(collieBinary), {
+      cwd: rootDir,
+      stdout: "pipe",
+      // Piped, never ignored: when the report cannot be read, git's own words on this stream are
+      // the only thing that says why, and a service log is where the operator looks.
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const timer = setTimeout(() => child.kill(), PREFLIGHT_TIMEOUT_MS);
+    try {
+      const [stdout, stderr] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ]);
+      // A RED preflight exits non-zero and still prints a perfectly good report, so the exit code is
+      // deliberately not consulted for the ANSWER: the document is the answer, and its absence is
+      // the failure. It is consulted for the LOG, below, and only there.
+      const code = await child.exited;
+      const unreadable = parsePreflightReport(stdout) === null;
+      if (unreadable || (code !== 0 && stderr.trim() !== "")) {
+        const tail = stderr.trim().split("\n").slice(-5).join(" / ");
+        console.warn(
+          `[update] preflight exited ${code}${unreadable ? " with no readable report" : ""}${tail === "" ? "" : `: ${tail}`}`,
+        );
+      }
+      return { stdout };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+});
+const updateAction = canRunUpdate
+  ? {
+      preflight: (force?: boolean) => preflightCache.get(force),
+      lockHeld: () => updateLockHeld(cfg.stateDir),
+      start: ({ major }: { major: boolean }) => {
+        const command = updateStartCommand({
+          platform: process.platform,
+          binary: collieBinary,
+          major,
+          stamp: String(Date.now()),
+          hasSystemdRun: Bun.which("systemd-run") !== null,
+          hasSetsid: Bun.which("setsid") !== null,
+        });
+        try {
+          const child = Bun.spawn(command, {
+            cwd: rootDir,
+            stdout: "ignore",
+            stderr: "ignore",
+            stdin: "ignore",
+          });
+          // Never waited on, and never held open: `collie update` stages and then restarts this very
+          // process. The record on disk is how the phone follows it from here (M15/04).
+          child.unref();
+          return { ok: true as const };
+        } catch (err) {
+          return { ok: false as const, reason: err instanceof Error ? err.message : String(err) };
+        }
+      },
+    }
+  : undefined;
 
 // First check delayed (don't probe mid-boot); then every few hours. unref() so neither timer holds
 // the process open; both cleared on shutdown.
@@ -537,7 +687,7 @@ const muxRegistry = buildMuxRegistry();
 
 // Say what this collie drives, once, before anything dials it. A reachable multiplexer used to be
 // silent — the log named one only when it could not be reached — so `collie logs` could not answer
-// the first question a tmux or zellij operator asks (README → "Did it work?").
+// the first question a tmux or zellij operator asks (docs/multiplexers.md → "Did it work?").
 console.log(`[bridge] mux: ${describeMux(muxRegistry, cfg.mux, cfg.muxEndpoint)}`);
 
 // Are the agent's own hooks installed (M11/02)? Probed through `cli/hooks.ts`'s definition of
@@ -881,6 +1031,18 @@ if (warnsOnWildcardBind(pack.mode, cfg.host)) {
   if (clamped !== null) console.warn(clamped);
 }
 
+/**
+ * This collie's own id and operator-facing MACHINE label (§9.2), resolved in ONE place.
+ *
+ * `servers[0]` (the merged snapshot) and `members[0]` (the pack overview) name the same machine, so
+ * they take the same value rather than two computations that agree today. Never the PACK's name,
+ * which is not a roster member and would collide visually with every peer's per-machine label — see
+ * `leadLabel`'s doc for the hostname/fallback rule.
+ */
+function packSelfOf(data: TrustStoreData) {
+  return { id: data.self.memberId, name: leadLabel(hostname(), data.self.memberId) };
+}
+
 const packLead = (() => {
   if (pack.mode !== "lead") return undefined;
   const data = trustStore.current();
@@ -904,10 +1066,7 @@ const packLead = (() => {
     // The per-pane forward (§5, §9.1). `proxy`, not `raw`: the peer's own status codes — its 304
     // above all — are the answer, and flattening them would cost the conditional-GET win end to end.
     proxy: (link, route, params, init) => client.proxy(link, route, params, init),
-    // servers[].name is an operator-facing MACHINE label (§9.2), same as every peer's `join` label —
-    // never the pack's name, which is not a roster member and would collide visually with the peers'
-    // per-machine labels. See leadLabel's doc for the hostname/fallback rule.
-    self: { id: data.self.memberId, name: leadLabel(hostname(), data.self.memberId) },
+    self: packSelfOf(data),
     // Notifications for a peer's panes, derived on the lead from the body this sweep just parsed and
     // pushed through the same coordinator machinery a local session uses (M4/06).
     onPeerSnapshot: (memberId, body) => peerNotifier?.observe(memberId, body),
@@ -1000,6 +1159,34 @@ const packLead = (() => {
   });
 })();
 
+/**
+ * `GET /api/pack`'s body, asked for per request and answered from memory (bridge/pack/status-wire.ts).
+ *
+ * `undefined` unless this process leads a pack, which is the route's 404 for a solo instance and for
+ * a peer alike (ADR 0013: a peer is not a front door). The closure still re-reads
+ * `trustStore.current()` on every call — a cached value, no disk — because a rotation, a
+ * `pack remove` or a `pack deputy` in another process lands there while this one runs, and a body
+ * composed from a snapshot taken at boot would report a roster the operator has already changed.
+ *
+ * Nothing here can dial: `contributions()` is the sweep's own ledger, read, never refreshed.
+ */
+const packStatus =
+  packLead === undefined
+    ? undefined
+    : (): PackStatusResponse | null => {
+        const data = trustStore.current();
+        if (data === null) return null;
+        return packStatusBody({
+          store: data,
+          self: packSelfOf(data),
+          // The same string `hello` answers with (§7.1) — resolved once at boot, like the pack
+          // router's, so the two surfaces cannot name this build two different versions.
+          version: packVersion,
+          peers: packLead.contributions(),
+          now: Date.now(),
+        });
+      };
+
 // THE SWEEP RIDES THE EXISTING POLL — there is no second timer (§10.1, §11). The primary session's
 // engine is the lead's clock: it is created eagerly, never disposed, and already ticks at
 // COLLIE_POLL_MS (relaxing to the idle cadence with the herd), so the pack inherits the exact
@@ -1016,14 +1203,12 @@ if (packLead) registry.get()?.engine.onTick(() => (deposed === null ? void packL
  * else. It signs no request bodies: the deputy is in nobody's roster, so a §8.6 signature could only
  * ever fail to verify and become a refusal. What authenticates it is the pinned handshake against the
  * certificate the receiver anchored, plus the dial attestation naming which anchor is calling.
+ *
+ * **Except toward the LEAD, where there is no handshake to pin** — its pack surface rides a front
+ * door that terminates TLS before the process ({@link takeoverDialTls}). There the pack secret and
+ * the dial attestation are the whole of it, and both ride EVERY call this client makes.
  */
 function takeoverClient(data: TrustStoreData): PeerClient {
-  const certOf = (memberId: string): string | null => {
-    const held = trustStore.current();
-    if (held === null) return null;
-    if (held.lead !== null && held.lead.memberId === memberId) return held.lead.certPem;
-    return held.standbyRoster?.find((r) => r.memberId === memberId)?.certPem ?? null;
-  };
   return new PeerClient({
     self: data.self.memberId,
     secret: () => trustStore.current()?.pack?.secret ?? null,
@@ -1031,10 +1216,12 @@ function takeoverClient(data: TrustStoreData): PeerClient {
     patientTimeoutMs: packHelloBudget(cfg.pollMs),
     fetch: (url, init) => fetch(url, init),
     dialSign: (parts) => signDial(trustStore.current()?.self.keyPem ?? data.self.keyPem, parts),
-    tls: (link) => {
-      const certPem = certOf(link.memberId);
-      return certPem === null ? undefined : (dialTls(trustStore.current(), { certPem }) ?? undefined);
-    },
+    // Re-read from the store on every dial, and NOT the same answer for every member: a witness is
+    // pinned to the certificate the warrant push carried, and the LEAD is dialled with no pin at all,
+    // because a lead's address is a front door that terminates TLS before the process
+    // (`bridge/pack/transport.ts`'s note; the CLI's dials were fixed the same way in `b126989`).
+    // The rule is a pure function of the store, so it is decided — and tested — in `takeover.ts`.
+    tls: (link) => takeoverDialTls(trustStore.current(), link.memberId),
   });
 }
 
@@ -1124,6 +1311,10 @@ async function performTakeover(deviceLabel: string): Promise<{ ok: boolean; mess
 
 /** The door proper — peer-only. A lead binds the port above for its health answer and nothing else. */
 const standbyDoor = standbyStore === null ? null : createStandbyDoor({
+  // What this machine is running, for the updater's health gate reading this port (M15/05) — the
+  // same `<semver>+<sha>` `/api/health` answers with, and the same bundle id `/api/config` reports.
+  version: packVersion,
+  build: () => buildId(),
   facts: (): StandbyFacts => {
     const held = trustStore.current();
     const roster = held?.standbyRoster ?? [];
@@ -1178,11 +1369,19 @@ const standbyServer =
           // DEPOSED collie fails the check (§18.12), a LEAD passes it, and a peer holding a warrant
           // runs the door. A path nobody owns gets a bare 404 with no body worth reading — three
           // routes exist on this port and nothing else does.
+          // `/standby/update` FIRST, before every role: an update restarts the front door, so this
+          // is the one door still answering in the window the operator most wants to look (M15/04).
+          // It is the same file `/api/update/check` reports, read through the same staleness rule.
+          const update = standbyUpdateAnswer(req, url, () => readUpdateRun(cfg.stateDir));
+          if (update !== null) return withStandbyVersion(update, packVersion);
           const answered =
             deposed !== null
               ? deposedAnswer(deposed, outcomeNow(deposed, leadContact.facts()), url)
               : (frontDoorHealth(pack.mode, url) ?? (standbyDoor === null ? null : await standbyDoor(req, url)));
-          return answered ?? new Response("not found", { status: 404 });
+          // STAMPED HERE, ONCE, so it covers every answer this port can make — including the 404 for
+          // a path nobody owns and the deposed page, which are exactly the answers a runner probing a
+          // machine mid-update is most likely to meet (M15/05).
+          return withStandbyVersion(answered ?? new Response("not found", { status: 404 }), packVersion);
         },
       });
 
@@ -1206,12 +1405,20 @@ const server = startServer({
   snooze,
   notifyPrefs,
   updateMonitor,
+  // The preflight and the handoff, or undefined on an install with no compiled binary to run —
+  // where the route answers 503 and the phone says so (M15/05).
+  updateAction,
+  // The bare `<semver>+<sha>` this process answers `/api/health` and `/pack/v1/hello` with — one
+  // string, resolved once, so the detached updater's health gate and a peer can never be told two
+  // different things about this machine (M15/04).
+  version: packVersion,
   audit,
   activity,
   pack,
   pairing,
   stt,
   packLead,
+  packStatus,
   peerNotifier,
   // Registered on the EXISTENCE of a trust store, not on the mode: a lead answering its very first
   // `collie join` still has zero peers and is therefore still `solo` by mode. An instance that never

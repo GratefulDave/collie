@@ -13,10 +13,19 @@
 // no flag, no race — and because a navigation aborts any in-flight revalidation, the nav is instant
 // even while a poll's doomed fetch is still hanging.
 
-import { fetchDevices, fetchHistory, fetchPane, fetchSnapshot, isApiErrorStatus } from "@/lib/api";
+import {
+  fetchDevices,
+  fetchHistory,
+  fetchPack,
+  fetchPane,
+  fetchSnapshot,
+  isApiErrorStatus,
+} from "@/lib/api";
 import { parseAnsi } from "@/lib/ansi";
+import { noteUpdateRun } from "./self-update";
 import { splitLines } from "@/lib/blocks";
 import { isLostLatched } from "@/lib/connection-health";
+import { ambientSpaces } from "@/lib/hosts";
 import {
   dropLastPaneText,
   loadLastPaneText,
@@ -25,12 +34,22 @@ import {
   saveLastSnapshot,
 } from "@/lib/last-seen";
 import { detectNoEchoPrompt } from "@/lib/no-echo";
+import { markPollResult } from "@/lib/poll-intent";
 import { clearNotPaired, markNotPaired } from "@/lib/pairing";
-import { internScope, paneScopeKey, type Scope, scopeFromUrl, scopeKey } from "@/lib/scope";
+import {
+  internScope,
+  paneScopeKey,
+  type Scope,
+  scopeFromUrl,
+  scopeKey,
+  snapshotKey,
+  viewAllFromUrl,
+} from "@/lib/scope";
 import type {
   AgentView,
   BridgeStatus,
   DeviceAuth,
+  PackStatusResponse,
   PairedDeviceWire,
   PaneHistoryResponse,
   PaneReadResponse,
@@ -103,6 +122,16 @@ export interface HomeData {
   ts: number;
   /** The scope this snapshot was fetched for (host + session) — so children don't re-derive it. */
   scope: Scope;
+  /**
+   * True when this body was WIDENED (`?all=1`): its pane lists hold every Herdr session on the
+   * addressed machine, and every pane in them carries its own `session`. False is every view that
+   * existed before, where the lists hold one session and no pane names it.
+   *
+   * Deliberately NOT folded into {@link scope}: a scope is an ADDRESS and this is a breadth. See
+   * lib/scope.ts `ALL_PARAM` for the whole argument — the short version is that folding it in would
+   * carry it onto every pane URL and split every per-pane cache entry in two.
+   */
+  viewAll: boolean;
   /** Active notification snooze deadline (epoch ms), or null when not snoozed. */
   snoozedUntil: number | null;
   /** Version / upgrade status for the footer update banner; undefined on an older bridge. */
@@ -183,21 +212,31 @@ function isPaneUrl(url: string | undefined): boolean {
 function toHomeData(
   snap: SnapshotResponse,
   scope: Scope,
+  viewAll: boolean,
   error: boolean,
   lastSeenAt?: number,
 ): HomeData {
+  // Where the Collie UPDATE run is, on every snapshot — the self-updater must not reload the bundle
+  // out from under a running update, and it must reload once that run is done (M15/05). Stamped here
+  // rather than in the card so the hold applies on every route, not only where the card is mounted.
+  noteUpdateRun(snap.update?.run?.state);
   return {
     lastSeenAt,
     bridge: snap.bridge,
     device: snap.device,
     agents: snap.agents,
     shellPanes: snap.shellPanes ?? [],
-    workspaces: snap.workspaces ?? [],
-    tabs: snap.tabs ?? [],
+    // Narrowed to the address the URL is on, for the reason `ambientPanes` narrows the panes drawn
+    // beside them: the navigator is a tree of ONE machine, and on a pack the lead's merged body now
+    // carries every machine's spaces. A solo body carries no host on any row, so both calls pass
+    // everything through by identity and nothing about a solo dashboard changes.
+    workspaces: ambientSpaces(snap.workspaces ?? [], scope, snap.servers),
+    tabs: ambientSpaces(snap.tabs ?? [], scope, snap.servers),
     sessions: snap.sessions ?? [],
     servers: snap.servers ?? [],
     ts: snap.ts ?? 0,
     scope,
+    viewAll,
     snoozedUntil: snap.notifications?.snoozedUntil ?? null,
     update: snap.update,
     error,
@@ -215,12 +254,12 @@ function toHomeData(
 // restored PWA has an empty module cache and a failing first fetch, and without it the operator gets an
 // empty herd instead of the screen they left. A restored snapshot is promoted into the module cache so
 // the rest of this page session behaves exactly as if we had fetched it.
-function staleHome(scope: Scope): HomeData {
-  const restored = loadLastSnapshot(scope);
-  const cached = lastSnapshot.get(scopeKey(scope)) ?? restored?.value;
+function staleHome(scope: Scope, viewAll: boolean): HomeData {
+  const restored = loadLastSnapshot(scope, viewAll);
+  const cached = lastSnapshot.get(snapshotKey(scope, viewAll)) ?? restored?.value;
   if (cached) {
-    lastSnapshot.set(scopeKey(scope), cached);
-    return toHomeData(cached, scope, true, restored?.at);
+    lastSnapshot.set(snapshotKey(scope, viewAll), cached);
+    return toHomeData(cached, scope, viewAll, true, restored?.at);
   }
   // Nothing cached at all — an outage on a tab that never saw a good snapshot. `error: true` is what
   // keeps this apart from a genuinely empty herd downstream: the empty state is only allowed to say
@@ -237,6 +276,7 @@ function staleHome(scope: Scope): HomeData {
     servers: [],
     ts: 0,
     scope,
+    viewAll,
     snoozedUntil: null,
     update: undefined,
     error: true,
@@ -246,6 +286,10 @@ function staleHome(scope: Scope): HomeData {
 
 export async function rootLoader({ request }: { request?: Request } = {}): Promise<HomeData> {
   const scope = scopeFromRequest(request);
+  // The BREADTH, read off the same URL as the address and kept beside it rather than inside it. It
+  // is a home-view concept only: no other loader reads it, and nothing downstream may put it in a
+  // pane URL (lib/scope.ts ALL_PARAM).
+  const viewAll = viewAllFromUrl(request?.url);
   // Nav-vs-revalidate: a revalidation (poll) re-runs at the SAME url; a navigation runs at a different
   // one. Cold start (lastRootUrl undefined) reads as a navigation too, but the latch gate below is
   // never set that early, so the first run always really fetches (BootSplash + escalation, as today).
@@ -258,20 +302,20 @@ export async function rootLoader({ request }: { request?: Request } = {}): Promi
   // Fast path: a navigation during a known, escalated outage returns last-known data INSTANTLY rather
   // than hanging on a doomed fetch. Revalidations fall through and really fetch (so recovery lands and
   // markLive clears the latch → the next run fetches live and replaces the stale herd).
-  if (isNavigation && isLostLatched()) return staleHome(scope);
+  if (isNavigation && isLostLatched()) return staleHome(scope, viewAll);
 
   try {
-    const snap = await fetchSnapshot(scope, request?.signal);
-    lastSnapshot.set(scopeKey(scope), snap);
+    const snap = await fetchSnapshot(scope, request?.signal, viewAll);
+    lastSnapshot.set(snapshotKey(scope, viewAll), snap);
     // Write-through: the same body, dated, in a store that outlives this page (lib/last-seen.ts).
-    saveLastSnapshot(scope, snap);
+    saveLastSnapshot(scope, snap, undefined, viewAll);
     rememberAuthError(scope, false);
-    return toHomeData(snap, scope, false);
+    return toHomeData(snap, scope, viewAll, false);
   } catch (e) {
     if (isAbortError(e)) throw e; // superseded revalidation — let React Router drop it
     rememberAuthError(scope, isAuthError(e));
     // Keep the last good herd on screen, flagged so the ConnectionBanner can say "reconnecting…".
-    return staleHome(scope);
+    return staleHome(scope, viewAll);
   }
 }
 
@@ -417,6 +461,16 @@ export async function paneLoader({
     // branch) so the connection bar doesn't flicker on an unchanged poll.
     const read: PaneReadResponse = await fetchPane(paneId, lines, scope, request?.signal);
     const text = read.text || lastPaneText.get(key) || "";
+    // THE "IS THE SCREEN STILL MOVING" SIGNAL, taken at the one place that can honestly answer it.
+    //
+    // A 304 is the bridge saying the mirror is byte-identical, which is exactly "unchanged". The
+    // text compare behind it is not redundant: a bridge that serves no ETag would otherwise report
+    // every poll as a change and the burst would never end. Read BEFORE the write-through below,
+    // since `rememberPaneText` is what makes this text the previous one.
+    //
+    // The cadence consumes it (hooks/use-polling.ts): a mirror that keeps moving is one the operator
+    // is watching move.
+    markPollResult(read.notModified !== true && text !== lastPaneText.get(key));
     rememberPaneText(key, text);
     // Write-through, EXCEPT while the pane is asking for a secret — see holdsNoEchoPrompt (ADR 0017).
     if (holdsNoEchoPrompt(text)) dropLastPaneText(scope, paneId);
@@ -471,6 +525,37 @@ export async function devicesLoader({ request }: { request?: Request } = {}): Pr
     if (isAbortError(e)) throw e; // superseded revalidation — let React Router drop it
     // A failed read says nothing about pairing, so the latch is left exactly as it was.
     return { enforced: false, current: null, devices: [], error: true };
+  }
+}
+
+// ── The pack census (the /pack overview) ─────────────────────────────────────
+//
+// The pack route's own loader, shaped exactly like `devicesLoader`: it rides the poll loop while the
+// page is open (so a member going quiet shows up here without a reload), and a failure DEGRADES —
+// it never throws, because a page that answers "how is my pack doing?" with an error boundary has
+// answered the question badly.
+//
+// The 404 is not a failure and must not be rendered as one. Only a lead serves `/api/pack`; a solo
+// collie and a peer refuse, and that refusal is the truthful answer "there is no pack here". So it
+// is folded to `status: null, error: false`, and the route says so in one honest card. Every OTHER
+// refusal — a real outage, a 500 — keeps `status: null` but sets `error`, because "I could not ask"
+// and "there is nothing to ask about" are different sentences and the operator's next move differs.
+
+export interface PackData {
+  /** The census, or `null` when this collie leads no pack (404) or the fetch failed. */
+  status: PackStatusResponse | null;
+  /** True only for a fetch that FAILED — a 404 is an answer, not an error. */
+  error: boolean;
+}
+
+export async function packLoader({ request }: { request?: Request } = {}): Promise<PackData> {
+  try {
+    return { status: await fetchPack(request?.signal), error: false };
+  } catch (e) {
+    if (isAbortError(e)) throw e; // superseded revalidation — let React Router drop it
+    // Solo or peer: there is no pack to report, and that is a complete answer.
+    if (isApiErrorStatus(e, 404)) return { status: null, error: false };
+    return { status: null, error: true };
   }
 }
 

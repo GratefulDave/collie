@@ -11,8 +11,11 @@ import {
   fakeFiles,
   HOME,
   ROOT,
+  STATE,
   type Scripted,
 } from "./fakes.ts";
+import { leadStore, member, peerStore } from "../bridge/pack/fixtures.ts";
+import { serializeTrustStore } from "../bridge/pack/trust-store.ts";
 import { EXIT, type Io } from "./io.ts";
 
 /** The `Io` a nested `serve` was handed — `null` until it has been called. */
@@ -21,6 +24,7 @@ interface SeenIo {
 }
 import {
   cmdLogs,
+  cmdRestart,
   cmdStart,
   cmdStatus,
   cmdStop,
@@ -70,7 +74,14 @@ function harness(over: HarnessOptions = {}): Harness {
   const files = fakeFiles({ [BINARY]: "", ...over.files });
   const readyCalls: Array<{ port: number; host: string }> = [];
   const deps: LifecycleDeps = {
-    ctx: context(over.env, over.instance === undefined ? {} : { instance: over.instance }),
+    // Every fixture here is a Collie that has already chosen its multiplexer, so `start`'s first-run
+    // gate (`cli/mux.ts`) returns before it probes. A supervision test must not also be a test of
+    // that question — `cli/mux.test.ts` owns it, and the one case where it stops `start` is pinned
+    // below in "the first-run multiplexer gate".
+    ctx: context(
+      { COLLIE_MUX: "herdr", ...over.env },
+      over.instance === undefined ? {} : { instance: over.instance },
+    ),
     io,
     exec,
     files,
@@ -367,6 +378,52 @@ describe("start, unsupervised", () => {
   });
 });
 
+// The gate itself is `cli/mux.test.ts`'s subject; what is pinned here is that it sits IN FRONT of
+// `start` — before the unit is written and before anything is spawned. A bridge launched for a
+// multiplexer nobody chose is the outage M14/03 removes.
+describe("the first-run multiplexer gate", () => {
+  /** Where the tmux adapter's own candidate list looks first — a second sighting, in one file. */
+  const TMUX_BIN = "/usr/bin/tmux";
+  const unchosen = (over: HarnessOptions = {}): Harness =>
+    harness({ ...over, env: { ...over.env, COLLIE_MUX: undefined } });
+
+  test("refuses `start` when nothing is configured and nothing is running", async () => {
+    const h = unchosen({ answers: NO_SYSTEMD });
+    expect(await cmdStart(h.deps)).toBe(EXIT.FAIL);
+    expect(h.exec.spawned).toHaveLength(0);
+    expect(h.io.stderr.join("\n")).toContain("no COLLIE_MUX is set");
+    expect(h.io.stderr.join("\n")).toContain(`${CONFIG}/.env`);
+  });
+
+  test("auto-selects the only multiplexer running, writes it down, and hands it to the bridge", async () => {
+    const socket = "/home/pat/.config/herdr/herdr.sock";
+    const h = unchosen({ answers: NO_SYSTEMD, files: { [socket]: "" } });
+    expect(await cmdStart(h.deps)).toBe(EXIT.OK);
+    expect(h.files.read(`${CONFIG}/.env`)).toContain("COLLIE_MUX=herdr");
+    // Both halves: the file a supervised bridge reads, and the environment this one is spawned with.
+    expect(h.exec.spawned[0]?.env.COLLIE_MUX).toBe("herdr");
+  });
+
+  // `restart` asks the SAME question, and asks it FIRST. A refusal reached from inside `start` would
+  // arrive after `stop` had already disabled the unit, so the verb that promises a running bridge
+  // would end with none — the 1.0.0 outage this pins shut.
+  test("`restart` refuses before it stops anything, so the bridge it cannot re-start stays up", async () => {
+    const socket = "/home/pat/.config/herdr/herdr.sock";
+    const h = unchosen({
+      files: { [socket]: "", [TMUX_BIN]: "" },
+      answers: [[`${TMUX_BIN} list-sessions`, { stdout: "work\n" }]],
+    });
+    expect(await cmdRestart(h.deps)).toBe(EXIT.FAIL);
+    // The whole point: no service manager was touched, and the line `stop` prints was never printed.
+    expect(h.exec.calls).toEqual([`${TMUX_BIN} list-sessions -F #{session_name}`]);
+    expect(h.io.stdout).not.toContain("bridge stopped");
+    expect(h.exec.spawned).toHaveLength(0);
+    const said = h.io.stderr.join("\n");
+    expect(said).toContain("no COLLIE_MUX is set, and 2 multiplexers are running");
+    expect(said).toContain(`  printf 'COLLIE_MUX=<herdr|tmux|zellij>\\n' >> ${CONFIG}/.env && collie start`);
+  });
+});
+
 describe("stop", () => {
   test("systemd: disable --now, so it stays down across a login", () => {
     const h = harness();
@@ -418,6 +475,60 @@ describe("the status banner", () => {
     const lines = (await statusBanner(cold.deps)).join("\n");
     expect(cold.readyCalls).toEqual([{ port: 8787, host: "100.64.0.8" }]);
     expect(lines).toContain("⚠ Collie isn't answering on 100.64.0.8:8787 yet");
+  });
+
+  // F13: the probe already resolved the bind; the `local` row two lines under it did not, so a peer
+  // bound to its tailnet address was reported UP with a loopback URL that refuses to connect.
+  test("the `local` row is the bind, and the two halves of the banner agree", async () => {
+    const solo = (await statusBanner(harness({ ready: true }).deps)).join("\n");
+    expect(solo).toContain("local     http://127.0.0.1:8787");
+
+    const moved = harness({ ready: false, env: { COLLIE_HOST: "192.168.77.1" } });
+    const lines = (await statusBanner(moved.deps)).join("\n");
+    expect(lines).toContain("local     http://192.168.77.1:8787");
+    expect(lines).toContain("isn't answering on 192.168.77.1:8787");
+    // Not "no 127.0.0.1 anywhere": the `tailnet` row's no-name fallback names loopback on purpose,
+    // and says why on the same line. The `local` row is the one that claimed it silently.
+    expect(lines).not.toContain("local     http://127.0.0.1");
+  });
+
+  // F22's other half: one resolution behind the probe and the `local` row. A wildcard bind means
+  // EVERY interface, so loopback is one of the addresses it answers on and the only one this machine
+  // can promise reaches itself — probing the literal `0.0.0.0` is a dial nobody asked for.
+  test("a WILDCARD bind is probed on loopback, and the banner says so once", async () => {
+    const h = harness({ ready: true, env: { COLLIE_HOST: "0.0.0.0" } });
+    const lines = (await statusBanner(h.deps)).join("\n");
+    expect(h.readyCalls).toEqual([{ port: 8787, host: "127.0.0.1" }]);
+    expect(lines).toContain("local     http://127.0.0.1:8787");
+
+    const cold = harness({ ready: false, env: { COLLIE_HOST: "" } });
+    expect((await statusBanner(cold.deps)).join("\n")).toContain("⚠ Collie isn't answering on :8787 yet");
+    expect(cold.readyCalls).toEqual([{ port: 8787, host: "127.0.0.1" }]);
+  });
+
+  // F24: the banner's other half of the same finding. A peer publishes no front door (ADR 0013), so
+  // a `tailnet` row was a row about a door that is not there — and the URL it offered was loopback,
+  // which on a peer is not the bind either. The pack row answers the question the tailnet row was
+  // asked: where DO I point my phone.
+  test("a peer's banner names the pack, not a tailnet door it does not serve", async () => {
+    const h = harness({
+      ready: true,
+      env: { COLLIE_HOST: "192.168.77.2" },
+      files: { [`${STATE}/pack-trust.json`]: serializeTrustStore(peerStore()) },
+    });
+    const lines = (await statusBanner(h.deps)).join("\n");
+    expect(lines).toContain("local     http://192.168.77.2:8787");
+    expect(lines).toContain("pack      peer — no front door here");
+    expect(lines).not.toContain("tailnet");
+  });
+
+  test("a LEAD, and a solo collie, keep the tailnet row exactly as it was", async () => {
+    const lead = harness({
+      ready: true,
+      files: { [`${STATE}/pack-trust.json`]: serializeTrustStore(leadStore({ peers: [member({ memberId: "nas" })] })) },
+    });
+    expect((await statusBanner(lead.deps)).join("\n")).toContain("tailnet");
+    expect((await statusBanner(harness({ ready: true }).deps)).join("\n")).toContain("tailnet");
   });
 
   test("reads the unit's state, not merely that a unit exists", () => {

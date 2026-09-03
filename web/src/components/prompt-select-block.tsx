@@ -190,7 +190,9 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
       ) : feedback && feedbackCopy && terminalFocused ? (
         <div className="rounded-lg border border-dashed border-status-working/50 px-3 py-2 text-xs text-status-working">
           {feedbackCopy.focused}
-          {feedback.text ? <span className="text-muted-foreground"> ({feedback.text})</span> : null}
+          {feedback.text ? (
+            <span className="font-content text-muted-foreground"> ({feedback.text})</span>
+          ) : null}
         </div>
       ) : feedback && feedbackCopy && feedback.text !== "" ? (
         <div className="flex items-start gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2">
@@ -200,7 +202,7 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
           />
           <span className="min-w-0 flex-1 text-xs text-foreground/90">
             {feedbackCopy.typedPrefix}
-            {feedback.text}
+            <span className="font-content">{feedback.text}</span>
           </span>
         </div>
       ) : feedback && feedbackCopy && feedbackCopy.offer && editorOpen ? (
@@ -221,7 +223,7 @@ export function PromptSelectBlock({ prompt, onAction, disabled }: PromptSelectBl
             rows={3}
             aria-label={t("prompt.feedback.planChange.textAria")}
             placeholder={feedbackCopy.placeholder}
-            className="w-full resize-none rounded-md border border-border/60 bg-background px-2 py-1.5 text-sm text-foreground outline-none focus:border-primary/60"
+            className="w-full resize-none rounded-md border border-border/60 bg-background px-2 py-1.5 text-sm text-foreground focus:border-primary/60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
           />
           <p className="text-[11px] leading-snug text-muted-foreground">{feedbackCopy.help}</p>
           <div className="flex items-center justify-end gap-1.5">

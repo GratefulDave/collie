@@ -1,6 +1,24 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 
+/* Codex paints submitted user messages onto a near-white terminal-width row. The mirror's light
+   theme inversion turns that fill nearly black; on a narrow phone it reads as a heavy black bar
+   rather than message emphasis. The codex adapter marks only that exact ANSI fill. Desktop keeps
+   the native TUI background, while phone width makes it transparent without touching diff colours.
+
+   The marked segment carries its fill in --terminal-seg-bg instead of an inline background-color,
+   so these two rules can win by ordinary cascade order. An inline background-color would need
+   `!important` to override, which nothing else in this stylesheet does. */
+.terminal-mobile-transparent-bg {
+  background-color: var(--terminal-seg-bg);
+}
+
+@media (max-width: 640px) {
+  .terminal-mobile-transparent-bg {
+    background-color: transparent;
+  }
+}
+
 /* `dark:` must fire for BOTH an explicitly-pinned dark root and a system-dark root the user hasn't
    pinned to light — otherwise the handful of literal `dark:` utilities silently stop working for
    everyone on System (the default). Token-driven colors don't need this; these are the literals. */
@@ -33,7 +51,14 @@
 :root {
   color-scheme: light dark;
 
-  --radius: 0.65rem;
+  /* 2px, not the stock 0.65rem, and it does not ramp. The radius descends from the mark: the mark
+     holds a disc and a traced line, and it holds no stadium and no soft-cornered box anywhere. A
+     corner is either a full circle (width == height — a dot, an avatar, the switch thumb) or it is
+     effectively square. 2px is the smallest radius that still reads as intentional rather than as a
+     rasterizer artefact, so it is the floor the whole surface sits on. The four derived steps below
+     are hard-set to the same 2px: the stock shadcn calc() ramp subtracts up to 4px, which at this
+     base computes negative and is invalid. */
+  --radius: 2px;
   /* Light deviates from stock shadcn in two places, both measured rather than taste:
      --background is a step off white (stock has background == card == popover == pure white, so the
      entire dashboard hierarchy rests on one 1.26:1 hairline), and --muted-foreground is darkened
@@ -43,8 +68,25 @@
   --foreground: light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
   --card: light-dark(oklch(1 0 0), oklch(0.205 0 0));
   --card-foreground: light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
-  --popover: light-dark(oklch(1 0 0), oklch(0.205 0 0));
-  --popover-foreground: light-dark(oklch(0.145 0 0), oklch(0.985 0 0));
+  /* THE GROUND UNDER THE THUMB — the composer's chrome block, and nothing else. Chrome is normally
+     the page colour separated by a rule (see --muted below), and that rule holds everywhere the
+     chrome sits on the PAGE. It cannot hold here: this block sits on the terminal mirror, and in
+     dark --background IS the mirror's fill (components/mirror-space.ts), so page-coloured chrome
+     against it is invisible and the grab handle inside it stops reading as a control at all.
+     It needs a fill, and the fill it had was --muted: rgb(38) in dark, a bright slab under a
+     rgb(10) terminal, which the operator read as too light. This is the same value as --card in
+     dark — one raised-chrome surface app-wide, shared with the sheets — and the same value --muted
+     already had in light, where --card is pure white and would land 1.04:1 against the inverted
+     mirror. One name, because it answers one question: what does chrome stand on when it cannot
+     stand on the page. */
+  --chrome: light-dark(oklch(0.94 0 0), oklch(0.205 0 0));
+  /* Pinned to --card, not a value of its own. `bg-popover` / `text-popover-foreground` appear ZERO
+     times in src/ — Collie's floating layer is the BottomSheet (ui/sheet.tsx), which is
+     `bg-background` over a `bg-black/50` scrim. The pair is kept rather than deleted only so a
+     future `npx shadcn add` of a Popover/Tooltip primitive lands on a Collie surface instead of
+     stock white; it is an alias, and there is no third paper behind it. */
+  --popover: var(--card);
+  --popover-foreground: var(--card-foreground);
   --primary: light-dark(oklch(0.205 0 0), oklch(0.922 0 0));
   --primary-foreground: light-dark(oklch(0.985 0 0), oklch(0.205 0 0));
   /* The "this control is ON" tint — a very light sky. Its own token pair rather than reusing
@@ -57,12 +99,21 @@
      makes it visible is that it is the one saturated thing in a neutral row. Don't "fix" that number
      by darkening it into a mid blue. Text on the tint is what has to clear a contrast bar, and does:
      7.3:1 light, 9.2:1 dark. */
-  --control-on: light-dark(oklch(0.90 0.06 235), oklch(0.32 0.05 240));
-  --control-on-foreground: light-dark(oklch(0.38 0.12 245), oklch(0.89 0.06 235));
+  --control-on: light-dark(oklch(0.9 0.06 235), oklch(0.32 0.05 240));
+  --control-on-foreground: light-dark(
+    oklch(0.38 0.12 245),
+    oklch(0.89 0.06 235)
+  );
   --secondary: light-dark(oklch(0.94 0 0), oklch(0.269 0 0));
   --secondary-foreground: light-dark(oklch(0.205 0 0), oklch(0.985 0 0));
-  /* Light --muted is a step BELOW --background so the header/composer chrome band still reads as a
-     distinct surface now that the page is no longer white. */
+  /* The INERT fill — a well, a disabled track, a quiet chip on a card. Value unchanged (rgb 235
+     light / 38 dark), but its old job is gone: it used to be the chrome band behind the header,
+     "a step BELOW --background so the band still reads as a distinct surface". The band existed
+     because the line it competed with was not a line — `border-border/60` composites to 1.09:1
+     against the page in light and 1.16:1 in dark, i.e. a rumour. --rule below is that line drawn
+     properly, and chrome is now the page colour (app-header.tsx, settings.tsx, pack.tsx).
+     Do NOT put --muted back behind chrome: on the pane screen it re-opens the seam --background's
+     0.97 was chosen to close, and it is the worst ground a status chip has ever landed on. */
   --muted: light-dark(oklch(0.94 0 0), oklch(0.269 0 0));
   /* Light was oklch(0.556) — 4.74:1 on white, i.e. zero headroom, so every /70, /80 and opacity-60
      derivative in the app fell under 3:1 while its dark counterpart passed. Darkened to buy that
@@ -78,10 +129,24 @@
      ~0.94, active 0.92 — and 0.94 would have collided the last two. */
   --accent: light-dark(oklch(0.92 0 0), oklch(0.269 0 0));
   --accent-foreground: light-dark(oklch(0.205 0 0), oklch(0.985 0 0));
-  --destructive: light-dark(oklch(0.577 0.245 27.325), oklch(0.704 0.191 22.216));
+  --destructive: light-dark(
+    oklch(0.577 0.245 27.325),
+    oklch(0.704 0.191 22.216)
+  );
   --destructive-foreground: light-dark(oklch(0.985 0 0), oklch(0.985 0 0));
   --border: light-dark(oklch(0.922 0 0), oklch(1 0 0 / 12%));
   --input: light-dark(oklch(0.922 0 0), oklch(1 0 0 / 15%));
+  /* The STRUCTURAL line, and deliberately stronger than --border. --border draws one component's
+     edge; --rule draws the cut between two regions of chrome — the header's bottom edge, a strip
+     separator, the composer's top edge — where the whole job is to separate chrome from page
+     without a fill.
+     Measured against --background, which is the only ground chrome sits on:
+       border-border/60  1.09:1 light  ·  1.16:1 dark   ← what the header used, invisible
+       border-border     1.16:1 light  ·  1.26:1 dark
+       --rule            1.34:1 light  ·  2.06:1 dark
+     rgb(214) on rgb(245) light; white 24% over rgb(10) = rgb(69) dark. At 3x DPR on a phone that
+     is a crisp 1px cut, which is the mark's own vocabulary — a cut, not a wash. */
+  --rule: light-dark(oklch(0.875 0 0), oklch(1 0 0 / 24%));
   /* Light is darkened off stock shadcn (0.708 → 0.62): at 0.708 the focus ring measures 2.58:1 on
      white, under the 3:1 WCAG 1.4.11 floor for a non-text indicator — and components draw it at
      `ring-ring/50`, which halves that again. On an app whose buttons type into a live shell, a focus
@@ -98,25 +163,132 @@
      makes the dots darker; if that costs the dashboard its glance-ability outdoors, the fallback is
      splitting fill and text into separate tokens.
 
-     The light values are measured against the WORST ground this text lands on, which took three
-     tries to get right. Tuned against plain white they were 5.4/4.8/4.6 and failed on the chip.
-     Tuned against the `bg-status-X/15` chip on a white card they were 4.90/4.58/4.46 and still
-     failed, because the chip is translucent and the card underneath varies: `needs you` sits on a
-     `bg-status-blocked/5` card (4.17) and the pane header's chip sits on `bg-muted`, rgb(235) not
-     rgb(255) (3.91). These are tuned against that rgb(235) case. When touching them, measure the
-     chip on the pane header, not the dot on the dashboard. */
+     Measure the CHIP, never the dot: the chip is `bg-status-X/15` under `text-status-X`, so the
+     translucent wash lifts the ground toward the ink and the ratio is always worse than the solid
+     text. /15 is the strict case and the one the table below uses; status-badge.tsx draws its chip
+     at /10, which is ~0.4 kinder everywhere, so anything that passes here passes there too. Tuned against plain white these read 5.4/4.8/4.6 and failed on the chip; tuned against
+     the chip on a white card they read 4.90/4.58/4.46 and still failed, because the ground varies.
+
+     The historic worst ground was the header band, `bg-muted` rgb(235) — that band is GONE (see
+     --muted). Chips now land on --background or --card and on nothing else. The table below is
+     RASTERISED, not arithmetic: each cell was rendered by the browser at DPR 1 and the pixel read
+     back, so the oklab `color-mix` Tailwind emits for `/15` is measured rather than modelled. Plain
+     sRGB alpha arithmetic agrees to within 0.08 and always in the pessimistic direction.
+
+       ground              blocked working done  idle  unknown info
+       --card    255        5.71   5.75   5.39  5.96  6.40    5.19   (light)
+       --background 245     5.23   5.28   4.95  5.47  5.88    4.77   (light, the only chrome ground)
+       --muted   235        4.83   4.89   4.58  5.06  5.44   *4.41   (light, the old header band)
+       --accent  228        4.55   4.60  *4.31  4.77  5.12   *4.16   (light, NOT A PERMITTED GROUND)
+       --background 10      5.59   8.67   7.37  6.79  5.75    8.41   (dark)
+       --card     23        4.90   7.47   6.39  5.89  5.01    7.28   (dark)
+       --muted    38       *4.13   6.16   5.29  4.87 *4.16    6.02   (dark, the old header band)
+       --accent   38       *4.13   6.16   5.29  4.87 *4.16    6.02   (dark, NOT A PERMITTED GROUND)
+
+     Every cell on --background and --card clears 4.5. The starred cells are why the two fills are
+     not permitted grounds, and they are recorded so nobody re-derives them the expensive way.
+
+     Both of the failures this table used to record are now CLOSED, and the fixes were of two
+     different kinds — keep the distinction, because it is the rule for the next one:
+       · dark `unknown` was 4.35 on --background and 3.82 on --card. No ground could reach it, so
+         the TOKEN moved. See --status-idle / --status-unknown below.
+       · the switcher active row was `bg-accent` (rgb 228 light / 38 dark) and it CONTAINS status
+         count pills: blocked 4.55 / working 4.60 light — hairline — and blocked 4.13 dark, an
+         outright fail. The GROUND moved: the fill is gone and the row is marked by a 2px inset rail
+         in --primary (session-switcher.tsx, server-switcher.tsx), so the pills land on the sheet's
+         --background at 5.23 / 5.28 light and 5.59 / 8.67 dark.
+     A chip belongs on --background or --card and on nothing else. */
   --status-blocked: light-dark(oklch(0.46 0.2 25), oklch(0.7 0.2 24));
   --status-working: light-dark(oklch(0.46 0.12 72), oklch(0.82 0.15 82));
   --status-done: light-dark(oklch(0.45 0.14 152), oklch(0.74 0.16 152));
-  --status-idle: light-dark(oklch(0.45 0.02 250), oklch(0.65 0.02 250));
-  --status-unknown: light-dark(oklch(0.43 0.02 250), oklch(0.6 0.02 250));
+  /* The two quiet ends of the palette, and the only pair in it tuned as a PAIR. Light halves are
+     untouched (chip on --background: idle 5.47, unknown 5.88).
 
-  /* Calm-info sky blue — same shape as the lifecycle palette above (light tuned to clear 4.5:1 on
-     the rgb(235) chip ground, dark brighter to glow on near-black) but a distinct hue (230, cool
-     sky) so it never gets confused with `status-working`'s amber "needs attention" signal. Used by
+     Both dark halves were raised, and both had to move together. Dark `unknown` was oklch(0.6 0.02)
+     = rgb(119,129,140): its chip measured 4.35 on --background and 3.82 on --card, so it failed the
+     4.5 floor on every ground it is allowed to sit on and no ground change could reach it. Clearing
+     --card (the binding ground, since the wash lifts less over a lighter paper) needs L >= 0.645 for
+     a bare pass; 0.68 was taken instead so the pass has ~0.46 of headroom rather than a hairline.
+     Raising `unknown` to 0.68 would have put it ABOVE `idle` at 0.65 and inverted the pair, so
+     `idle` went up to 0.73 and the 0.05 L gap between them is preserved exactly.
+
+     The chroma went 0.02 -> 0.03 in the dark halves only, and that is the load-bearing part: at
+     L 0.68/0.73 these values sit on either side of --muted-foreground (0.708, rgb 161,161,161), so
+     lightness can no longer separate them from ordinary quiet text and the tint has to. Measured as
+     rgb distance, the three pairs now sit in one band — idle/unknown 26.6 (was 26.0),
+     idle/muted-fg 27.5 (was 32.5), unknown/muted-fg 25.2 — i.e. no pair is closer than the
+     idle/unknown pair this file already treats as far enough apart. 0.03 is still the lowest chroma
+     in the app; --control-on is 0.05 and every other status hue is 0.15 or more, so neither of these
+     reads as a signal blue.
+
+     Dark chips, --background / --card:  idle 6.79 / 5.89   unknown 5.75 / 5.01. New rgb values are
+     idle 154,170,186 and unknown 139,154,171. */
+  --status-idle: light-dark(oklch(0.45 0.02 250), oklch(0.73 0.03 250));
+  --status-unknown: light-dark(oklch(0.43 0.02 250), oklch(0.68 0.03 250));
+
+  /* Calm-info sky blue — same shape as the lifecycle palette above (dark brighter to glow on
+     near-black). It is the palette's tightest light value: on the old rgb(235) header band its chip
+     measured 4.41 — under the floor the block above claims. Chrome is the page now, so the one
+     surface that uses it (alpha-bar.tsx, inside the header) reads 4.77. It has ~0.27 of headroom
+     and no more; do not lighten it, and do not put it back on a fill. Same shape as the lifecycle
+     values but a distinct hue (230, cool sky) so it never gets confused with `status-working`'s
+     amber "needs attention" signal. Used by
      surfaces that are informational, not a status: currently just the prerelease strip
      (alpha-bar.tsx). */
   --status-info: light-dark(oklch(0.46 0.14 230), oklch(0.8 0.15 230));
+
+  /* ── Per-host identity palette (components/host-chip.tsx, lib/hosts.ts) ──────────────────────
+     Ten hues, `--host-0` … `--host-9`, handed to machines by lib/hosts.ts `hostSlot`. They are an
+     IDENTITY, never a state: nothing about a host's health, version or reachability is encoded
+     here, and the machine's NAME is always rendered beside the tint (WCAG 1.4.1 — colour is the
+     second encoding, never the only one). On a solo collie no host wears one at all.
+
+     WHY THESE TEN HUES, AND NOT TAILWIND'S SHADE RAMP. Four bands of the wheel are already spoken
+     for by the status palette above and a host tint must never be read as a status: blocked 24-27,
+     working 72-82, done 149-152, info 230. What is left is ten hues at ~20-90 degrees of
+     separation — orange 41, lime 132, teal 185, cyan 221, sky 241, blue 262, indigo 280,
+     purple 302, fuchsia 325, pink 352 — and the SLOT ORDER below interleaves them, so the linear
+     probe in `hostSlot` hands neighbouring slots hues from opposite sides of the wheel.
+     Two hues sit near a status and are kept deliberately: cyan (9 off `info`) and sky (11 off it).
+     `--status-info` is drawn in exactly one place, the prerelease strip in the header
+     (alpha-bar.tsx), and never beside a host mark. Everything nearer a status than that was
+     dropped: rose and red (blocked), amber and yellow (working), green and emerald (done).
+
+     The light halves are NOT Tailwind's `-600` shades. Tailwind's 600s read 2.4-4.7:1, i.e. most of
+     the ramp fails 4.5 outright, and its 700s and 800s fail too for the low-chroma hues. So the
+     light half is tuned the way the status palette is: L 0.46, the hue's maximum in-gamut chroma
+     capped at 0.20. The dark half IS Tailwind's `-400` L/C at the same hue — the ramp's dark end
+     glows correctly on near-black and needed no work.
+
+     The tint is applied to the GLYPH ONLY (ui/address-tag.tsx, host-chip.tsx) — the tag's border,
+     background and name stay the literal untinted `border-border bg-muted/60 text-muted-foreground`
+     always; only the leading icon inside it wears `text-host-N`. A wash across the whole pill read
+     as too much and was dropped. The table below is a RECORD of the wash's rasterised chip contrast
+     from when `bg-host-N/15` under `text-host-N` was still applied to the whole tag; it no longer
+     drives what ships, since `text-host-N` on a small glyph over `--muted/60` clears every one of
+     these grounds by a wider margin than the wash did:
+       slot 0 cyan    5.07/5.48 light   8.39/7.27 dark
+       slot 1 orange  5.46/5.90          6.47/5.63
+       slot 2 purple  5.71/6.16          5.89/5.13
+       slot 3 lime    5.03/5.44          9.74/8.38
+       slot 4 pink    5.47/5.96          6.01/5.25
+       slot 5 teal    4.96/5.37          8.43/7.22
+       slot 6 blue    5.40/5.86          6.09/5.30
+       slot 7 fuchsia 5.65/6.12          6.36/5.55
+       slot 8 sky     5.11/5.55          7.10/6.17
+       slot 9 indigo  5.58/6.08          5.34/4.67   ← the palette's tightest cell
+     Every cell clears 4.5 on both permitted grounds. `--muted` and `--accent` are not permitted
+     grounds here either, for the reason the status block states. */
+  --host-0: light-dark(oklch(0.46 0.085 221), oklch(0.789 0.154 221));
+  --host-1: light-dark(oklch(0.46 0.143 41), oklch(0.75 0.183 41));
+  --host-2: light-dark(oklch(0.46 0.2 302), oklch(0.714 0.203 302));
+  --host-3: light-dark(oklch(0.46 0.129 132), oklch(0.841 0.238 132));
+  --host-4: light-dark(oklch(0.46 0.192 352), oklch(0.718 0.202 352));
+  --host-5: light-dark(oklch(0.46 0.082 185), oklch(0.777 0.152 185));
+  --host-6: light-dark(oklch(0.46 0.2 262), oklch(0.707 0.165 262));
+  --host-7: light-dark(oklch(0.46 0.2 325), oklch(0.74 0.238 325));
+  --host-8: light-dark(oklch(0.46 0.108 241), oklch(0.746 0.16 241));
+  --host-9: light-dark(oklch(0.46 0.2 280), oklch(0.673 0.182 280));
 
   /* ── Terminal palette ─────────────────────────────────────────────────────────────────────────
      The 16 indexed ANSI slots, emitted by lib/ansi.ts as var(--ansi-N).
@@ -153,15 +325,20 @@
 }
 
 @theme inline {
-  --radius-sm: calc(var(--radius) - 4px);
-  --radius-md: calc(var(--radius) - 2px);
-  --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) + 4px);
+  /* One radius, four names. There is no ramp to walk: sm/md/lg/xl all resolve to the same 2px, so
+     `rounded-md` and `rounded-xl` are the same corner and no component can drift rounder than its
+     neighbour by picking a bigger step. Written out rather than left as calc(): at --radius: 2px
+     the stock `- 2px` and `- 4px` forms compute 0 and -2px, and a negative radius is invalid. */
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
+  --color-chrome: var(--chrome);
   --color-popover: var(--popover);
   --color-popover-foreground: var(--popover-foreground);
   --color-primary: var(--primary);
@@ -178,6 +355,7 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
   --color-input: var(--input);
+  --color-rule: var(--rule);
   --color-ring: var(--ring);
 
   --color-status-blocked: var(--status-blocked);
@@ -187,9 +365,37 @@
   --color-status-unknown: var(--status-unknown);
   --color-status-info: var(--status-info);
 
-  --font-mono: "Nerd Font Symbols", "JetBrains Mono", "Cascadia Mono", "Cascadia Code",
-    "Roboto Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
-    monospace;
+  --color-host-0: var(--host-0);
+  --color-host-1: var(--host-1);
+  --color-host-2: var(--host-2);
+  --color-host-3: var(--host-3);
+  --color-host-4: var(--host-4);
+  --color-host-5: var(--host-5);
+  --color-host-6: var(--host-6);
+  --color-host-7: var(--host-7);
+  --color-host-8: var(--host-8);
+  --color-host-9: var(--host-9);
+
+  --font-mono:
+    "Nerd Font Symbols", "JetBrains Mono", "Cascadia Mono", "Cascadia Code",
+    "Roboto Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* The UI typeface — CHROME ONLY, and the DEFAULT one. Which face this actually is became a
+     per-device setting in ADR 0033; this is the stack a device that has never touched the setting
+     gets, which is why it is still spelled here and not behind a class. The `:root.font-*` blocks
+     below hold the others. See the @font-face block for what "chrome only" means and why the
+     stand-in family in the middle of the stack is not optional. */
+  --font-sans:
+    "Aldrich", "Aldrich Fallback", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+
+  /* The CONTENT stack: exactly what the app rendered in before the UI typeface arrived. Anything an
+     agent or a machine authored wears this, so the custom face never dresses someone else's words
+     (see the boundary note below). It is a plain system stack on purpose — it ships no bytes. */
+  --font-content:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
 }
 
 /* Nerd Font symbols, bundled — the only webfont Collie ships.
@@ -233,12 +439,191 @@
   unicode-range: U+F0000-F1AFF;
 }
 
+/* The UI typefaces — Space Grotesk (the default) and Aldrich, both bundled. The app's own voice,
+ * and NOTHING ELSE'S.
+ *
+ * WHAT IT DRESSES. Chrome: headers, section labels, buttons, settings rows, banners, counts, the
+ * wordmark. WHICH face does that is the reader's choice, per device: the Typeface card in Settings
+ * writes `collie:design:v1` and public/theme-init.js turns it into a root class before first paint
+ * (ADR 0033). This used to say "the maker's choice and there is no setting for it"; that decision
+ * fell, and the ADR records why. The Terminal font card below it is a DIFFERENT setting — it
+ * configures --font-mono, which nothing in this block touches.
+ *
+ * WHAT IT MUST NEVER DRESS. Anything an agent or a machine authored: the pane mirror, the
+ * transcript, agent prose and markdown, code, command text, file paths, ANSI. Two mechanisms hold
+ * that line, and both must stay:
+ *   1. `font-mono` — every verbatim terminal surface already carries it, so it resolves through
+ *      --font-mono and never sees this face. The colour half of the same boundary is
+ *      components/mirror-space.ts:33-34 (MIRROR_SPACE / MIRROR_INVERT); read its header first.
+ *   2. `font-content` (--font-content above) — for agent-authored text that is NOT verbatim
+ *      terminal output and therefore is not monospaced: rendered markdown, and the labels the
+ *      interactive blocks lift out of a dialog. mirror-space.ts says those blocks are "siblings of
+ *      the mirror, not children" and keep app theming — true for colour, and exactly why they need
+ *      this second mechanism for family. A new surface that prints an agent's words takes one of
+ *      the two. If you cannot tell whether a surface is chrome or content, it is content.
+ *
+ * WHY THIS FACE. The mark is a line-art collie head in an ellipse with monotone beads: one stroke,
+ * constant curvature, mitred corners (collie-brand/src/bead.ts). Space Grotesk is the candidate
+ * drawn from the same idea — geometric skeleton, monotone stroke, cut terminals — so the wordmark
+ * at 18px reads as one drawing with the mark beside it. Its cost is the small end: x-height is
+ * 486/1000, the lowest of the three faces measured, so 11px uppercase labels and the 13px tier are
+ * where it has to be judged. The other two candidates (IBM Plex Sans 3.201, Geist 1.800) are on
+ * disk in public/fonts/ and wired into the playground's "UI typeface" card behind a live switcher —
+ * that card is where a candidate is AUDITIONED before anyone argues for shipping it.
+ *
+ * WEIGHT. 27 KB, subset to Latin + Latin-Ext-A + the punctuation this app actually prints (·, —, …,
+ * ‹›, arrows, ×, ✓) and instanced to wght 400–700. Compare 641 KB / 504 KB for the two Nerd Font
+ * faces — those are lazy behind `unicode-range`; this one is on the critical path, which is why it
+ * had to be this small. `tnum` is kept in the subset: every count in the app is `tabular-nums`.
+ * Rebuild with scripts/build-ui-font.sh; the version is in the filename because public/ assets are
+ * unhashed and the SW caches them forever by URL (lib/sw-routes.ts FONT_URLS).
+ *
+ * NO LAYOUT SHIFT — the part that is not negotiable. `font-display: swap` paints immediately in a
+ * fallback, so the only question is whether the swap MOVES anything. It does not, because the two
+ * families below are the local system face re-declared with Space Grotesk's own metrics:
+ * `size-adjust` matches the average advance width over the app's real charset, and the
+ * ascent/descent overrides restore the line box after that scaling. A glyph changes shape at swap;
+ * no box changes size. index.html preloads the DEFAULT face's file (Aldrich, since the default
+ * moved there), so on a warm tailnet its swap usually never happens at all. Measured in Chrome by forcing the swap with an observer running: see the
+ * stand-in's own comment below for what it is matching and why one table covers every platform.
+ *
+ * Space Grotesk is SIL OFL 1.1 — public/fonts/LICENSE-space-grotesk.txt. The two other candidates
+ * ship their licences beside it. */
+@font-face {
+  font-family: "Space Grotesk";
+  src: url("/fonts/ui-space-grotesk-2.000-latin.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+}
+/* The metric-matched stand-in. No `src: url()` — this IS the local system face, resized, so it
+   costs nothing and is available at the first byte of CSS. `size-adjust` is the ratio of Space
+   Grotesk's total advance width over a line of the app's own copy to the same line in the local
+   face; the ascent/descent overrides then restore the line box after that scaling. Together they
+   mean the swap changes glyph SHAPES and nothing else: same line breaks, same line boxes, same
+   block heights. Recomputed by scripts/build-ui-font.sh — do not hand-edit.
+
+   The `local()` list is deliberately one metric family: Arial and its clones (Helvetica, Liberation
+   Sans, Arimo) plus Roboto, which measures within 0.3% of Arial on that same line, so one override
+   table serves both the desktop and the Android case. Noto Sans is NOT in the list — it is ~5%
+   wider and would defeat the whole mechanism. If none of them resolve the family is skipped and the
+   stack falls through to the plain system entries, which is the behaviour this app had before the
+   face existed. */
+@font-face {
+  font-family: "Space Grotesk Fallback";
+  src:
+    local("Arial"), local("Helvetica Neue"), local("Helvetica"),
+    local("Liberation Sans"), local("Arimo"), local("Roboto");
+  size-adjust: 107.53%;
+  ascent-override: 91.51%;
+  descent-override: 27.16%;
+  line-gap-override: 0%;
+}
+
+/* Aldrich — the second SHIPPED face, and the one a reader picks deliberately. Built by the same
+ * scripts/build-ui-font.sh run, subset to the same ranges, 8 KB.
+ *
+ * ONE WEIGHT, AND NO FAKE SECOND ONE. Aldrich is drawn at 400 and upstream ships nothing else, so
+ * `font-weight: 400` is the honest declaration. The app asks for 500 and 600 in a hundred places,
+ * and the engine used to answer every one of them by smearing the 400 outlines. MEASURED, that
+ * loses: Aldrich's counters are tight to begin with, and synthesis closes them — 14px sidebar text
+ * smears far worse than a 24px heading, so the damage lands hardest exactly where the app does most
+ * of its reading. `font-synthesis-weight: none` in the base layer below turns it off for every
+ * face, and a survey confirmed no UI here uses weight as the SOLE separator between two states, so
+ * nothing loses its only cue. Bold under Aldrich now renders at Aldrich's one real weight.
+ *
+ * That is still not a licence to write `400 700` here. A RANGE would claim weights this file does
+ * not have, which is a lie to the engine about the font's contents rather than a decision about
+ * rendering — the suppression belongs in the base layer, where it says what it means.
+ *
+ * Aldrich is SIL OFL 1.1 — public/fonts/LICENSE-aldrich.txt. */
+@font-face {
+  font-family: "Aldrich";
+  src: url("/fonts/ui-aldrich-1.002-latin.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+/* Aldrich's own metric-matched stand-in, on exactly the terms Space Grotesk's has above: no
+   `src: url()`, the same one metric family, and every number recomputed by scripts/build-ui-font.sh
+   rather than hand-picked. Aldrich's line box is a good deal shallower than Space Grotesk's, which
+   is why it needs its OWN table and cannot borrow the one above — sharing it would reintroduce on
+   this face precisely the shift the mechanism exists to remove. */
+@font-face {
+  font-family: "Aldrich Fallback";
+  src:
+    local("Arial"), local("Helvetica Neue"), local("Helvetica"),
+    local("Liberation Sans"), local("Arimo"), local("Roboto");
+  size-adjust: 113.37%;
+  ascent-override: 63.53%;
+  descent-override: 18.52%;
+  line-gap-override: 4.22%;
+}
+
+/* ── The typeface setting: CSS owns every stack, JavaScript only swaps a class ───────────────────
+ *
+ * THE WHOLE MECHANISM IS THESE THREE BLOCKS. `public/theme-init.js` reads `collie:design:v1` before
+ * first paint and adds ONE class to <html>; `lib/design.ts` swaps it at runtime. Neither ever holds
+ * a font list, sets a family, or writes a custom property — because a font stack in JavaScript is a
+ * second source of truth for something this file already states, and the two would drift.
+ *
+ * The DEFAULT (Aldrich) is deliberately NOT a class: no class means the `--font-sans` in the
+ * @theme block above, which is the stack index.html preloads and the boot splash re-declares. A
+ * device that never opens the setting therefore has no JavaScript in its first-paint path at all.
+ *
+ * Each block sets BOTH properties. `--font-sans` is what `body` resolves through; Tailwind's
+ * `--default-font-family` is what preflight hands to form controls, which would otherwise keep the
+ * default face while everything around them changed.
+ *
+ * Specificity, since it is load-bearing: `:root.font-*` is (0,2,0) and unlayered, and the @theme
+ * block emits (0,1,0) inside Tailwind's `theme` layer. These win on both counts. */
+:root.font-system {
+  /* No webfont, no stand-in, no bytes: the phone's own interface face. This is the same stack
+     --font-content uses, spelled out rather than aliased — the two are equal today by coincidence
+     of both wanting "the system face", not because one is defined as the other. */
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, "Noto Sans", sans-serif;
+  --default-font-family: var(--font-sans);
+}
+:root.font-grotesk {
+  --font-sans:
+    "Space Grotesk", "Space Grotesk Fallback", ui-sans-serif, system-ui,
+    -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --default-font-family: var(--font-sans);
+}
+/* An operator's own face (theme.toml, ADR 0033). The FAMILY NAME is the one thing this file cannot
+   know, so `lib/operator-fonts.ts` injects a <style> element that sets `--font-operator-family` and
+   declares the matching `@font-face` — one validated name and one validated URL, nothing else. The
+   stack around it still lives here.
+ *
+ * THE `var()` FALLBACK IS THE OFFLINE STORY, and it is not decoration. A device set to an operator
+ * face that cannot be resolved — first paint before /api/config answers, offline, or the operator
+ * deleted the row — has no `--font-operator-family`, so the stack starts at "Space Grotesk": the
+ * DEFAULT SHIPPED FACE, never a bare `sans-serif`. Aldrich is named a second time after the
+ * var() so that a resolved-but-unfetchable face lands there too rather than on the metric twin,
+ * which is Arial wearing Aldrich's measurements and not the same thing at all.
+ *
+ * The preference is NOT cleared when this happens. A phone that is briefly offline must not
+ * silently forget a choice it will be able to honour again in a minute. */
+:root.font-operator {
+  --font-sans:
+    var(--font-operator-family, "Aldrich"), "Aldrich", "Aldrich Fallback",
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --default-font-family: var(--font-sans);
+}
+
 @layer base {
   * {
     /* Full-strength ring, not /50: halved, the focus indicator measures 1.77:1 in light and 1.87:1
        in dark — both under the 3:1 floor for a non-text indicator, on an app whose buttons type
        into a live shell. */
     @apply border-border outline-ring;
+    /* No faked bold, on any face. Aldrich ships one weight and the synthesized 500/600 smeared its
+       counters shut at body sizes; see the @font-face note above. Space Grotesk has a real 400-700
+       axis and is untouched by this. */
+    font-synthesis-weight: none;
   }
   html {
     /* Respect notches; keep the app glued to the viewport edges on mobile. */
@@ -247,6 +632,9 @@
   }
   body {
     @apply bg-background text-foreground;
+    /* Spelled here rather than left to Tailwind's `--default-font-family`, so the app's face is a
+       fact you can read in this file instead of a preflight default you have to know about. */
+    font-family: var(--font-sans);
     overscroll-behavior-y: none;
   }
 }
@@ -344,5 +732,28 @@
   .busy-bar__indicator {
     width: 100%;
     animation: busy-bar-pulse 1.1s ease-in-out infinite;
+  }
+}
+
+/* The working status dot's "live" pulse (components/status-badge.tsx StatusDot, `live` prop) — a
+   slow breathe, not a ping. One dot, opacity only, no second ring element and no scale: a phone
+   screen can carry several of these at once (pane chip, pane header) and an unsynchronized scaling
+   ring on each read as blinking. 2.4s is slow enough that a handful of un-phased dots still read as
+   "alive", not as a strobe. */
+.status-breathe {
+  animation: status-breathe 2.4s ease-in-out infinite;
+}
+@keyframes status-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .status-breathe {
+    animation: none;
   }
 }

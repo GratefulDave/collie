@@ -1,3 +1,5 @@
+import { useId } from "react";
+
 import { cn } from "@/lib/utils";
 import { initials } from "@/lib/format";
 import { AGENT_BRANDS } from "@/components/agent-icon-data";
@@ -11,6 +13,10 @@ function brandKey(agent: string): string | undefined {
   if (k.startsWith("codex")) return "codex";
   if (k.startsWith("opencode")) return "opencode";
   if (k === "pi" || k.startsWith("pi-") || k.startsWith("pi.")) return "pi";
+  // Bare prefix, exactly as canonicalAgent folds it (lib/operator-scope.ts): `omp` is its own
+  // prefix, and the `pi` rule above must not claim it — oh-my-pi is not pi.dev.
+  if (k.startsWith("omp")) return "omp";
+  if (k === "agy" || k.startsWith("agy-") || k.startsWith("agy.") || k.startsWith("antigravity")) return "agy";
   return undefined;
 }
 
@@ -28,12 +34,17 @@ export function AgentIcon({
   className?: string;
 }) {
   const brand = agent ? AGENT_BRANDS.get(brandKey(agent) ?? "") : undefined;
+  // One id per mounted tile, sanitised the way collie-mark.tsx does it and for the same two
+  // reasons: an id inside an inline SVG is DOCUMENT-scoped, so a dashboard column of tiles would
+  // otherwise name one gradient and let the first render win; and React's own id carries glyphs a
+  // `url(#…)` reference has no business quoting once a CSS context gets hold of it.
+  const gradId = `agent-icon-${useId().replace(/[^A-Za-z0-9_-]/g, "")}`;
 
   if (!brand) {
     return (
       <span
         className={cn(
-          "inline-flex shrink-0 items-center justify-center rounded-[22%] border bg-muted text-[0.5em] font-semibold uppercase leading-none text-muted-foreground",
+          "inline-flex shrink-0 items-center justify-center rounded-md border bg-muted text-[0.5em] font-semibold uppercase leading-none text-muted-foreground",
           className,
         )}
         role="img"
@@ -45,6 +56,10 @@ export function AgentIcon({
   }
 
   const stroke = brand.mode === "stroke";
+  // A local, not `brand.grad` inline: narrowing survives into the map callback, so the stops need no
+  // non-null assertion. omp's official mark is a gradient, so its paint is a fragment reference.
+  const grad = brand.grad;
+  const paint = grad ? `url(#${gradId})` : brand.fg;
   return (
     <svg
       viewBox="0 0 24 24"
@@ -52,12 +67,21 @@ export function AgentIcon({
       role="img"
       aria-label={`${agent} logo`}
     >
+      {grad && (
+        <defs>
+          <linearGradient id={gradId} x1="0" y1="0" x2="1" y2="1">
+            {grad.map((stop, i) => (
+              <stop key={stop + i} offset={i / (grad.length - 1)} stopColor={stop} />
+            ))}
+          </linearGradient>
+        </defs>
+      )}
       <rect width="24" height="24" rx="5.3" fill={brand.bg} />
       {/* Inset the 24×24 mark to ~62% so every logo carries uniform app-icon padding. */}
       <g
         transform="translate(4.6 4.6) scale(0.617)"
-        fill={stroke ? "none" : brand.fg}
-        stroke={stroke ? brand.fg : undefined}
+        fill={stroke ? "none" : paint}
+        stroke={stroke ? paint : undefined}
         strokeWidth={stroke ? 2 : undefined}
         strokeLinecap={stroke ? "square" : undefined}
       >

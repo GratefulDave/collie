@@ -21,12 +21,13 @@
 // (find covers the raw mirror only).
 
 import type { AnsiSegment } from "./ansi";
-import { PURE_HORIZONTAL_RULE_GLYPH_CLASS } from "./rule-glyphs";
+import { FRAME_EDGE_GLYPH_CLASS, PURE_HORIZONTAL_RULE_GLYPH_CLASS } from "./rule-glyphs";
 import type { PromptModel } from "./harness/prompt-model";
 import type { WizardModel } from "./harness/wizard-model";
 import type { PreviewSelectModel } from "./harness/preview-model";
 import type { MultiSelectModel } from "./harness/multi-select-model";
 import type { MenuModel } from "./harness/menu-model";
+import type { AutocompleteModel } from "./harness/autocomplete-model";
 
 // Re-export every dialog model so consumers (the block components, the race guards) have one import
 // site for the AST's typed payloads. All five are harness-NEUTRAL contracts (harness/*-model.ts):
@@ -49,6 +50,7 @@ export type {
   MultiPointer,
 } from "./harness/multi-select-model";
 export type { MenuModel, MenuAction, MenuNav, MenuLeftRight } from "./harness/menu-model";
+export type { AutocompleteModel, AutocompleteEntry } from "./harness/autocomplete-model";
 
 /** One visual line: the styled segments that make it up, with the line-terminating "\n" removed. */
 export interface StyledLine {
@@ -122,6 +124,20 @@ export interface MenuBlock {
 }
 
 /**
+ * The agent's own COMPLETION POPUP while the operator types into its input box (Claude's slash-command
+ * menu). Unlike every other non-`raw` kind this one is PRESENTATIONAL: it emits no keystrokes and has
+ * no row in harness/dialog-contract.ts, because nothing on that screen owns the keyboard — the input
+ * box is live underneath it and the composer must stay free to type. `lines` is the popup's own region
+ * (provenance; the block renders the parsed entries, not the text) and is not part of the find
+ * haystack.
+ */
+export interface AutocompleteBlock {
+  kind: "autocomplete";
+  autocomplete: AutocompleteModel;
+  lines: StyledLine[];
+}
+
+/**
  * A semantic block. A discriminated union on `kind`; new members are added purely additively, so a
  * `switch (block.kind)` in the renderer stays exhaustive.
  */
@@ -131,7 +147,8 @@ export type Block =
   | WizardBlock
   | PreviewSelectBlock
   | MultiSelectBlock
-  | MenuBlock;
+  | MenuBlock
+  | AutocompleteBlock;
 
 /**
  * Split parsed segments into visual lines at "\n" boundaries. The newline characters become the
@@ -194,9 +211,20 @@ const PURE_HORIZONTAL_BORDER = new RegExp(
   `^([${PURE_HORIZONTAL_RULE_GLYPH_CLASS}])\\1{${MIN_NO_WRAP_BORDER_LENGTH - 1},}$`,
 );
 
+// A FRAMED ROW: the first and the last non-space glyph are both frame edges (a boxed TUI menu row, a
+// panel border). Herdr spawns panes at desktop width while a phone mirror shows ~45 columns, so
+// wrapping such a row splits it across two or three ragged visual lines: the frame scrambles and the
+// inverse-video selection is shredded, exactly while the operator drives that menu from the Keys pad.
+// Clipped instead — the selection marker sits at the line's left edge, so what overflows is the part
+// that carries the least. A leading edge alone is NOT enough (`tree` output starts with "│"), and one
+// glyph cannot be both edges.
+const FRAME_ROW = new RegExp(`^\\s*[${FRAME_EDGE_GLYPH_CLASS}].*[${FRAME_EDGE_GLYPH_CLASS}]\\s*$`);
+
 function styledLine(segments: AnsiSegment[]): StyledLine {
   const text = segments.map((segment) => segment.text).join("");
-  return PURE_HORIZONTAL_BORDER.test(text.trim()) ? { segments, noWrap: true } : { segments };
+  return PURE_HORIZONTAL_BORDER.test(text.trim()) || FRAME_ROW.test(text)
+    ? { segments, noWrap: true }
+    : { segments };
 }
 
 // The two generic StyledLine probes. They live HERE, in the core AST module that imports nothing

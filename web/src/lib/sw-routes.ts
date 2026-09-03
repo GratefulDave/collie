@@ -5,7 +5,7 @@
  * touching the network. That is what makes deep links work offline — and it is also why an installed
  * PWA, which has no address bar to fall back on, cannot reach anything a fronting reverse proxy
  * serves at a path Collie doesn't own. A proxy that authenticates devices ahead of the bridge
- * (DEPLOYMENT.md, Variant C/E) has a sign-in or enrolment page, and before this list existed there was no
+ * (docs/deployment.md, Variant C/E) has a sign-in or enrolment page, and before this list existed there was no
  * legitimate place to put it: the `/api/` denylist was the only crack in the precache, so operators
  * squatted a page inside the namespace the API owns.
  *
@@ -40,6 +40,11 @@ export const PROXY_AUTH_PATH = "/auth/";
 export const NAVIGATION_NETWORK_ONLY = [
   /^\/api\//,
   /^\/auth(?:[/?]|$)/,
+  // Authentik forward-auth exposes a fixed same-origin outpost namespace for its start/callback
+  // flow. Operators can point Collie's `/auth/` escape hatch there; after the operator taps Sign in,
+  // the installed PWA must pass that navigation through instead of replacing it with the cached app
+  // shell. The path is non-relocatable in Authentik's standard integration.
+  /^\/outpost\.goauthentik\.io(?:[/?]|$)/,
   // Cloudflare Access serves its login and callback under `/cdn-cgi/access/` and the path is NOT
   // relocatable, so pointing the operator at `/auth/` cannot help them — the flow would break on a
   // callback the precache swallowed. `/cdn-cgi/` is Cloudflare-reserved; Collie will never route it.
@@ -68,16 +73,50 @@ export const NAVIGATION_NETWORK_ONLY = [
 ] as const;
 
 /**
- * The bundled Nerd Font faces (index.css). The SW caches these on first use rather than precaching
- * them — `unicode-range` keeps them lazy and ~1.1 MB is not something to charge an install for — and
- * sweeps anything else out of that cache on activate, which is why the live set has to be a value
- * both sides can read. The version is part of the filename: `public/` assets are unhashed, so a
- * regenerated subset must be a new URL or the permanent cache would serve the old one forever.
+ * Every webfont the app ships (index.css). The SW caches these on first use rather than precaching
+ * them, and sweeps anything else out of that cache on activate, which is why the live set has to be
+ * a value both sides can read. The version is part of every filename: `public/` assets are unhashed,
+ * so a regenerated subset must be a new URL or the permanent cache would serve the old one forever.
  * `fonts.test.ts` pins this list against the stylesheet and the files on disk.
+ *
+ * Two kinds of entry, cached the same way for different reasons:
+ *
+ *  - The Nerd Font symbol faces are LAZY. `unicode-range` means a herd whose agents print no Nerd
+ *    Font glyph never fetches them, and ~1.1 MB is not something to charge an install for.
+ *  - The DEFAULT UI typeface is on the critical path — it dresses every label — so it is fetched on
+ *    the first load and served from this cache on every load after, online or not. It is out of the
+ *    precache anyway because that install has to fetch it during the same first paint regardless,
+ *    and putting it in `globPatterns` would only make the install pay for it twice. 27 KB. The other
+ *    shipped face (Aldrich, 8 KB) is only ever fetched by a device whose reader chose it, and is
+ *    cached the same way from that moment on — including offline, which is the point of listing it.
+ *
+ * Runtime caching is cache-first (src/sw.ts), so an update that renames the file re-fetches once
+ * and the sweep drops the superseded entry. Offline after any prior visit is covered by the cache;
+ * offline on a device that has never loaded the app is not a font problem.
  */
+/**
+ * The UI face a device gets when it has never touched the Typeface setting — Aldrich.
+ *
+ * Named separately because it is the one URL that is on the CRITICAL PATH: index.html preloads it,
+ * the boot splash re-declares it, and `fonts.test.ts` holds it to the ~60 KB budget. The other
+ * shipped faces are opt-in, so they are fetched when a reader picks one and never before.
+ */
+export const DEFAULT_UI_FONT_URL = "/fonts/ui-aldrich-1.002-latin.woff2";
+
+/**
+ * Every SHIPPED UI face — the ones the Typeface setting can be set to (ADR 0033). In the order
+ * index.css declares them, because `fonts.test.ts` compares the two lists element by element.
+ *
+ * An OPERATOR's face is not here and must never be: those live behind `/api/fonts/`, are fetched
+ * from the network like any other API call, and are neither precached nor swept. A URL added here
+ * that does not sit under `/fonts/` would be swept out of the font cache on every activate.
+ */
+export const UI_FONT_URLS = ["/fonts/ui-space-grotesk-2.000-latin.woff2", DEFAULT_UI_FONT_URL] as const;
+
 export const FONT_URLS = [
   "/fonts/nerd-symbols-3.5.0-pua.woff2",
   "/fonts/nerd-symbols-3.5.0-spua.woff2",
+  ...UI_FONT_URLS,
 ] as const;
 
 /**

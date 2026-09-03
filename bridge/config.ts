@@ -37,8 +37,8 @@ function envInt(
   return n;
 }
 
-function envList(name: string): string[] {
-  return (process.env[name] ?? "")
+function envList(name: string, env: Record<string, string | undefined> = process.env): string[] {
+  return (env[name] ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -52,8 +52,12 @@ function envList(name: string): string[] {
  * things on the two platforms this bridge supports. One path stays one path, so an existing value
  * parses to exactly what it always meant.
  */
-function envRoots(name: string, fallback: string): string[] {
-  const list = envList(name);
+function envRoots(
+  name: string,
+  fallback: string,
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  const list = envList(name, env);
   return list.length > 0 ? list : [fallback];
 }
 
@@ -143,11 +147,6 @@ export interface Config {
    */
   host: string;
   /**
-   * Optional Unix-domain HTTP listener. When set, this replaces {@link host}/{@link port}; placing
-   * it in a 0700 directory prevents other local accounts from bypassing the Tailscale proxy.
-   */
-  unixSocket: string;
-  /**
    * Escape hatch for {@link host}: permit a bind that is not loopback (`COLLIE_ALLOW_NON_LOOPBACK_BIND=1`).
    * Without it the bridge refuses to start on a wide bind rather than warning and carrying on.
    * Setting it also disables the peer-address check in server.ts.
@@ -202,6 +201,24 @@ export interface Config {
    */
   quickRepliesFile: string;
   /**
+   * Where the operator's UI typeface rows live — `theme.toml`, the fourth sibling in the same dir,
+   * read the same way (bridge/operator-fonts.ts) and likewise never read here. Named for a theme
+   * rather than for fonts so a colour block can join it without becoming a fifth operator file.
+   */
+  themeFile: string;
+  /**
+   * The directory `theme.toml`'s `file` names resolve inside — `fonts/`, beside the file that
+   * declares them, in the CONFIG dir. It is the containment ROOT for `GET /api/fonts/<basename>`,
+   * never a search path: a name that resolves outside it after symlinks is not served (ADR 0033).
+   */
+  fontsDir: string;
+  /**
+   * Where the operator's launcher rows live — `launchers.toml`, the sibling of `commands.toml`
+   * and `keys.toml` in the same dir, read the same way (bridge/operator-launchers.ts) and
+   * likewise never read here.
+   */
+  launchersFile: string;
+  /**
    * Tailscale identity gate. If set under `tailscale serve`, the request must carry a matching
    * `Tailscale-User-Login` header. A mismatch is rejected. A missing header is also rejected —
    * serve injects none for tagged nodes, so tolerating it let any tagged node write. Under
@@ -223,8 +240,8 @@ export interface Config {
    * Per-device authorisation. Name of a request header carrying an opaque device identifier,
    * injected by a trusted upstream reverse proxy. Empty = the feature is off (no behaviour change).
    * When set, devices whose header value isn't in {@link deviceAllowlist} are read-only. See
-   * `deviceAuth()` in server.ts for the full matrix. The header is trusted only when the reverse
-   * proxy is the listener's sole effective caller; a direct local client can forge it.
+   * `deviceAuth()` in server.ts for the full matrix. The header is trusted only because the bridge
+   * binds loopback behind the proxy — a direct client can't set it (same trust basis as trustedUser).
    */
   deviceHeader: string;
   /**
@@ -274,7 +291,7 @@ export interface Config {
    * proxy (Caddy/Nginx) fronts the loopback bridge instead. The bridge itself handles every request
    * identically either way — this flag only informs the startup warnings: without `tailscale serve`
    * in front, the `Tailscale-User-Login` header is never injected, so {@link trustedUser} is inert
-   * and per-device auth ({@link deviceHeader}) becomes the way to gate writes (DEPLOYMENT.md → Variant C).
+   * and per-device auth ({@link deviceHeader}) becomes the way to gate writes (docs/deployment.md → Variant C).
    */
   skipServe: boolean;
 }
@@ -376,6 +393,54 @@ export function resolveStateDir(
 }
 
 /**
+ * Where each harness's journal lives, resolved from an environment and a home directory.
+ *
+ * A PARAMETER rather than a read of `process.env` and `homedir()`, so `collie doctor` can ask this
+ * one function the same question the bridge asks it (issue #137) instead of re-deriving five
+ * fallbacks that would drift. {@link loadConfig} calls it with the defaults, so the running bridge's
+ * roots are unchanged.
+ *
+ * **The home is the resolving PROCESS's home**, which is the whole reason `doctor` reports this: a
+ * bridge running as another user reads that user's `~/.claude/projects`, not the operator's.
+ */
+export function resolveJournalRoots(
+  env: Record<string, string | undefined> = process.env,
+  home: string = homedir(),
+): JournalRoots {
+  return {
+    // COLLIE_TRANSCRIPT_ROOT predates the per-harness split and meant Claude's root, so it keeps
+    // meaning exactly that — an existing deployment's env keeps working untouched. It takes SEVERAL
+    // roots (comma-separated) because `CLAUDE_CONFIG_DIR` gives each Claude profile its own
+    // projects tree, and a herd routinely mixes them (issue #92); one value is still one root.
+    claude: envRoots("COLLIE_TRANSCRIPT_ROOT", join(home, ".claude", "projects"), env),
+    // Each harness's own home var is honoured first, so relocating the agent relocates its journal
+    // without a second Collie setting to keep in sync. The Collie override takes a list too — the
+    // multi-home case isn't Claude's alone, and one setting shouldn't behave differently per agent.
+    codex: envRoots(
+      "COLLIE_CODEX_ROOT",
+      join(env.CODEX_HOME ?? join(home, ".codex"), "sessions"),
+      env,
+    ),
+    pi: envRoots(
+      "COLLIE_PI_ROOT",
+      join(env.PI_CODING_AGENT_DIR ?? join(home, ".pi", "agent"), "sessions"),
+      env,
+    ),
+    // OpenCode keeps one SQLite database at the top of its XDG data dir, not per-session files.
+    opencode: envRoots(
+      "COLLIE_OPENCODE_ROOT",
+      join(env.XDG_DATA_HOME ?? join(home, ".local", "share"), "opencode"),
+      env,
+    ),
+    grok: envRoots(
+      "COLLIE_GROK_ROOT",
+      join(env.GROK_HOME ?? join(home, ".grok"), "sessions"),
+      env,
+    ),
+  };
+}
+
+/**
  * The operator's config dir — where their `.env` lives, their `commands.toml` beside it, and the
  * `tailscale serve` ownership record beside that.
  *
@@ -423,44 +488,20 @@ export function loadConfig(): Config {
     dialMode: envEnum("COLLIE_HERDR_DIAL", ["auto", "net", "bun"] as const, "auto"),
     port: envInt("COLLIE_PORT", DEFAULT_PORT, { min: 1, max: 65535 }),
     host,
-    unixSocket: (process.env.COLLIE_UNIX_SOCKET ?? "").trim(),
     allowNonLoopbackBind,
     pollMs: envInt("COLLIE_POLL_MS", 1500, { min: 250 }),
     pollIdleMs: envInt("COLLIE_POLL_IDLE_MS", 12_000, { min: 1000 }),
     notifyDelayMs: envInt("COLLIE_NOTIFY_DELAY_MS", 30_000, { min: 0 }),
     readLines: envInt("COLLIE_READ_LINES", 200, { min: 1 }),
     transcript: envBool("COLLIE_TRANSCRIPT", true),
-    journalRoots: {
-      // COLLIE_TRANSCRIPT_ROOT predates the per-harness split and meant Claude's root, so it keeps
-      // meaning exactly that — an existing deployment's env keeps working untouched. It takes SEVERAL
-      // roots (comma-separated) because `CLAUDE_CONFIG_DIR` gives each Claude profile its own
-      // projects tree, and a herd routinely mixes them (issue #92); one value is still one root.
-      claude: envRoots("COLLIE_TRANSCRIPT_ROOT", join(homedir(), ".claude", "projects")),
-      // Each harness's own home var is honoured first, so relocating the agent relocates its journal
-      // without a second Collie setting to keep in sync. The Collie override takes a list too — the
-      // multi-home case isn't Claude's alone, and one setting shouldn't behave differently per agent.
-      codex: envRoots(
-        "COLLIE_CODEX_ROOT",
-        join(process.env.CODEX_HOME ?? join(homedir(), ".codex"), "sessions"),
-      ),
-      pi: envRoots(
-        "COLLIE_PI_ROOT",
-        join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "sessions"),
-      ),
-      // OpenCode keeps one SQLite database at the top of its XDG data dir, not per-session files.
-      opencode: envRoots(
-        "COLLIE_OPENCODE_ROOT",
-        join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode"),
-      ),
-      grok: envRoots(
-        "COLLIE_GROK_ROOT",
-        join(process.env.GROK_HOME ?? join(homedir(), ".grok"), "sessions"),
-      ),
-    },
+    journalRoots: resolveJournalRoots(),
     submitKeys: submitKeys.length ? submitKeys : ["Enter"],
     commandsFile: join(configDir, "commands.toml"),
     keysFile: join(configDir, "keys.toml"),
     quickRepliesFile: join(configDir, "quick-replies.toml"),
+    themeFile: join(configDir, "theme.toml"),
+    fontsDir: join(configDir, "fonts"),
+    launchersFile: join(configDir, "launchers.toml"),
     trustedUser: process.env.COLLIE_TRUSTED_USER ?? "",
     trustedUserOptional: envBool("COLLIE_TRUSTED_USER_OPTIONAL", false),
     auditContent: envEnum("COLLIE_AUDIT_CONTENT", ["preview", "none"] as const, "preview"),

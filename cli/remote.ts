@@ -6,6 +6,7 @@ import { DEFAULT_PORT } from "../bridge/config.ts";
 import { commitPackChange, mintInvite } from "../bridge/pack/enrollment.ts";
 import type { OpsRecord } from "../bridge/pack/ops-store.ts";
 import { TrustStore, type TrustedMember, type TrustStoreData } from "../bridge/pack/trust-store.ts";
+import { parseUpdateRun, type UpdateRun } from "../bridge/update-run.ts";
 import { collieVersion, INSTANCE_PATTERN, PLUGIN_ID } from "./context.ts";
 import { EXIT, type Io } from "./io.ts";
 import { ensureStore, parsePackArgs, probeMembers, resolveSelfAddress, type PackDeps } from "./pack.ts";
@@ -173,6 +174,20 @@ export function shq(value: string): string {
 }
 
 /**
+ * A remote PATH expression for `/bin/sh` — {@link shq}, except a leading `~` is expanded against the
+ * REMOTE `$HOME`, never against this machine's. `shq` alone defeats tilde expansion (single quotes
+ * turn off every shell substitution), so an operator's `--path '~/apps/collie-stable'` would reach
+ * the far shell as the seven-byte literal `~/apps/collie-stable` — a directory named `~` that does
+ * not exist — rather than the path they meant. And the two accounts are not guaranteed to share a
+ * `$HOME`, so this side must never resolve the tilde itself and ship the resolved string instead.
+ */
+export function shqPath(path: string): string {
+  if (path === "~") return '"$HOME"';
+  if (path.startsWith("~/")) return `"$HOME"/${shq(path.slice(2))}`;
+  return shq(path);
+}
+
+/**
  * Resolve a tool the way `scripts/collie-ctl.sh` resolves Bun: `PATH` first, then the fixed install
  * locations — because `ssh host '/bin/sh -s'` is byte-for-byte the no-login-shell, no-`PATH`
  * environment that shim was written for. `command -v` reports a shell function as a bare word, so
@@ -288,7 +303,7 @@ export function probeScript(opts: { readonly path: string | null; readonly port:
   const candidates =
     opts.path === null
       ? `"$HOME/.collie" "$HOME/collie" "$HOME"/.config/herdr/plugins/github/*/ "$HOME"/.config/herdr/plugins/local/*/`
-      : shq(opts.path);
+      : shqPath(opts.path);
   return [
     "set -u",
     "umask 077",
@@ -347,6 +362,22 @@ export function probeScript(opts: { readonly path: string | null; readonly port:
     'if [ -n "$TS" ]; then ADDR=$("$TS" ip -4 2>/dev/null | head -n 1) || ADDR=""; fi',
     'say address "$ADDR"',
     // The port, probed BEFORE anything is installed rather than discovered at first start.
+    //
+    // ── WHAT THIS ANSWER IS, AND WHAT IT IS NOT (Q2) ─────────────────────────
+    // One `ss -ltn` at one instant. `busy` is therefore a fact — something WAS listening — and the
+    // negative is only "nothing was listening just now", which is why the operator is told it in
+    // those words rather than as `free`.
+    //
+    // The case that exposed the gap: a Collie whose unit crash-loops on a five-second timer is
+    // absent from `ss` for most of every cycle, so the honest instantaneous answer is "nothing
+    // listening" and the durable answer is "occupied by a service that keeps coming back".
+    //
+    // **Collie cannot close that gap from here, and does not pretend to.** "Refused now but a unit
+    // is active" is not a remote observation: it needs the far machine's supervisor, and which
+    // supervisor that is (systemd user, launchd, unsupervised) is exactly what `pack add` has not
+    // yet decided at probe time — it is decided by the install leg, after this. Sampling the port
+    // repeatedly would only lengthen the coin flip. So the limitation is stated, not papered over;
+    // a genuine collision still surfaces at first start, which is where the supervisor is known.
     "PORTSTATE=unknown",
     'SS=$(collie_tool ss) || SS=""',
     'NETSTAT=$(collie_tool netstat) || NETSTAT=""',
@@ -386,7 +417,7 @@ export function installScript(opts: {
     TOOL_LOOKUP,
     'GIT=$(collie_tool git) || { echo "error: no git on this machine" >&2; exit 20; }',
     'BUN=$(collie_tool bun) || { echo "error: no bun on this machine" >&2; exit 21; }',
-    `ROOT=${shq(opts.root)}`,
+    `ROOT=${shqPath(opts.root)}`,
     `COMMIT=${shq(opts.commit)}`,
     `EXPECT=${shq(opts.version)}`,
     'WORK=$(mktemp -d "${TMPDIR:-/tmp}/collie-add.XXXXXX")',
@@ -465,10 +496,61 @@ export async function runInstall(
 export function restartScript(root: string): string {
   return [
     "set -eu",
-    `ROOT=${shq(root)}`,
+    `ROOT=${shqPath(root)}`,
     'exec "$ROOT/bin/collie" restart',
     "",
   ].join("\n");
+}
+
+// ── The far side's own update record ─────────────────────────────────────────
+
+/**
+ * `collie update --status --json` on the far machine — how the health gate of a pack update finds
+ * out WHY a member did not come back (M15/06).
+ *
+ * **No `curl`, and no port dialled from here.** The member's `/api/health` is answered by the member
+ * itself, so the honest way to ask across a machine boundary is the member's own binary, run over
+ * the ssh the operator already authenticated (ADR 0016). A staged install keeps the live binary
+ * under `current/`; a Herdr-managed checkout advances in place and has only `bin/collie`. Both are
+ * tried, in that order, because the first one that exists is the one that is running.
+ *
+ * Exit 66 = no Collie binary at that path, which is the same code {@link remoteCheckScript} uses for
+ * the same fact.
+ */
+export function updateStatusScript(root: string): string {
+  return [
+    "set -u",
+    `ROOT=${shqPath(root)}`,
+    'for _c in "$ROOT/current/bin/collie" "$ROOT/bin/collie"; do',
+    '  if [ -x "$_c" ]; then exec "$_c" update --status --json; fi',
+    "done",
+    "exit 66",
+    "",
+  ].join("\n");
+}
+
+/**
+ * The run record inside whatever the far side printed, or null.
+ *
+ * Null covers three cases that are one answer to the caller: no binary there, a Collie old enough
+ * not to know `--status`, and a machine that has never run an update (`--status --json` prints
+ * `null`). None of them is evidence about the update that just ran, so none of them may be read as
+ * a diagnosis.
+ */
+export function parseRemoteRun(stdout: string): UpdateRun | null {
+  const start = stdout.indexOf("{");
+  const end = stdout.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  return parseUpdateRun(stdout.slice(start, end + 1));
+}
+
+/** {@link updateStatusScript} as a step: run it, and read what came back. */
+export async function runUpdateStatus(
+  runner: RemoteRunner,
+  root: string,
+): Promise<{ readonly result: RemoteResult; readonly run: UpdateRun | null }> {
+  const result = await runner.run(updateStatusScript(root));
+  return { result, run: parseRemoteRun(result.stdout) };
 }
 
 // ── Leg 3 — configure ────────────────────────────────────────────────────────
@@ -520,7 +602,7 @@ export function configureScript(opts: {
 export function membershipScript(root: string): string {
   return [
     "set -eu",
-    `ROOT=${shq(root)}`,
+    `ROOT=${shqPath(root)}`,
     '"$ROOT/bin/collie" pack status --no-probe',
     "",
   ].join("\n");
@@ -553,7 +635,9 @@ export function parseMembership(stdout: string): RemoteMembership | null {
  * The token never reaches argv, an environment variable or a file this verb writes (§8.3) — it is
  * spliced into a quoted heredoc, so it exists only in the ssh stream and in the shell's heredoc
  * buffer. `--insecure` is never passed on the operator's behalf: the far side refuses `http://`
- * exactly as it would for a hand-typed join.
+ * exactly as it would for a hand-typed join — and since F9 this verb no longer LETS that refusal be
+ * the one the operator meets, because it arrived after the far machine had already been rebuilt.
+ * {@link leadAddressRefusal} takes the same decision from the lead's own argv, before leg 1.
  */
 export function enrollScript(opts: {
   readonly root: string;
@@ -571,7 +655,7 @@ export function enrollScript(opts: {
   ];
   return [
     "set -eu",
-    `ROOT=${shq(opts.root)}`,
+    `ROOT=${shqPath(opts.root)}`,
     `exec "$ROOT/bin/collie" ${args.map(shq).join(" ")} <<'${PAYLOAD_EOF}'`,
     STDIN_MARKER,
     PAYLOAD_EOF,
@@ -620,7 +704,9 @@ type Wired = PackAddDeps & { emit(event: AddEvent): void };
 
 const USAGE = [
   "usage: collie pack add <ssh-host> [--path <remote-checkout>] [--port <n>]",
-  "                      [--peer-address <addr>] [--address <lead-address>]",
+  // `<bare-host>`, not `<addr>`: the value becomes the member's COLLIE_HOST, and the usage line was
+  // the first of the five places that said "address" while meaning "host" (F8).
+  "                      [--peer-address <bare-host>] [--address <lead-address>]",
   "                      [--label <name>] [--name <pack>] [--instance <name>]",
 ];
 
@@ -690,6 +776,25 @@ async function packAddRun(deps: Wired, args: readonly string[]): Promise<number>
   const instance = flags.instance ?? null;
   if (instance !== null && !INSTANCE_PATTERN.test(instance)) {
     deps.io.err(`error: --instance ${instance} is not a usable instance name — 1-16 characters of [a-z0-9-].`);
+    return EXIT.USAGE;
+  }
+  // ── EVERY CHEAP REFUSAL SITS ABOVE THE FIRST SSH BYTE ───────────────────────
+  // The flags below are refused HERE, beside `--port` and `--instance`, and not where they are first
+  // used. Both were found the same way (F8, F9): a value this build can prove wrong on its own was
+  // checked after an 8 MB bundle push, a remote build, an `.env` write and two lead restarts, so a
+  // typo cost a rebuilt member and left it half-configured. Nothing below this block is cheap; a
+  // check that CAN be made from the lead's own argv belongs above it.
+  const peerAddress = flags["peer-address"];
+  if (peerAddress !== undefined) {
+    const refusal = peerHostRefusal(peerAddress);
+    if (refusal !== null) {
+      for (const line of peerHostRefusalLines(peerAddress, refusal)) deps.io.err(line);
+      return EXIT.USAGE;
+    }
+  }
+  const leadAddress = leadAddressRefusal(flags.address, deps.ctx.env.COLLIE_PUBLIC_URL);
+  if (leadAddress !== null) {
+    for (const line of leadAddress) deps.io.err(line);
     return EXIT.USAGE;
   }
 
@@ -796,7 +901,9 @@ async function addOverSsh(deps: Wired, runner: RemoteRunner, opts: AddOptions): 
     deps.emit({
       kind: "fact",
       name: "port",
-      value: `${port} ${probe.port === "busy" ? "already carries this collie" : "free"}`,
+      // "nothing was listening just now", not "free" (Q2). See {@link probeScript}: this is one
+      // `ss -ltn` at one instant, and `free` claims a durable property the probe cannot observe.
+      value: `${port} ${probe.port === "busy" ? "already carries this collie" : "nothing was listening just now"}`,
     });
   }
   deps.emit({ kind: "leg-done", leg: "probe", ok: true, detail: `${host} is ready` });
@@ -939,6 +1046,35 @@ function bindIsCurrent(probe: Probe, peerHost: string, port: number): boolean {
   return probe.envhost === peerHost && configuredPort(probe) === port;
 }
 
+/**
+ * The bind this run would OVERWRITE, when overwriting it is a decision the operator has to take —
+ * `null` when it is not, and the write may just happen.
+ *
+ * The confirmation exists for one case: the far machine already carries a bind somebody chose, and
+ * this run is about to replace it with a different one. That case is untouched here, wide binds
+ * included — a non-loopback COLLIE_HOST somebody set is exactly the value that must not vanish under
+ * a re-run without a yes.
+ *
+ * **An UNSET COLLIE_HOST is not that case.** It is the state a solo collie is in by default, and the
+ * state `collie leave` deliberately restores (F12: the pack's wide bind is admitted by the pack's two
+ * factors and lapses with them). There is nothing there to preserve, so there is nothing to confirm —
+ * and asking anyway made `pack add` non-idempotent in the one direction that matters: the first add
+ * of a fresh machine asked nothing, while the re-add of a machine torn down properly always asked,
+ * and hard-stopped every non-interactive run on `configured to bind (unset):8787` (F23). `ssh -tt`
+ * did not get past it, because a piped `y` is not a terminal either.
+ *
+ * The port half keeps its own guard for the same reason the host half does: a COLLIE_PORT the far
+ * machine already carries was chosen there, and moving a listener is a decision too.
+ */
+export function bindOverwriteConfirmation(probe: Probe, peerHost: string, port: number): string | null {
+  const hostDisagrees = probe.envhost !== "" && probe.envhost !== peerHost;
+  const portDisagrees = probe.envport !== "" && configuredPort(probe) !== port;
+  if (!hostDisagrees && !portDisagrees) return null;
+  // No `(unset)` placeholder: every value named here is one the far machine really carries. When only
+  // the port disagrees the host is the one this run is about to write, and the line reads as such.
+  return `${probe.envhost === "" ? peerHost : probe.envhost}:${probe.envport === "" ? port : probe.envport}`;
+}
+
 /** Leg 3, as its own step: skip, prompt, or write the peer's `.env`. */
 async function configureLeg(
   deps: Wired,
@@ -957,8 +1093,8 @@ async function configureLeg(
     deps.emit({ kind: "leg-done", leg: "configure", ok: true, detail: `already ${o.peerHost}:${o.port}` });
     return null;
   }
-  if (probe.envhost !== "" || probe.envport !== "") {
-    const current = `${probe.envhost || "(unset)"}:${probe.envport || "(unset)"}`;
+  const current = bindOverwriteConfirmation(probe, o.peerHost, o.port);
+  if (current !== null) {
     const answer = await ask(deps, `${o.host} is configured to bind ${current}; change it to ${o.peerHost}:${o.port}?`);
     if (answer === "aborted") return EXIT.FAIL;
     if (!answer) {
@@ -966,6 +1102,16 @@ async function configureLeg(
       deps.io.err("       A peer the lead cannot dial stays provisional forever (`collie doctor` there).");
       return EXIT.STATE;
     }
+  } else if (probe.envhost === "") {
+    // Said out loud, because a step that stopped asking is otherwise a step that silently changed.
+    deps.emit({
+      kind: "line",
+      stream: "out",
+      tone: "info",
+      text:
+        `  ${o.host} has no COLLIE_HOST — the default state of a solo collie, and the one` +
+        " `collie leave` restores. Nothing to preserve there, so nothing to confirm.",
+    });
   }
   const written = await runner.run(
     configureScript({ configDir: o.configDir, host: o.peerHost, port: o.port, instance: o.instance }),
@@ -1301,14 +1447,16 @@ async function resolvePeerHost(
   probe: Probe,
   override: string | undefined,
 ): Promise<string | null> {
+  // The flag was already refused at parse time, before any ssh ran (`packAddRun`). Anything reaching
+  // here is either the address the far machine reported for itself or a value typed at the prompt.
   if (override !== undefined && override !== "") return override;
   if (probe.address !== "") return probe.address;
   const answered = await deps.prompt(
-    "This host has no tailnet address. What address should this lead dial it at?",
+    `This host has no tailnet address. What bare host should this lead dial it at (port ${PEER_HOST_PORT_HINT})?`,
   );
   if (answered === null) {
     deps.io.err("error: this host reported no tailnet address, and this run is not interactive.");
-    deps.io.err("       Pass it: `collie pack add <host> --peer-address <addr-the-lead-can-dial>`.");
+    deps.io.err("       Pass it: `collie pack add <host> --peer-address <bare-host-the-lead-can-dial>`.");
     return null;
   }
   const trimmed = answered.trim();
@@ -1316,7 +1464,105 @@ async function resolvePeerHost(
     deps.io.err("error: no address given — a peer the lead cannot dial stays provisional forever.");
     return null;
   }
+  const refusal = peerHostRefusal(trimmed);
+  if (refusal !== null) {
+    for (const line of peerHostRefusalLines(trimmed, refusal)) deps.io.err(line);
+    return null;
+  }
   return trimmed;
+}
+
+/** Named once so the prompt and the flag's refusal cannot describe different things. */
+const PEER_HOST_PORT_HINT = "--port";
+
+/**
+ * The refusal for a lead address a peer must not be told to enroll over, or `null` when it may stand.
+ *
+ * **Two things were wrong, and they compounded (F9).** The `http://` refusal is `collie join`'s, on
+ * the far machine — so it ran at the END of leg 4, after the bundle push, the remote build, the
+ * `.env` write and two full lead restarts, and it ended by naming `--insecure`: a flag `join` has and
+ * `pack add` does not. Re-running with it produced the identical refusal. A closed loop with no exit,
+ * paid for with a rebuilt member.
+ *
+ * So the check moves here, to parse time on the lead, and the remedy it names is one that exists.
+ * **`pack add` will not grow `--insecure`**: this verb mints the token and pushes it down an ssh pipe
+ * on the operator's behalf, and a flag that made it ship that token over plaintext would be Collie
+ * accepting the risk for a machine it is not standing at. The consent belongs where the token is
+ * spent — `collie join … --insecure`, typed on the peer, which is exactly what `cli/pack.ts` already
+ * implements and what `cli/remote.ts`'s enroll leg says it never passes on the operator's behalf.
+ *
+ * Both sources of the address are checked, and neither costs anything: the flag, and
+ * `COLLIE_PUBLIC_URL` (which `resolveSelfAddress` would otherwise pick up silently later). A derived
+ * tailnet address carries no scheme and is dialled `https://`, so there is no third plaintext path.
+ */
+export function leadAddressRefusal(
+  flag: string | undefined,
+  publicUrl: string | undefined,
+): string[] | null {
+  const [address, source] =
+    flag !== undefined && flag !== ""
+      ? ([flag, "--address"] as const)
+      : ([publicUrl?.trim() ?? "", "COLLIE_PUBLIC_URL"] as const);
+  if (address === "") return null;
+  if (!/^http:\/\//i.test(address)) return null;
+  return [
+    `error: refusing to enroll a peer over ${source}=${address} — the invite token and the pack`,
+    "       secret would cross the wire in the clear. An on-path attacker who reads the token can",
+    "       enroll THEIR OWN certificate as a member before your peer does (the lead admits on the",
+    "       token alone), then holds the pack secret and a pinned link.",
+    "       Give an encrypted address: https:// via `tailscale serve`, or your own TLS front door",
+    "       (docs/deployment.md Variant C).",
+    "       `pack add` has no --insecure and will not get one — it would ship the token over",
+    "       plaintext on behalf of a machine you are not standing at. If this hop really is trusted,",
+    "       own it where the token is spent: install Collie on that machine, run `collie pack invite`",
+    "       here, and run `collie join <lead-address> <token> --insecure` THERE.",
+    "       Nothing was pushed, built or restarted.",
+  ];
+}
+
+/**
+ * Why this `--peer-address` cannot be a member's bind, or `null` when it may stand.
+ *
+ * **The flag says *address*; the value is a bare HOST, and nothing checked which.** Leg 3 writes it
+ * verbatim into the member's `COLLIE_HOST`, and this lead dials `` `${peerHost}:${port}` `` — so
+ * `--peer-address 192.168.77.2:8787` printed `192.168.77.2:8787:8787` twice and wrote
+ * `COLLIE_HOST=192.168.77.2:8787`, which `Bun.serve` can never bind. The member was left
+ * half-enrolled with a dead service and nothing on screen naming the cause (F8).
+ *
+ * **Splitting `host:port` here instead was considered and refused.** `--port` already exists, and it
+ * is not only the dial port: leg 1 probes it for a collision, leg 3 writes it as `COLLIE_PORT` and
+ * leg 4 banks it in `pack-ops.json`. A second spelling that silently overrode the first is one more
+ * way for those to disagree. One value, one flag — and this function is why the refusal can say so.
+ *
+ * Pure, and the whole check: it runs at parse time on the lead, before a single byte crosses ssh.
+ */
+export function peerHostRefusal(value: string): string | null {
+  if (value.trim() !== value || value === "") return "it is empty or padded with whitespace";
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return "it carries a scheme — a bind address is not a URL";
+  if (value.includes("/")) return "it carries a path — a bind address is a host and nothing else";
+  if (value.includes("@")) return "it carries a user — that is the ssh destination, not the bind";
+  // Brackets are URL-authority syntax, and this value is a BIND: `resolveBridgeHost` hands
+  // `COLLIE_HOST` to `Bun.serve` verbatim, which wants the literal bare. `[fd7a::1]:8787` is a port
+  // and `[fd7a::1]` is a spelling this build will not vouch for — both are refused, by the same rule.
+  if (value.includes("[") || value.includes("]")) {
+    return "it is bracketed — COLLIE_HOST is a bind address, so write an IPv6 literal bare";
+  }
+  const colons = value.split(":").length - 1;
+  // Exactly one colon is `host:port`. Two or more is a bare IPv6 literal, which cannot carry a port
+  // without brackets — so it is a host, and the case above is the only one that can.
+  if (colons === 1) return "it carries a port";
+  return null;
+}
+
+/** The refusal as the operator reads it: what is wrong, then what a value that works looks like. */
+export function peerHostRefusalLines(value: string, refusal: string): string[] {
+  return [
+    `error: --peer-address ${value} is not a bind address — ${refusal}.`,
+    "       Give a BARE HOST — a hostname or an IP address and nothing else:",
+    "         --peer-address collie-2.tail1234.ts.net    --peer-address 192.168.77.2",
+    "       It is written verbatim into that machine's COLLIE_HOST, so it must be an address that",
+    `       machine can BIND, and the port it is dialled on comes from \`${PEER_HOST_PORT_HINT}\`.`,
+  ];
 }
 
 /**

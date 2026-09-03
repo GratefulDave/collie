@@ -17,7 +17,6 @@ import {
 const KEYS = [
   "COLLIE_PORT",
   "COLLIE_HOST",
-  "COLLIE_UNIX_SOCKET",
   "COLLIE_POLL_MS",
   "COLLIE_POLL_IDLE_MS",
   "COLLIE_NOTIFY_DELAY_MS",
@@ -79,7 +78,6 @@ describe("loadConfig", () => {
     const cfg = loadConfig();
     expect(cfg.port).toBe(8787);
     expect(cfg.host).toBe("127.0.0.1");
-    expect(cfg.unixSocket).toBe("");
     expect(cfg.pollMs).toBe(1500);
     expect(cfg.pollIdleMs).toBe(12_000);
     expect(cfg.readLines).toBe(200);
@@ -236,11 +234,6 @@ describe("loadConfig", () => {
     const cfg = loadConfig();
     expect(cfg.deviceHeader).toBe("X-Device-Id");
     expect(cfg.deviceAllowlist).toEqual(["phone", "laptop"]);
-  });
-
-  test("reads an optional Unix-domain listener path", () => {
-    process.env.COLLIE_UNIX_SOCKET = " /tmp/collie.sock ";
-    expect(loadConfig().unixSocket).toBe("/tmp/collie.sock");
   });
 
   test("parses integer env vars and falls back to the default on garbage", () => {

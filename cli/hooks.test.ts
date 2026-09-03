@@ -87,6 +87,76 @@ describe("the command it writes", () => {
     expect(resolveHookCommand(d.ctx, d.fs).source).toBe("checkout");
   });
 
+  // ── A binary install: the hook must survive `collie update` (issue: dangling versioned hooks) ──
+  //
+  // The layout is `<root>/versions/X.Y.Z` with a `current` symlink beside it, and `update` keeps only
+  // the PREVIOUS version — so a hook pinned to `versions/1.0.0-beta.49/bin/collie` is deleted out from
+  // under itself after one or two updates and fires into nothing, silently. Nothing here may write a
+  // `versions/` path.
+
+  const INSTALL_ROOT = `${HOME}/.local/share/collie`;
+  const VERSION_ROOT = `${INSTALL_ROOT}/versions/1.0.0-beta.49`;
+  const VERSIONED = `${VERSION_ROOT}/bin/collie`;
+  const CURRENT = `${INSTALL_ROOT}/current/bin/collie`;
+
+  /** A binary install: the process runs from the version directory, `current` points at it. */
+  function binaryDeps(published?: string): ReturnType<typeof deps> {
+    const d = deps();
+    const ctx = context({}, { root: VERSION_ROOT });
+    d.fs.entries.set(`${INSTALL_ROOT}/current`, { kind: "symlink", target: VERSION_ROOT });
+    if (published !== undefined) d.fs.entries.set(PUBLISHED, { kind: "symlink", target: published });
+    return { ...d, ctx };
+  }
+
+  test("on a binary install, prefers the published name — which resolves THROUGH `current` (realpath, not string equality)", () => {
+    const d = binaryDeps(CURRENT);
+    expect(resolveHookCommand(d.ctx, d.fs)).toEqual({
+      binary: PUBLISHED,
+      source: "path-link",
+      command: `${PUBLISHED} beacon emit ${HOOK_MARKER}`,
+    });
+  });
+
+  test("on a binary install with no published name, writes `current/bin/collie` — never the version directory", () => {
+    const d = binaryDeps();
+    const resolved = resolveHookCommand(d.ctx, d.fs);
+    expect(resolved).toEqual({
+      binary: CURRENT,
+      source: "install-current",
+      command: `${CURRENT} beacon emit ${HOOK_MARKER}`,
+    });
+    expect(resolved.command).not.toContain("/versions/");
+  });
+
+  test("a published name pointing straight at THIS version is still the published name, not the version path", () => {
+    const d = binaryDeps(VERSIONED);
+    const resolved = resolveHookCommand(d.ctx, d.fs);
+    expect(resolved.binary).toBe(PUBLISHED);
+    expect(resolved.command).not.toContain("/versions/");
+  });
+
+  test("a published name left over at a GC'd version falls back to `current`, never to the dangling path", () => {
+    const d = binaryDeps(`${INSTALL_ROOT}/versions/1.0.0-beta.47/bin/collie`);
+    expect(resolveHookCommand(d.ctx, d.fs).binary).toBe(CURRENT);
+  });
+
+  test("a published name belonging to another install is refused on a binary install too", () => {
+    const d = binaryDeps("/opt/collie-v1/bin/collie");
+    expect(resolveHookCommand(d.ctx, d.fs).binary).toBe(CURRENT);
+  });
+
+  test("re-installing REPLACES a marked entry whose command is a stale versioned path", () => {
+    const stale = `${VERSIONED} beacon emit ${HOOK_MARKER}`;
+    const before: JsonValue = { hooks: { Stop: [THEIRS, { hooks: [{ type: "command", command: stale, timeout: 10 }] }] } };
+    const outcome = installDocument(before, `${CURRENT} beacon emit ${HOOK_MARKER}`);
+    const stop = outcome.kind === "document" ? JSON.parse(serializeSettings(outcome.document)).hooks.Stop : [];
+    // The operator's own entry keeps its place; ours is replaced where it stood, not appended.
+    expect(stop[0]).toEqual(THEIRS);
+    expect(stop).toHaveLength(2);
+    expect(markedCommandIn(stop[1])).toBe(`${CURRENT} beacon emit ${HOOK_MARKER}`);
+    expect(JSON.stringify(stop)).not.toContain("/versions/");
+  });
+
   test("carries a version-prefixed ownership marker", () => {
     expect(HOOK_MARKER).toMatch(/# collie-beacon v\d+$/);
     expect(markedCommandIn({ hooks: [{ type: "command", command: COMMAND }] })).toBe(COMMAND);
@@ -347,5 +417,65 @@ describe("status", () => {
     const d = deps({ files: { [SETTINGS]: serializeSettings(document) } });
     cmdHooksStatus(d);
     expect(d.io.stdout.join("\n")).toContain("re-run install to heal it");
+  });
+});
+
+// `--check` is what `collie update` runs on the binary it has just installed: no output at all, and
+// the exit code is the whole answer. "Behind" is narrower than "install would change something" —
+// a file with none of our entries opted out, and nothing may nag it.
+describe("status --check", () => {
+  const partial = () => {
+    const older = BEACON_HOOKS.slice(1);
+    return serializeSettings({
+      hooks: Object.fromEntries(older.map((r) => [r.event, [{ hooks: [{ type: "command", command: COMMAND }] }]])),
+    });
+  };
+  const staleDoc = () => {
+    const stale = { hooks: [{ type: "command", command: "/old/collie beacon emit # collie-beacon v0" }] };
+    return serializeSettings({ hooks: Object.fromEntries(BEACON_HOOKS.map((r) => [r.event, [stale]])) });
+  };
+  const installed = () => {
+    const d = deps();
+    cmdHooksInstall(d, ["claude"]);
+    return d.files.entries.get(SETTINGS)!.text;
+  };
+
+  test("says behind for a partial install, and prints nothing at all", () => {
+    const d = deps({ files: { [SETTINGS]: partial() } });
+    expect(cmdHooksStatus(d, ["--check"])).toBe(EXIT.STATE);
+    expect(d.io.stdout).toEqual([]);
+    expect(d.io.stderr).toEqual([]);
+    expect(d.files.ops).toEqual([]);
+  });
+
+  test("says behind for entries at a marker version this build no longer writes", () => {
+    const d = deps({ files: { [SETTINGS]: staleDoc() } });
+    expect(cmdHooksStatus(d, ["--check"])).toBe(EXIT.STATE);
+  });
+
+  test("stays quiet when the hooks were never installed — that is an opt-out, not a gap", () => {
+    const never = deps({ files: { [SETTINGS]: serializeSettings({ hooks: { Stop: [THEIRS] } }) } });
+    expect(cmdHooksStatus(never, ["--check"])).toBe(EXIT.OK);
+    const nofile = deps();
+    expect(cmdHooksStatus(nofile, ["--check"])).toBe(EXIT.OK);
+  });
+
+  test("stays quiet when every registration is present at this version", () => {
+    const d = deps({ files: { [SETTINGS]: installed() } });
+    expect(cmdHooksStatus(d, ["--check"])).toBe(EXIT.OK);
+    expect(d.io.stdout).toEqual([]);
+  });
+
+  test("is behind when ANY configured profile is, not only ~/.claude (issue #92)", () => {
+    const d = deps({
+      env: { COLLIE_TRANSCRIPT_ROOT: "/srv/ops/projects" },
+      files: { [SETTINGS]: installed(), "/srv/ops/settings.json": partial() },
+    });
+    expect(cmdHooksStatus(d, ["--check"])).toBe(EXIT.STATE);
+  });
+
+  test("does not answer `behind` for a file it cannot read — that is doctor's business", () => {
+    const d = deps({ files: { [SETTINGS]: "{ not json" } });
+    expect(cmdHooksStatus(d, ["--check"])).toBe(EXIT.OK);
   });
 });

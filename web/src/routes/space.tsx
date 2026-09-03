@@ -1,17 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useRevalidator } from "react-router";
 
-import { AppHeader, SettingsGear } from "@/components/app-header";
-import { PullToRefresh } from "@/components/pull-to-refresh";
+import { RouteHeader, SettingsGear } from "@/components/app-header";
 import { ReadOnlyBanner } from "@/components/read-only-banner";
 import { SpaceStrip } from "@/components/space-strip";
 import { SpaceView } from "@/components/space-view";
 import { TabStrip } from "@/components/tab-strip";
 import { NewSpaceSheet } from "@/components/new-space-sheet";
 import { StatusArea } from "@/components/status-area";
+import { ToastViewport } from "@/components/ui/toast-viewport";
 import { BuildStamp } from "@/components/build-stamp";
 import { UpdateBanner } from "@/components/update-banner";
-import { useLoadingStalled } from "@/hooks/use-loading-stalled";
 import { useSpaceActions } from "@/hooks/use-spaces";
 import { homePath, panePath, spacePath } from "@/lib/nav";
 import { leadHost, paneScope } from "@/lib/hosts";
@@ -27,10 +26,9 @@ import { useRootData } from "@/lib/route-data";
 export function SpaceRoute() {
   const data = useRootData();
   const { spaceId = "" } = useParams();
-  const stalled = useLoadingStalled();
   const navigate = useNavigate();
   const revalidator = useRevalidator();
-  const { newTab, newSpace } = useSpaceActions();
+  const { newTab, newSpace, creatingTab, creatingSpace } = useSpaceActions();
   const [newSpaceOpen, setNewSpaceOpen] = useState(false);
   // Either write gate refusing locks the tab strip's rename/close the same way (see ReadOnlyBanner).
   const { refused: notPaired } = usePairing();
@@ -55,7 +53,7 @@ export function SpaceRoute() {
   // pane still supplies its own host, so opening one can never point the URL at another machine.
   const navHost = leadHost(data.servers);
   const open = (pane: AgentView) =>
-    navigate(panePath(pane.paneId, paneScope(data.scope, pane, data.servers)));
+    navigate(panePath(pane.paneId, paneScope(data.scope, pane, data.servers, data.sessions)));
 
   // Recover from a deleted space: once a healthy snapshot no longer has it, bounce to the dashboard
   // instead of leaving you on an empty shell. Guarded on a connected, non-stale snapshot so a
@@ -77,19 +75,21 @@ export function SpaceRoute() {
   return (
     <div className="mx-auto flex min-h-0 w-full max-w-screen-sm flex-1 flex-col">
       {/* The space header: same shell as the dashboard, minus the session switcher (you switch
-          sessions from home). Wordmark + shared pill + Settings gear. */}
-      <AppHeader
-        bridge={data.bridge}
-        error={data.error}
-        stalled={stalled}
+          sessions from home). Wordmark + shared pill + Settings gear. Launchers live on the
+          dashboard's own strip and in the pane switcher sheet, not here. */}
+      <RouteHeader
         onHome={toDashboard}
         wordmark
+        width="column"
         rightTrail={<SettingsGear scope={data.scope} />}
       />
 
-      {/* Content region below the header: the viewport-clipped scroller, carrying the same pull
-          gesture the dashboard does — the two are one list screen at two depths. */}
-      <PullToRefresh scope={data.scope} className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+      {/* Content region below the header: the viewport-clipped scroller, the same shell the
+          dashboard uses — the two are one list screen at two depths. `relative` for the reason
+          home.tsx gives: an `sr-only` descendant must resolve against this scroller. */}
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
+        {/* Below the header, so it is content, not viewport chrome: an inset box on this route's
+            gutter, like the dashboard's. See read-only-banner.tsx. */}
         <ReadOnlyBanner device={data.device} />
 
         {selectedWs && (
@@ -100,6 +100,7 @@ export function SpaceRoute() {
               selected={spaceId}
               onSelect={(id) => (id === null ? toDashboard() : switchSpace(id))}
               onNewSpace={() => setNewSpaceOpen(true)}
+              creatingSpace={creatingSpace}
               onBack={toDashboard}
             />
             <TabStrip
@@ -110,6 +111,7 @@ export function SpaceRoute() {
               selected={tab}
               onSelect={switchTab}
               onNewTab={newTab}
+              creatingTab={creatingTab.has(selectedWs.workspaceId)}
               scope={data.scope}
               readOnly={isReadOnly(data.device) || notPaired}
               onRenamed={() => revalidator.revalidate()}
@@ -136,14 +138,16 @@ export function SpaceRoute() {
 
         {/* An available update / needed restart, then the build stamp (which bundle you're
             running, with a stale-cache nudge). */}
-        <UpdateBanner className="px-3 pt-3" />
-        <BuildStamp className="px-3 pt-3 pb-[calc(env(safe-area-inset-bottom)_+_0.5rem)]" />
-      </PullToRefresh>
-
-      {/* Status overlay, anchored to the bottom of the viewport. Stays outside the scroller. */}
-      <div className="pointer-events-none fixed inset-x-0 bottom-0 z-30 mx-auto w-full max-w-screen-sm px-3 pb-[calc(env(safe-area-inset-bottom)_+_0.75rem)]">
-        <StatusArea />
+        <UpdateBanner className="px-4 pt-3" />
+        <BuildStamp className="px-4 pt-3 pb-[calc(env(safe-area-inset-bottom)_+_0.5rem)]" />
       </div>
+
+      {/* Status overlay, anchored to the bottom of the viewport. Stays outside the scroller. Same
+          call as the dashboard's, and for the same reason: no composer down there to collide with.
+          ToastViewport owns the position — see the note on home.tsx's copy. */}
+      <ToastViewport>
+        <StatusArea />
+      </ToastViewport>
 
       <NewSpaceSheet open={newSpaceOpen} onClose={() => setNewSpaceOpen(false)} onCreate={newSpace} />
     </div>

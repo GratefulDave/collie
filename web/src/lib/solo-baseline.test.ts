@@ -102,6 +102,10 @@ const AGENT_VIEW_KEYS = {
   // Also not a pack dimension: an optional sentence the bridge composes about one kind of pane
   // (M11/05), rendered as text and absent everywhere else.
   hint: true,
+  // The OTHER half of a pane's address. Like `host` it is written by the REQUEST, not by the pane:
+  // present exactly when the snapshot was widened (`?sessions=all`, the "All sessions" view), absent
+  // on every other read — which is every read the app made before that view existed.
+  session: true,
 } satisfies Record<keyof AgentView, true>;
 
 const DEVICE_AUTH_KEYS = {
@@ -117,8 +121,13 @@ const UPDATE_INFO_KEYS = {
   releaseAvailable: true,
   majorAvailable: true,
   majorUrl: true,
+  installKind: true,
   bridgeStale: true,
   checkedAt: true,
+  // The update card's two additions (M15/05): what one update folds in, and the run record the card
+  // renders. Both optional — an older bridge sends neither.
+  newerVersions: true,
+  run: true,
 } satisfies Record<keyof UpdateInfo, true>;
 
 describe("solo zero-tax — the client's mirror types carry no pack dimension", () => {
@@ -154,6 +163,10 @@ describe("solo zero-tax — the client's mirror types carry no pack dimension", 
     expect(SNAPSHOT_KEYS.servers).toBe(true);
     expect(SESSION_SUMMARY_KEYS.host).toBe(true);
     expect(AGENT_VIEW_KEYS.host).toBe(true);
+    // The pane's two ADDRESS fields, and the only two here a request can turn on: `host` on a merged
+    // pack body, `session` on a widened one. Neither is on a solo, un-widened read — which is what
+    // the golden object above pins — and this list is the tripwire against a quiet third.
+    expect(AGENT_VIEW_KEYS.session).toBe(true);
     expect(Object.keys(AGENT_VIEW_KEYS).toSorted()).toEqual([
       "agent",
       "cwd",
@@ -167,6 +180,7 @@ describe("solo zero-tax — the client's mirror types carry no pack dimension", 
       "paneId",
       "paneLabel",
       "readableLines",
+      "session",
       "sessionName",
       "status",
       "tabId",
@@ -182,11 +196,14 @@ describe("solo zero-tax — the client's mirror types carry no pack dimension", 
       "bridgeStale",
       "checkedAt",
       "current",
+      "installKind",
       "latest",
       "latestUrl",
       "majorAvailable",
       "majorUrl",
+      "newerVersions",
       "releaseAvailable",
+      "run",
     ]);
   });
 

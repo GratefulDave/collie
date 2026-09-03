@@ -31,7 +31,7 @@ A **collie** — a long-lived local process that
 - translates browser actions → socket methods,
 - sits behind **one hardened front door** — `tailscale serve` (default; tailnet-only HTTPS +
   MagicDNS) or a conforming reverse proxy
-  ([DEPLOYMENT.md → Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)) —
+  ([docs/deployment.md → Variant C](./docs/deployment.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)) —
   installable as a **PWA**.
 
 The browser never touches the multiplexer directly; the bridge is the only thing that does.
@@ -163,7 +163,7 @@ Product details that shaped the loop:
   field, so the phone keyboard's own mic works in it with nothing built, and Send stays an explicit
   button — dictated text is reviewable before it goes. Beyond that, `collie stt setup` switches on
   Collie's own record button through a provider seam (`bridge/stt/`, CLI `cli/stt.ts`,
-  [README → Voice input](./README.md#voice-input-optional)). The seam is **absent until that verb
+  [docs/voice-and-push.md → Voice input](./docs/voice-and-push.md#voice-input-optional)). The seam is **absent until that verb
   runs**: no key, no outbound path, no child process, no button. Turning it on is what buys the
   credential in the state dir and the outbound path carrying microphone audio — a local engine keeps
   that egress on loopback, and hands-free sends go through the same guarded reply path a typed reply
@@ -192,6 +192,52 @@ why that matters on Android). What ships identifies **which** agent needs you �
 app. Closing this needs the server-side blocking-message capture described above.
 
 ## 5. Architecture notes
+
+The shape of one collie, end to end — the ASCII sketches in §2 stay the precise ones; this is the
+overview the rest of this section fills in.
+
+```mermaid
+graph TD
+  subgraph phone["The phone"]
+    pwa["PWA — the mobile web app, installed to the home screen"]
+  end
+
+  subgraph door["One hardened front door"]
+    serve["tailscale serve — tailnet-only HTTPS (or a conforming reverse proxy)"]
+  end
+
+  subgraph collie["The collie — one long-lived local process, bound to 127.0.0.1 only"]
+    api["static web app + small JSON API"]
+    muxport["mux port (bridge/mux/) — the only code that knows a multiplexer's verbs"]
+    journal["journal adapters (bridge/journal/) — one per harness"]
+  end
+
+  subgraph mplex["The multiplexer — exactly one per install (COLLIE_MUX)"]
+    herdr["Herdr driver"]
+    tmuxd["tmux driver"]
+    zellijd["zellij driver"]
+    panes["the agents' terminal panes"]
+  end
+
+  logs[("the agents' own session logs, on this machine's disk")]
+  beacons[("beacons — written by the agent's own hooks")]
+
+  pwa -->|"HTTPS over the tailnet, polls /api/snapshot"| serve
+  serve -->|"127.0.0.1:PORT — the browser never reaches further"| api
+  api -->|"snapshot poll, event-poked"| muxport
+  api -->|"/api/pane/:id/history"| journal
+  muxport -->|"registry.ts loads exactly one driver"| herdr
+  muxport --> tmuxd
+  muxport --> zellijd
+  herdr -->|"JSON-RPC over the Herdr socket"| panes
+  tmuxd -->|"capture-pane"| panes
+  zellijd -->|"dump-screen --ansi"| panes
+  panes -.->|"the harness writes its own turns"| logs
+  journal -->|"reads the transcript off local disk, never the screen"| logs
+  panes -.->|"collie beacon emit, from the agent's hooks"| beacons
+  beacons -.->|"which pane holds an agent, and its session key"| tmuxd
+  beacons -.-> zellijd
+```
 
 - **`bridge/mux/` is a port with three drivers, and nothing above it knows which one is loaded.** The
   port is Collie's own contract (`types.ts`), not Herdr's shape renamed
@@ -277,8 +323,12 @@ app. Closing this needs the server-side blocking-message capture described above
   [ADR 0018](./.adr/0018-operator-command-rows-replace-the-catalog.md). Their **Keys-tray presets**
   ride the same request on the same terms, from `keys.toml` (`bridge/operator-keys.ts`), and their
   **Quick-dock groups** from `quick-replies.toml` (`bridge/operator-quick-replies.ts`); the three
-  files share one reader (`bridge/operator-file.ts`) and one scope ladder
-  (`web/src/lib/operator-scope.ts`).
+  share one reader (`bridge/operator-file.ts`) and one scope ladder
+  (`web/src/lib/operator-scope.ts`). Their **launcher rows**, from `launchers.toml`
+  (`bridge/operator-launchers.ts`), share the reader but NOT `/api/config`: a launcher row creates
+  its own pane rather than addressing an existing one, so it carries no scope, and its rows ride
+  their own session-scoped `GET /api/launchers` instead — rows must come from the host that runs
+  them, which a lead-only `/api/config` field cannot say in a pack (PACK_PROTOCOL.md §5).
 
 - **UI strings are translated by a typed dictionary, not a library** (`web/src/lib/i18n/`, six
   locales, English the compile-time source of truth) — `t()`/`tn()` plus the `useLocale()` hook
@@ -323,9 +373,9 @@ door (tailnet-only by default; one per **pack** — §2.1). These four are genui
   tolerating the absence let any tagged node write. `COLLIE_TRUSTED_USER_OPTIONAL=1` restores the old
   pass, for host-local development. The header exists **only** under `tailscale serve` ingress, so
   under `COLLIE_SKIP_SERVE` only a mismatch is rejected. Under a reverse-proxy front door
-  ([DEPLOYMENT.md → Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale))
+  ([docs/deployment.md → Variant C](./docs/deployment.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale))
   there is none, and the equivalent write gate is **per-device auth** (`COLLIE_DEVICE_HEADER`) with
-  the proxy contract (DEPLOYMENT.md Variant B/C requirements) as the load-bearing piece. That gate **fails
+  the proxy contract (docs/deployment.md Variant B/C requirements) as the load-bearing piece. That gate **fails
   closed since 0.15.0**: with `COLLIE_DEVICE_HEADER` set, a request arriving without the header is
   read-only, so reaching the port is no longer sufficient to write. Device ids are names your proxy
   asserts, not secrets — treat them as guessable and keep the front door and its ACL as the real
@@ -360,7 +410,7 @@ door (tailnet-only by default; one per **pack** — §2.1). These four are genui
   device can't CSRF the bridge. With a plain `tailscale serve` on the MagicDNS name these match
   automatically (no config). When Collie is fronted by a *different* public hostname or an extra
   reverse proxy / TLS terminator (custom domain, load balancer, Headscale + upstream TLS, or a
-  reverse-proxy front door — [DEPLOYMENT.md → Variant C](./DEPLOYMENT.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)),
+  reverse-proxy front door — [docs/deployment.md → Variant C](./docs/deployment.md#variant-c--reverse-proxy-as-the-only-front-door-no-tailscale)),
   the public origin no longer matches the forwarded `Host` — list that exact origin in
   `COLLIE_ALLOWED_ORIGINS` (the only sanctioned way to widen the gate; never bind off-loopback to
   "fix" it).

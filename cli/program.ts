@@ -64,7 +64,7 @@ import { loadUi, renderInputs, takePlainFlag, type Ui, wantsRich } from "./rende
 import { cmdPackDeputy } from "./pack-deputy.ts";
 import { cmdPackUpdate } from "./pack-update.ts";
 import { cmdPackAdd, packAddDeps, type PackAddDeps } from "./remote.ts";
-import { cmdServe, cmdUnserve } from "./serve.ts";
+import { cmdServe, cmdServeVerb, cmdUnserve } from "./serve.ts";
 import {
   cmdStt,
   cmdSttOff,
@@ -75,8 +75,8 @@ import {
   type SttDeps,
 } from "./stt.ts";
 import { realExec, realFiles } from "./sys.ts";
-import { bridgeUrl } from "./tailnet.ts";
 import { cmdApplyUpdate, cmdUpdate } from "./update.ts";
+import { cmdUpdateCheck, updateCheckDeps, wantsCheck } from "./update-check.ts";
 
 // The `collie` binary's dispatch: argv in, exit code out. This module owns ONLY the dispatch —
 // every verb's behaviour lives in its own module under `cli/`, taking the resolved context as an
@@ -291,14 +291,20 @@ export const COMMANDS: readonly Command[] = [
   ),
   {
     name: "update",
-    summary: "advance to the newest release of this major, rebuild, restart (--major crosses one)",
-    run: (args, s) => cmdUpdate(updateDeps(s.io), args),
+    summary:
+      "advance to the newest release of this major (--check is a read-only preflight, and --check --local checks this instance only, skipping pack members; --major crosses one; --rollback flips current back to the previous version; --status shows the run)",
+    // `--check` is a different verb wearing `update`'s name: a read-only preflight that answers
+    // "could this update succeed right now?" and touches nothing (`cli/update-check.ts`). It is
+    // routed HERE, before `cmdUpdate` is ever constructed, so no part of the real update path can
+    // run behind it.
+    run: (args, s) =>
+      wantsCheck(args) ? cmdUpdateCheck(updateCheckDeps(s.io), args) : cmdUpdate(updateDeps(s.io), args),
   },
   {
     name: "_apply-update",
     summary: "internal: the second half of `update`, run post-pull",
     internal: true,
-    run: (_args, s) => cmdApplyUpdate(updateDeps(s.io)),
+    run: (args, s) => cmdApplyUpdate(updateDeps(s.io), args),
   },
   lifecycleCommand(
     "_exec-bridge",
@@ -312,13 +318,9 @@ export const COMMANDS: readonly Command[] = [
     cmdBuild,
   ),
   // Invoked directly, `serve` also prints where to point a phone (the pre-shim collie-ctl.sh) —
-  // `start` does not, because its banner already carries the URL.
-  lifecycleCommand("serve", "publish the single managed `tailscale serve` front door", (deps) => {
-    const code = cmdServe(deps);
-    if (code !== EXIT.OK) return code;
-    deps.io.out(`open: ${bridgeUrl(deps.exec, deps.ctx)}`);
-    return EXIT.OK;
-  }),
+  // `start` does not, because its banner already carries the URL. That extra line is `cmdServeVerb`,
+  // which lives beside the publish decision it depends on (a peer prints none — F24).
+  lifecycleCommand("serve", "publish the single managed `tailscale serve` front door", cmdServeVerb),
   lifecycleCommand("unserve", "tear down the front door we published", cmdUnserve),
   lifecycleCommand("status", "is it running, and on what URLs", cmdStatus, { rich: true }),
   lifecycleCommand("url", "print the bridge URL", cmdUrl),
@@ -398,7 +400,7 @@ export const COMMANDS: readonly Command[] = [
       {
         name: "status",
         summary: "what each settings file carries right now (reads only)",
-        run: (_args, s) => cmdHooksStatus(hooksDeps(s.io)),
+        run: (args, s) => cmdHooksStatus(hooksDeps(s.io), args),
       },
     ],
     run: (args, s) => cmdHooks(hooksDeps(s.io), args),
@@ -510,14 +512,18 @@ export const COMMANDS: readonly Command[] = [
   // ── The pack (M4/07) ───────────────────────────────────────────────────────
   // The only way a machine enters or leaves a pack. Every one of them resolves its seams through
   // `packVerbDeps`, so the dispatcher stays a table and `cli/pack.ts` owns the behaviour.
+  // The two ALIASES. `pack join` and `pack leave` are the canonical spellings — every other pack
+  // verb is a `pack` sub-verb, and these two were the exception for no reason anyone could state.
+  // They stay because 1.0.0 documented them and scripts type them: same function, same seams, same
+  // exit codes, one name each. `cli/pack.test.ts` pins that the two spellings are one code path.
   {
     name: "join",
-    summary: "join a pack: `join <lead-address> <token|-|@file>` (run on the joining machine)",
+    summary: "same as `pack join`",
     run: async (args, s) => cmdJoin(await packVerbDeps(s.io), args),
   },
   {
     name: "leave",
-    summary: "leave the pack — drops the pack secret and every pin on this machine",
+    summary: "same as `pack leave`",
     run: async (_args, s) => cmdLeave(await packVerbDeps(s.io)),
   },
   {
@@ -527,6 +533,10 @@ export const COMMANDS: readonly Command[] = [
     // `cli/pack.ts`'s own usage block prints — the two are pinned to each other in cli/main.test.ts.
     subcommands: [
       packSubcommand("invite", "mint a single-use, 10-minute enrollment token (on the lead)", cmdPackInvite),
+      packSubcommand("join", "join a pack: `pack join <lead-address>` (run on the joining machine)", cmdJoin),
+      packSubcommand("leave", "leave the pack — drops the pack secret and every pin on this machine", (deps) =>
+        cmdLeave(deps),
+      ),
       packSubcommand("add", "install and enroll a peer over SSH: `pack add <ssh-host>` (on the lead)", cmdPackAdd, true),
       packSubcommand(
         "update",
@@ -607,6 +617,25 @@ export function helpText(commands: readonly Command[] = COMMANDS): string[] {
   lines.push("");
   lines.push(`  ${"--plain".padEnd(12)} never draw the terminal view — print the lines a pipe would get`);
   return lines;
+}
+
+/**
+ * The two reflexes every operator has, spelled as the verbs they mean.
+ *
+ * `collie --version` used to print `error: unknown command \`--version\`` and the usage line — a verb
+ * table where `version` exists and `--version` is a typo is a distinction only the implementer cares
+ * about. `-V` is the long option's conventional short form; `-v` is left alone, because it is the one
+ * a future `--verbose` would want and a flag that changed meaning later is worse than one that never
+ * existed.
+ *
+ * Only the FIRST argument is rewritten. `collie logs --version` is an argument to `logs`, exactly as
+ * every other flag reaching a verb is (`buildProgram` turns commander's own `-h` off for the same
+ * reason), and this must not start guessing at it.
+ */
+export function normalizeArgv(argv: readonly string[]): readonly string[] {
+  const first = argv[0];
+  if (first === "--version" || first === "-V") return ["version", ...argv.slice(1)];
+  return argv;
 }
 
 /** Feed a commander write (one string, possibly multi-line, usually newline-terminated) to `Io`. */
@@ -707,7 +736,7 @@ export async function run(
     code = c;
   });
   try {
-    await program.parseAsync(rest, { from: "user" });
+    await program.parseAsync(normalizeArgv(rest), { from: "user" });
     return code;
   } catch (err) {
     if (err instanceof CommanderError) {

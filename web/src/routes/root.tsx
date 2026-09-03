@@ -1,14 +1,23 @@
-import { Outlet, useLoaderData, useParams, useRouteError, useRouteLoaderData } from "react-router";
+import {
+  Outlet,
+  useLoaderData,
+  useNavigation,
+  useParams,
+  useRouteError,
+  useRouteLoaderData,
+} from "react-router";
 
-import { intervalFor, usePolling } from "@/hooks/use-polling";
+import { usePolling } from "@/hooks/use-polling";
 import { usePollBusy } from "@/hooks/use-poll-busy";
+import { useBusyWhile } from "@/lib/busy";
 import { useAgentTransitions } from "@/hooks/use-transitions";
 import { usePushSetup } from "@/hooks/use-push";
 import { useConnectionLost } from "@/hooks/use-connection-lost";
 import { UpdateAvailableBanner } from "@/components/update-available-banner";
 import { ConnectionBanner } from "@/components/connection-banner";
+import { AppHeaderHost } from "@/components/app-header";
 import { PackProvider } from "@/components/pack-provider";
-import { DogGallop } from "@/components/dog-gallop";
+import { CollieMark } from "@/components/collie-mark";
 import { describeThrownError } from "@/lib/api-error-message";
 import { homePath } from "@/lib/nav";
 import { scopeFromUrl } from "@/lib/session";
@@ -56,11 +65,19 @@ export function RootLayout() {
 
   // The scope rides along so a "look now" on foreground lands on the machine and session the page is
   // actually showing — a refresh aimed at the lead would leave a peer's herd exactly as stale.
-  usePolling(data, paneId, data.scope);
+  const pollMs = usePolling(data, paneId, data.scope);
   // Surface the busy bar when a navigation or a poll runs slow, each against its own threshold —
   // routine fast polls/navigations stay invisible. Mounted here so the whole app shares one
   // detector inside the router context.
   usePollBusy();
+  // The Collie mark's orbit turns for the whole of a route navigation — a tap the operator is
+  // waiting on a loader for. NO THRESHOLD here, unlike the bar above: the bar is a strip that
+  // appears, so it waits 500ms rather than flash on every fast tap, while the orbit is already on
+  // screen and only changes speed and chroma. The mark carries its phase across that change
+  // (lib/busy.ts states it at `useBusyWhile`), so a 120ms navigation reads as a short
+  // accelerate/decelerate rather than a flicker, and delaying it would only make the fast case —
+  // the common one — say nothing at all.
+  useBusyWhile(useNavigation().state !== "idle");
   useAgentTransitions(data.agents, paneId ?? null);
   usePushSetup();
 
@@ -74,9 +91,10 @@ export function RootLayout() {
     //
     // `ts` and the poll cadence ride along for tier-2 (lead↔peer) health: §10.2 presents a member
     // stale once the lead's last receipt from it is older than `3 × pollMs` (capped at 15s), and
-    // `intervalFor` is the same pure resolver `usePolling` above is running on — read here rather
-    // than re-derived, so the tolerance can never be computed against a cadence we aren't using.
-    <PackProvider servers={data.servers} ts={data.ts} pollMs={intervalFor(data, paneId)}>
+    // the number is the one `usePolling` above RETURNS — the gap it is actually running on, not a
+    // second derivation of it, so the tolerance can never be computed against a cadence we aren't
+    // using. That mattered more once the cadence gained inputs beyond the snapshot (#156).
+    <PackProvider servers={data.servers} sessions={data.sessions} ts={data.ts} pollMs={pollMs}>
       <div className="flex h-[100dvh] flex-col">
         {/* API-observed self-update: mounted unconditionally so its controller runs (and can
             auto-update) for the app's lifetime; renders the slim "tap to update" row only when a fresh
@@ -92,7 +110,23 @@ export function RootLayout() {
           authError={data.authError}
           lastSeenAt={shownLastSeenAt(data, pane)}
         />
-        <Outlet />
+        {/* THE ONE HEADER, and the third thing on this shelf. The two banners above it have always
+            survived a navigation because they are rendered HERE rather than inside `<Outlet/>`; the
+            header did not, because all six routes mounted their own copy of it, and a header inside
+            the outlet unmounts and remounts on every route change. That restarted the Collie mark's
+            37 CSS animations at zero each time — the operator's report — and rebuilt every gradient,
+            filter and mask id in the drawing with it. It is one shell now, mounted once for the life
+            of the app, and each route portals its own items into it via `<RouteHeader/>`.
+
+            It WRAPS the outlet rather than sitting beside it, which is the structural half of the
+            fix: there is no arrangement of this app in which a route mounts without a header above
+            it, and `<RouteHeader/>` throws outside the host rather than quietly rendering nothing.
+            `bridge` and `error` are read here, once, off the root snapshot every route was
+            forwarding them from anyway — six copies of the same two fields was six chances to
+            disagree with the ConnectionBanner two lines up. */}
+        <AppHeaderHost bridge={data.bridge} error={data.error}>
+          <Outlet />
+        </AppHeaderHost>
       </div>
     </PackProvider>
   );
@@ -101,29 +135,39 @@ export function RootLayout() {
 // Shown once, on the very first load, while the snapshot loader resolves (SPA hydration). This is the
 // router's HydrateFallback, so it stays mounted until the FIRST loader run settles — and over a dead
 // tailnet that initial fetch can hang well past its timeout (or forever on a WebView without
-// AbortSignal.timeout). Left as-is, a PWA reopened while the host is unreachable would gallop the dog
+// AbortSignal.timeout). Left as-is, a PWA reopened while the host is unreachable would bloom the mark
 // on "Connecting to the herd…" indefinitely, with no way to retry. So once we've been stuck here for
 // CONNECTION_LOST_MS (the same wall-clock threshold as the in-app prompt — `connecting` is trivially
 // true the whole time we're mounted), the splash escalates to an honest, actionable "Not connected"
-// state: the dog rests, the copy says we can't reach Collie, and a Retry re-runs the loaders from
-// scratch (a full reload clears most transient failures). Below the threshold it's unchanged.
+// state: the mark stills, the copy says we can't reach Collie, and a Retry
+// re-runs the loaders from scratch (a full reload clears most transient failures). Below the
+// threshold it's unchanged.
 export function BootSplash() {
   useLocale();
   const stuck = useConnectionLost(true);
   if (!stuck) {
     return (
       <div className="flex h-[100dvh] flex-col items-center justify-center gap-3 text-muted-foreground">
-        <DogGallop running size="4rem" label={t("error.boot.loadingAria")} />
+        {/* The bloom: the same mark as the rest state below, but turning and at full chroma. It is
+            a COLOUR as well as motion, which is the half a reduced-motion reader still gets —
+            `prefers-reduced-motion` stops the orbit and cannot stop the accents. `paper` is this
+            screen's ground, `bg-background`, the knockout that puts a near-side bead in front of
+            the head. The "Connecting to the herd…" copy below carries the accessible meaning, so
+            the mark is decorative. */}
+        <CollieMark size={64} weight="header" loading paper="var(--background)" />
         <span className="text-sm">{t("error.boot.connecting")}</span>
       </div>
     );
   }
   return (
     <div className="flex h-[100dvh] flex-col items-center justify-center gap-3 p-6 text-center">
-      {/* Rest = the static app icon, muted (grayscale + dimmed) to read asleep — NOT a gallop
-          rest-frame, whose full-stretch mid-stride pose looks frozen mid-run. The "Not connected"
-          copy below carries the accessible meaning, so the icon is decorative. */}
-      <img src="/favicon.svg" alt="" className="size-16 opacity-40 grayscale" />
+      {/* Rest = the Collie mark still, muted (grayscale + dimmed) to read asleep
+          — never the gallop's own rest frame, whose full-stretch mid-stride pose looks frozen
+          mid-run. No `loading`: we have stopped trying, and a blooming mark would say otherwise.
+          `paper` is this screen's ground, `bg-background`, which is the knockout colour that puts a
+          near-side bead in front of the head. The "Not connected" copy below carries the accessible
+          meaning, so the mark is decorative. */}
+      <CollieMark size={64} weight="header" paper="var(--background)" className="opacity-40 grayscale" />
       <p className="font-medium text-foreground">{t("error.boot.title")}</p>
       <p className="max-w-xs text-sm text-muted-foreground">{t("error.boot.body")}</p>
       <button

@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { KeyRound, Loader2, Smartphone } from "lucide-react";
-import { useRevalidator } from "react-router";
+import { useLocation, useRevalidator } from "react-router";
 
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -8,6 +8,7 @@ import { useLocale } from "@/hooks/use-locale";
 import { t } from "@/lib/i18n";
 import { pairDevice, revokeDevice } from "@/lib/api";
 import { timeAgo } from "@/lib/format";
+import { PAIRED_DEVICES_HASH } from "@/lib/nav";
 import { clearDeviceToken, setDeviceToken, usePairing } from "@/lib/pairing";
 import type { DevicesData } from "@/lib/loaders";
 import type { PairFailure } from "@/lib/types";
@@ -37,6 +38,26 @@ export function PairedDevices({ data }: { data: DevicesData }) {
   const revalidator = useRevalidator();
   const { token, refused } = usePairing();
 
+  // THE CARD ANSWERS TO ITS OWN FRAGMENT. `read-only-banner.tsx` links to `/settings#paired-devices`
+  // (lib/nav.ts owns the spelling), and Settings is a long page — arriving at its top would land the
+  // operator on Theme, several screens above the thing they tapped for. The browser cannot do this
+  // itself: React Router navigates without a document load, so no fragment is ever resolved.
+  //
+  // Focus moves too, and that is the half that is not decoration: a screen reader follows focus, not
+  // scroll, so scrolling alone would leave it reading the page from the top. `tabIndex={-1}` makes
+  // the card focusable programmatically without putting it in the tab order.
+  const cardRef = useRef<HTMLDivElement>(null);
+  const { hash } = useLocation();
+  useEffect(() => {
+    if (hash !== `#${PAIRED_DEVICES_HASH}`) return;
+    const card = cardRef.current;
+    if (!card) return;
+    card.scrollIntoView({ block: "start", behavior: "smooth" });
+    // preventScroll: the smooth scroll above owns the movement; focus() would otherwise jump to it
+    // instantly and cancel it.
+    card.focus({ preventScroll: true });
+  }, [hash]);
+
   // Show the pairing form when this device has no credential the bridge would accept: it holds no
   // token, its token was rejected by a write, or the registry itself says it authenticated as
   // nobody while pairing is on. Deliberately NOT shown on a failed load — an unreachable bridge is
@@ -50,7 +71,7 @@ export function PairedDevices({ data }: { data: DevicesData }) {
     pairedAsMessage && data.current ? splitAroundValue(pairedAsMessage, data.current) : ["", ""];
 
   return (
-    <Card className="gap-0 py-0">
+    <Card id={PAIRED_DEVICES_HASH} ref={cardRef} tabIndex={-1} className="gap-0 py-0 outline-none">
       <div className="flex items-start gap-3 p-4 pb-3">
         <KeyRound className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
         <div className="min-w-0">
@@ -64,21 +85,21 @@ export function PairedDevices({ data }: { data: DevicesData }) {
       </div>
 
       {data.current && (
-        <p className="border-t border-border/60 px-4 py-2.5 text-sm">
+        <p className="border-t border-border px-4 py-2.5 text-sm">
           {pairedAsBefore}
-          <span className="font-mono text-[13px] text-status-done">{data.current}</span>
+          <span className="text-[13px] font-medium text-status-done">{data.current}</span>
           {pairedAsAfter}
         </p>
       )}
 
       {data.error && (
-        <p className="border-t border-border/60 px-4 py-2.5 text-xs text-muted-foreground">
+        <p className="border-t border-border px-4 py-2.5 text-xs text-muted-foreground">
           {t("settings.devices.loadError")}
         </p>
       )}
 
       {data.devices.length > 0 && (
-        <ul className="divide-y divide-border/60 border-t border-border/60">
+        <ul className="divide-y divide-border border-t border-border">
           {data.devices.map((d) => (
             <DeviceRow
               key={d.label}
@@ -142,7 +163,10 @@ function DeviceRow({
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <Smartphone className="size-4 shrink-0 text-muted-foreground" />
-          <span className="truncate font-mono text-[13px]">{label}</span>
+          {/* A device name the operator typed, in the app's own face — the same face the field
+              that captures it uses below. Only the pairing CODE is monospaced, because that one is
+              eight characters you compare against a terminal. */}
+          <span className="truncate text-[13px] font-medium">{label}</span>
           {current && (
             <span className="shrink-0 rounded bg-status-done/15 px-1.5 py-0.5 text-[11px] font-medium text-status-done">
               {t("settings.devices.thisDevice")}
@@ -220,7 +244,7 @@ function PairForm({ onPaired }: { onPaired: () => void }) {
   const [hintBefore, hintAfter] = splitAroundValue(hintMessage, command);
 
   return (
-    <div className="flex flex-col gap-3 border-t border-border/60 p-4">
+    <div className="flex flex-col gap-3 border-t border-border p-4">
       <div>
         <div className="font-medium">{t("settings.devices.pair.title")}</div>
         <p className="text-sm text-muted-foreground">
@@ -242,7 +266,7 @@ function PairForm({ onPaired }: { onPaired: () => void }) {
           autoComplete="off"
           spellCheck={false}
           aria-label={t("settings.devices.pair.codeLabel")}
-          className="h-11 rounded-lg border border-border bg-background px-3 font-mono text-sm tracking-widest outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="h-11 rounded-lg border border-border bg-background px-3 font-mono text-sm tracking-widest focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         />
       </label>
       <label className="flex flex-col gap-1">
@@ -256,7 +280,7 @@ function PairForm({ onPaired }: { onPaired: () => void }) {
           autoCorrect="off"
           autoComplete="off"
           aria-label={t("settings.devices.pair.nameLabel")}
-          className="h-11 rounded-lg border border-border bg-background px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="h-11 rounded-lg border border-border bg-background px-3 text-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
         />
       </label>
       {error && <p className="text-xs text-status-blocked">{error}</p>}

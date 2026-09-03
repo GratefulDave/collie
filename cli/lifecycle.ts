@@ -1,13 +1,20 @@
 import { join } from "node:path";
 
-import { resolveBridgeHost } from "../bridge/config.ts";
 import { ensureBuild } from "./build.ts";
 import { collieVersion, type CliContext, type Environment, type EnvVars } from "./context.ts";
 import { EXIT, type Io } from "./io.ts";
+import { ensureMuxChosen } from "./mux.ts";
 import type { StatusView, Ui } from "./render.ts";
-import { cmdUnserve, type ServeDeps } from "./serve.ts";
+import { cmdUnserve, packModeOnDisk, type ServeDeps } from "./serve.ts";
 import type { Exec, Files } from "./sys.ts";
-import { bridgeUrl, configuredPublicUrl, tailnetHosts } from "./tailnet.ts";
+import {
+  bridgeUrl,
+  configuredPublicUrl,
+  dialableBridgeHost,
+  localBridgeHostPort,
+  localBridgeUrl,
+  tailnetHosts,
+} from "./tailnet.ts";
 import {
   AGENT_FILE_MODE,
   agentFilePath,
@@ -57,6 +64,15 @@ export interface LifecycleDeps extends ServeDeps {
   serve: (io?: Io) => Promise<number>;
   /** The terminal renderer, when this run landed on one (`cli/render.ts`). Absent ⇒ plain lines. */
   ui?: Ui | null;
+  /**
+   * Whether there is a terminal to ask the first-run multiplexer question at (`cli/mux.ts`).
+   *
+   * Optional, and absent reads as "nobody is there" — the branch that refuses rather than the one
+   * that asks. Every verb here but `start` ignores it.
+   */
+  interactive?: boolean;
+  /** The free-text ask the first-run picker uses. `null` means nobody answered. */
+  prompt?(question: string): string | null | Promise<string | null>;
 }
 
 export type Tier = "systemd" | "launchd" | "unsupervised";
@@ -310,6 +326,13 @@ async function startLaunchd(deps: LifecycleDeps): Promise<number> {
 // ── Verbs ────────────────────────────────────────────────────────────────────
 
 export async function cmdStart(deps: LifecycleDeps): Promise<number> {
+  // Which multiplexer, decided BEFORE anything is written or launched (M14/03). It returns
+  // immediately when `COLLIE_MUX` is set, which is every run after the first; when it is not, this
+  // is the one place the question gets asked, and a `start` that cannot answer it must not go on to
+  // put a bridge in front of no panes at all.
+  const chosen = await ensureMuxChosen(deps);
+  if (chosen !== EXIT.OK) return chosen;
+
   // The lazy first build. It warns rather than fails: a host whose UI won't build still gets its
   // API, and the 503 is legible where a refused `start` is not.
   ensureBuild(deps);
@@ -327,7 +350,7 @@ export async function cmdStart(deps: LifecycleDeps): Promise<number> {
   // `serve` reports its own reason.
   if ((await deps.serve(deps.io)) !== EXIT.OK) {
     deps.io.err(
-      `note: the tailnet front door did not come up; the bridge is still on 127.0.0.1:${deps.ctx.port}`,
+      `note: the tailnet front door did not come up; the bridge is still on ${localBridgeHostPort(deps.ctx.env, deps.ctx.port)}`,
     );
   }
   await printStatusBanner(deps);
@@ -392,6 +415,14 @@ export function cmdUninstall(deps: LifecycleDeps): number {
 }
 
 export async function cmdRestart(deps: LifecycleDeps): Promise<number> {
+  // The multiplexer question is asked BEFORE anything is stopped, and it is the whole reason this
+  // verb is not `cmdStop` + `cmdStart`. `start` asks it too, and on every run after the first both
+  // calls return at once on an explicit `COLLIE_MUX`. It is the FIRST run that matters: a refusal
+  // reached from inside `start` arrives after `stop` has already disabled the unit, so an operator
+  // who cannot answer it right now is left with no bridge at all, on a verb whose name promises one.
+  const chosen = await ensureMuxChosen(deps);
+  if (chosen !== EXIT.OK) return chosen;
+
   const stopped = cmdStop(deps);
   if (stopped !== EXIT.OK) return stopped;
   return cmdStart(deps);
@@ -515,11 +546,19 @@ export async function statusBanner(deps: LifecycleDeps): Promise<string[]> {
  */
 export async function statusView(deps: LifecycleDeps): Promise<StatusView> {
   const version = collieVersion(deps.ctx.root);
-  // The bridge binds `resolveBridgeHost`, not always loopback (a peer sets COLLIE_HOST to its
-  // tailnet address — the documented Variant-E shape). Probing 127.0.0.1 there would find nothing
-  // home and print "isn't answering" against a bridge that is in fact up; probe — and, in the
-  // warning, name — whatever address it actually bound.
-  const host = resolveBridgeHost(deps.ctx.env);
+  // The bridge does not always bind loopback (a peer sets COLLIE_HOST to its tailnet address — the
+  // documented Variant-E shape). Probing 127.0.0.1 there would find nothing home and print "isn't
+  // answering" against a bridge that is in fact up; probe — and, in the warning, name — whatever
+  // address it actually bound.
+  //
+  // Resolved ONCE, through F13's `dialableBridgeHost`, which is also what the `local` row three
+  // lines down reads: the two halves of this banner must never name two different addresses, and a
+  // WILDCARD bind has to probe loopback rather than the literal `0.0.0.0` the operator wrote.
+  //
+  // It reads the env as it stands NOW. `collie leave` rewrites COLLIE_HOST out of both the `.env`
+  // and this process's env before it restarts (F12/F22), so the banner that closes a tear-down
+  // describes the machine the tear-down left behind — not the peer it used to be.
+  const host = dialableBridgeHost(deps.ctx.env);
   const probedAddress = host === "127.0.0.1" ? `:${deps.ctx.port}` : `${host}:${deps.ctx.port}`;
   const running = await deps.ready(deps.ctx.port, host);
   const rows: { label: string; value: string }[] = [];
@@ -527,8 +566,17 @@ export async function statusView(deps: LifecycleDeps): Promise<StatusView> {
   // this is the line that says WHICH Collie answered (the unit name on the next line agrees).
   if (deps.ctx.instance !== null) rows.push({ label: "instance", value: deps.ctx.instance });
   rows.push({ label: "service", value: serviceDescription(deps) });
-  rows.push({ label: "local", value: `http://127.0.0.1:${deps.ctx.port}` });
-  if (deps.ctx.env.COLLIE_SKIP_SERVE === "1") {
+  // F13: the address the bridge BOUND, not a hardcoded loopback string — see `localBridgeUrl`.
+  rows.push({ label: "local", value: localBridgeUrl(deps.ctx.env, deps.ctx.port) });
+  // The front-door row, and the one machine that has no front door to describe. A PEER publishes
+  // none (ADR 0013) — `cmdServe` refuses the publish and says so — so a `tailnet` row here was a row
+  // about a door that is not there, offering a loopback URL that is not even a peer's bind (the
+  // `local` row above says what is). Asked of the same function that takes the publish decision, so
+  // the banner and the refusal can never disagree. The pack's door is named instead, because "where
+  // do I point my phone?" still has an answer on a peer: the lead's (F24).
+  if (packModeOnDisk(deps) === "peer") {
+    rows.push({ label: "pack", value: "peer — no front door here; the lead's door serves the pack (ADR 0013)" });
+  } else if (deps.ctx.env.COLLIE_SKIP_SERVE === "1") {
     const url = configuredPublicUrl(deps.ctx.env);
     rows.push({
       label: "proxy",

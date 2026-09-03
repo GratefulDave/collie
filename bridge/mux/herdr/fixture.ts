@@ -36,6 +36,7 @@ import type {
   WireSnapshot,
   WireTab,
   WireWorkspace,
+  WireWorktree,
 } from "./client.ts";
 
 const IDLE: AgentStatus = "idle";
@@ -77,6 +78,8 @@ export class FakeHerdr implements HerdrRpc {
   private readonly screens = new Map<string, FakeScreen>();
   private readonly subscribers = new Set<Subscriber>();
   private readonly recorded: MuxWrite[] = [];
+  /** Worktrees per repo root — the bookkeeping herdr keeps and a plain `git worktree add` does not. */
+  private readonly worktreesByRepo = new Map<string, WireWorktree[]>();
   /** Never decreases, and never reused — so a fresh pane can never land on a dead pane's id. */
   private minted = 0;
   /** False while the adapter's connection is down: every RPC rejects, as a closed socket does. */
@@ -297,6 +300,83 @@ export class FakeHerdr implements HerdrRpc {
       cwd: pane.cwd,
     };
   }
+
+  // ── Worktrees ──────────────────────────────────────────────────────────────
+  //
+  // Modelled, not stubbed, because conformance EXERCISES every declared capability: the fake keeps a
+  // per-repo list, so create → list → open → remove tells the same story the real socket told when
+  // it was probed (2026-08-28, herdr 0.8.2). Two behaviours are copied deliberately because the
+  // adapter's contract leans on them: opening what is already open answers `already_open` instead of
+  // refusing, and removal is addressed by WORKSPACE, so a checkout nothing shows cannot be removed.
+
+  async listWorktrees(cwd: string): Promise<WireWorktree[]> {
+    this.assertConnected("worktree.list");
+    const repo = this.worktreesByRepo.get(cwd) ?? [];
+    return [
+      {
+        path: cwd,
+        branch: "main",
+        is_linked_worktree: false,
+        is_prunable: false,
+        is_bare: false,
+        is_detached: false,
+      },
+      ...repo,
+    ];
+  }
+
+  async createWorktree(opts: { cwd: string; branch: string }): Promise<CreatedShell> {
+    this.assertConnected("worktree.create");
+    const repo = this.worktreesByRepo.get(opts.cwd) ?? [];
+    const path = `${opts.cwd}/.worktrees/${opts.branch.replace(/\//g, "-")}`;
+    if (repo.some((w) => w.path === path)) {
+      throw new Error(`herdr worktree.create: worktree_create_failed: '${path}' already exists`);
+    }
+    const shell = await this.createWorkspace({ cwd: path, label: opts.branch });
+    repo.push({
+      path,
+      branch: opts.branch,
+      is_linked_worktree: true,
+      is_prunable: false,
+      is_bare: false,
+      is_detached: false,
+      open_workspace_id: shell.workspaceId,
+    });
+    this.worktreesByRepo.set(opts.cwd, repo);
+    return shell;
+  }
+
+  async openWorktree(opts: {
+    cwd: string;
+    path: string;
+  }): Promise<{ shell: CreatedShell; alreadyOpen: boolean }> {
+    this.assertConnected("worktree.open");
+    const repo = this.worktreesByRepo.get(opts.cwd) ?? [];
+    const found = repo.find((w) => w.path === opts.path);
+    if (found === undefined) {
+      throw new Error(`herdr worktree.open: worktree_not_found: ${opts.path}`);
+    }
+    if (found.open_workspace_id != null) {
+      const pane = this.panes.find((candidate) => candidate.workspace_id === found.open_workspace_id);
+      const workspace = this.workspaces.find((w) => w.workspace_id === found.open_workspace_id);
+      if (pane !== undefined && workspace !== undefined) {
+        return {
+          shell: {
+            paneId: pane.pane_id,
+            workspaceId: workspace.workspace_id,
+            workspaceLabel: workspace.label,
+            tabId: pane.tab_id,
+            cwd: pane.cwd,
+          },
+          alreadyOpen: true,
+        };
+      }
+    }
+    const shell = await this.createWorkspace({ cwd: found.path, label: found.branch ?? "worktree" });
+    found.open_workspace_id = shell.workspaceId;
+    return { shell, alreadyOpen: false };
+  }
+
 
   subscribeEvents(opts: SubscribeOptions): EventStream {
     const subscriber: Subscriber = { opts, down: false };
