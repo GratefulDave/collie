@@ -17,7 +17,7 @@ import {
   type SeededFiles,
 } from "./fakes.ts";
 import type { Net } from "./sys.ts";
-import { parseUpdateRun, STALE_AFTER_MS } from "../bridge/update-run.ts";
+import { parseUpdateRun, STALE_AFTER_MS, UPDATE_RUN_SCHEMA } from "../bridge/update-run.ts";
 import {
   boundTail,
   healthTimeoutMs,
@@ -35,6 +35,7 @@ import { latestUpdateInMajor } from "../bridge/update.ts";
 import {
   type ApplyArgs,
   applyArgv,
+  parseApplyArgs,
   checkoutLayout,
   cmdApplyUpdate,
   cmdUpdate,
@@ -43,6 +44,7 @@ import {
   nextMajorRelease,
   parseApiTags,
   parseRemoteTags,
+  planToTag,
   planUpdate,
   platformId,
   pruneVersions,
@@ -52,6 +54,8 @@ import {
   updateCheckout,
   type UpdateDeps,
   wantsMajor,
+  wantsRunId,
+  wantsToTag,
 } from "./update.ts";
 
 // `update` against fakes. The shell suite proves the git grammar against REAL throwaway repos
@@ -60,9 +64,10 @@ import {
 // managed checkout is never re-linked.
 
 const GIT = `git -C ${ROOT}`;
+const TAG_REMOTE = "https::https://github.com/AltanS/collie.git";
 const DIST = `${ROOT}/web/dist`;
 
-// `git ls-remote --tags origin` as the remote actually answers: an ANNOTATED tag appears twice, and
+// `git ls-remote --tags` as the remote actually answers: an ANNOTATED tag appears twice, and
 // the peeled (`^{}`) line is the one naming a commit. `nightly` is the ref the anchor must drop;
 // `v1.1.0-rc.1` is parsed but reachable only by an install that is itself on a major-1 prerelease.
 const LS_REMOTE = [
@@ -382,7 +387,7 @@ describe("updateCheckout", () => {
       installed,
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
         [`${GIT} log -1`, { stdout: "abc1234 the newest release\n" }],
@@ -467,7 +472,7 @@ describe("updateCheckout", () => {
     // A STORING refspec, not the bare ref: the bare form writes FETCH_HEAD and stores no local tag,
     // after which `vite.config.ts` finds no `refs/tags/v0.32.0` at HEAD and stamps the build `-dev`.
     expect(gitRuns(h.exec)).toEqual([
-      `${GIT} fetch --depth 1 origin +refs/tags/v0.32.0:refs/tags/v0.32.0`,
+      `${GIT} fetch --depth 1 ${TAG_REMOTE} +refs/tags/v0.32.0:refs/tags/v0.32.0`,
       `${GIT} checkout -q --detach --force FETCH_HEAD`,
     ]);
     expect(h.io.stdout.join("\n")).toContain("detach onto v0.32.0");
@@ -481,7 +486,7 @@ describe("updateCheckout", () => {
       installed: "0.32.0",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "b2peeled\n" }],
       ],
     });
@@ -494,7 +499,7 @@ describe("updateCheckout", () => {
   test("--major on a managed checkout detaches onto the next major's tag", () => {
     const h = managed([], "0.31.1");
     expect(updateCheckout(h.deps, { crossMajor: true }).code).toBe(EXIT.OK);
-    expect(gitRuns(h.exec)[0]).toBe(`${GIT} fetch --depth 1 origin +refs/tags/v1.0.0:refs/tags/v1.0.0`);
+    expect(gitRuns(h.exec)[0]).toBe(`${GIT} fetch --depth 1 ${TAG_REMOTE} +refs/tags/v1.0.0:refs/tags/v1.0.0`);
     expect(h.io.stdout.join("\n")).toContain("crossing to Collie 1.0.0");
   });
 
@@ -510,7 +515,7 @@ describe("updateCheckout", () => {
       installed: "1.0.0-beta.9",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: TRAIN_DONE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: TRAIN_DONE }],
         [`${GIT} rev-parse HEAD`, { stdout: "b9b9b9b9\n" }],
         ...SHALLOW,
         [`${GIT} log -1`, { stdout: "d0d0d0d the release\n" }],
@@ -518,7 +523,7 @@ describe("updateCheckout", () => {
     });
     expect(updateCheckout(h.deps).code).toBe(EXIT.OK);
     // v1.0.0, NOT v1.0.0-beta.10: the release supersedes every beta that led to it.
-    expect(gitRuns(h.exec)[0]).toBe(`${GIT} fetch --depth 1 origin +refs/tags/v1.0.0:refs/tags/v1.0.0`);
+    expect(gitRuns(h.exec)[0]).toBe(`${GIT} fetch --depth 1 ${TAG_REMOTE} +refs/tags/v1.0.0:refs/tags/v1.0.0`);
     expect(h.io.stdout.join("\n")).toContain("detach onto v1.0.0");
   });
 
@@ -527,7 +532,7 @@ describe("updateCheckout", () => {
       installed: "1.0.0-beta.9",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: BETA_TRAIN }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: BETA_TRAIN }],
         [`${GIT} rev-parse HEAD`, { stdout: "b9b9b9b9\n" }],
         ...SHALLOW,
         [`${GIT} log -1`, { stdout: "c0c0c0c the next beta\n" }],
@@ -536,7 +541,7 @@ describe("updateCheckout", () => {
     expect(updateCheckout(h.deps).code).toBe(EXIT.OK);
     // A prerelease tag name reaches `refs/tags/` untouched — it is a ref like any other.
     expect(gitRuns(h.exec)).toEqual([
-      `${GIT} fetch --depth 1 origin +refs/tags/v1.0.0-beta.10:refs/tags/v1.0.0-beta.10`,
+      `${GIT} fetch --depth 1 ${TAG_REMOTE} +refs/tags/v1.0.0-beta.10:refs/tags/v1.0.0-beta.10`,
       `${GIT} checkout -q --detach --force FETCH_HEAD`,
     ]);
     expect(h.io.stdout.join("\n")).toContain("detach onto v1.0.0-beta.10");
@@ -547,7 +552,7 @@ describe("updateCheckout", () => {
       installed: "1.0.0-beta.10",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: BETA_TRAIN }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: BETA_TRAIN }],
         [`${GIT} rev-parse HEAD`, { stdout: "c0c0c0c0\n" }],
       ],
     });
@@ -565,7 +570,7 @@ describe("updateCheckout", () => {
       installed: "1.0.0",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "cccccccc\n" }],
       ],
     });
@@ -580,7 +585,7 @@ describe("updateCheckout", () => {
       installed: "1.0.0-beta.5",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: ONLY_0X }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: ONLY_0X }],
         [`${GIT} rev-parse HEAD`, { stdout: "zzz\n" }],
       ],
     });
@@ -593,7 +598,7 @@ describe("updateCheckout", () => {
     const h = harness({
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "zzz\n" }],
         ...SHALLOW,
         [`${GIT} log -1`, { stdout: "abc1234 tip\n" }],
@@ -601,7 +606,7 @@ describe("updateCheckout", () => {
     });
     expect(updateCheckout(h.deps).code).toBe(EXIT.OK);
     expect(gitRuns(h.exec)).toEqual([
-      `${GIT} fetch --depth 1 origin +refs/tags/v1.0.0:refs/tags/v1.0.0`,
+      `${GIT} fetch --depth 1 ${TAG_REMOTE} +refs/tags/v1.0.0:refs/tags/v1.0.0`,
       `${GIT} checkout -q --detach --force FETCH_HEAD`,
     ]);
     expect(h.io.stdout.join("\n")).toContain("pinning to newest release tag v1.0.0");
@@ -611,7 +616,7 @@ describe("updateCheckout", () => {
     const h = harness({
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: "" }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: "" }],
         [`${GIT} rev-parse HEAD`, { stdout: "zzz\n" }],
       ],
     });
@@ -625,13 +630,13 @@ describe("updateCheckout", () => {
     // detached — a destruction the operator never asked for and cannot undo.
     const h = harness({ installed: "0.31.1", answers: [
       ...MANAGED,
-      [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+      [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
       [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
       ...FULL,
     ] });
     expect(updateCheckout(h.deps).code).toBe(EXIT.OK);
     // …and the storing refspec rides along on the full-clone variant too.
-    expect(gitRuns(h.exec)[0]).toBe(`${GIT} fetch origin +refs/tags/v0.32.0:refs/tags/v0.32.0`);
+    expect(gitRuns(h.exec)[0]).toBe(`${GIT} fetch ${TAG_REMOTE} +refs/tags/v0.32.0:refs/tags/v0.32.0`);
   });
 
   test("a non-git checkout names the reinstall command and fails", () => {
@@ -644,7 +649,7 @@ describe("updateCheckout", () => {
   test("an unreachable remote fails before anything moves", () => {
     const h = harness({
       installed: "0.31.1",
-      answers: [...MANAGED, [`${GIT} ls-remote --tags origin`, { code: 128 }]],
+      answers: [...MANAGED, [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { code: 128 }]],
     });
     expect(updateCheckout(h.deps).code).toBe(EXIT.FAIL);
     expect(gitRuns(h.exec)).toEqual([]);
@@ -654,7 +659,7 @@ describe("updateCheckout", () => {
   test("a failed fetch stops before the checkout", () => {
     const h = managed([[`${ROOT}$ ${GIT} fetch`, { code: 1 }]]);
     expect(updateCheckout(h.deps).code).toBe(EXIT.FAIL);
-    expect(gitRuns(h.exec)).toEqual([`${GIT} fetch --depth 1 origin +refs/tags/v0.32.0:refs/tags/v0.32.0`]);
+    expect(gitRuns(h.exec)).toEqual([`${GIT} fetch --depth 1 ${TAG_REMOTE} +refs/tags/v0.32.0:refs/tags/v0.32.0`]);
   });
 });
 
@@ -717,7 +722,7 @@ describe("update", () => {
       installed: "0.31.1",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
       ],
@@ -741,7 +746,7 @@ describe("update", () => {
       installed: "0.31.1",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
       ],
@@ -762,7 +767,7 @@ describe("update", () => {
       installed: "0.32.0",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "b2peeled\n" }],
       ],
     });
@@ -819,7 +824,7 @@ describe("update", () => {
       installed: "0.31.1",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
       ],
@@ -837,7 +842,7 @@ describe("update", () => {
       installed: "0.32.0",
       answers: [
         ...LINKED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "b2peeled\n" }],
       ],
     });
@@ -856,7 +861,7 @@ describe("update", () => {
       installed: "0.31.1",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
       ],
@@ -873,7 +878,7 @@ describe("update", () => {
       installed: "0.31.1",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: ONLY_0X }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: ONLY_0X }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
       ],
@@ -887,7 +892,7 @@ describe("update", () => {
       installed: "0.31.1",
       answers: [
         ...MANAGED,
-        [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
         [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
         ...SHALLOW,
       ],
@@ -934,7 +939,11 @@ describe("the origin assertion", () => {
 
   test("COLLIE_UPDATE_REPO moves the assertion — one override, banner and updater together", async () => {
     const h = harness({
-      answers: [...forked, ...MANAGED, [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }]],
+      answers: [
+        ...forked,
+        ...MANAGED,
+        [`${GIT} ls-remote --tags https::https://github.com/youngsecurity/collie.git`, { stdout: LS_REMOTE }],
+      ],
       installed: "1.0.0",
       env: { COLLIE_UPDATE_REPO: "youngsecurity/collie" },
     });
@@ -1372,7 +1381,7 @@ function legacyClone(over: { answers?: Scripted["answers"]; absent?: string[]; i
     answers: [
       ...(over.answers ?? []),
       ...(LINKED ?? []),
-      [`${GIT} ls-remote --tags origin`, { stdout: LS_REMOTE }],
+      [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
       [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
       ...(FULL ?? []),
     ],
@@ -1459,7 +1468,7 @@ describe("the staged checkout path", () => {
     const h = legacyClone();
     expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
     // The tag is FETCHED and STORED, then a worktree of it is added beside the running install.
-    expect(gitRuns(h.exec)).toContain(`${GIT} fetch origin +refs/tags/v0.32.0:refs/tags/v0.32.0`);
+    expect(gitRuns(h.exec)).toContain(`${GIT} fetch ${TAG_REMOTE} +refs/tags/v0.32.0:refs/tags/v0.32.0`);
     expect(gitRuns(h.exec)).toContain(
       `${GIT} worktree add --detach --force ${WT("v0.32.0")} refs/tags/v0.32.0`,
     );
@@ -1529,7 +1538,7 @@ describe("the staged checkout path", () => {
   });
 
   test("a fetch that fails stops before any worktree is added", async () => {
-    const h = legacyClone({ answers: [[`${ROOT}$ git -C ${ROOT} fetch origin +refs/tags`, { code: 1 }]] });
+    const h = legacyClone({ answers: [[`${ROOT}$ git -C ${ROOT} fetch ${TAG_REMOTE} +refs/tags`, { code: 1 }]] });
     expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
     expect(h.io.stderr.join("\n")).toContain("stopped at the FETCH stage");
     expect(gitRuns(h.exec).join("\n")).not.toContain("worktree add");
@@ -1544,7 +1553,7 @@ describe("the staged checkout path", () => {
   });
 
   test("a staged install that is already current stages nothing at all", async () => {
-    const h = stagedHarness({ answers: [[`git -C ${WT("v1.0.0")} ls-remote --tags origin`, { stdout: LS_REMOTE }]] });
+    const h = stagedHarness({ answers: [[`git -C ${WT("v1.0.0")} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }]] });
     expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
     expect(h.io.stdout.join("\n")).toContain("already current");
     expect(h.exec.calls.join("\n")).not.toContain("worktree add");
@@ -1715,7 +1724,7 @@ describe("the update state file and its lock", () => {
     await cmdUpdate(h.deps);
     expect(h.files.ops).toContain(`mv ${RUN_FILE}.tmp ${RUN_FILE}`);
     const run = parseUpdateRun(h.files.read(RUN_FILE));
-    expect(run?.schema).toBe(1);
+    expect(run?.schema).toBe(UPDATE_RUN_SCHEMA);
     expect(run?.state).toBe("staging");
     expect(run?.to).toBe(NEW);
     // 0600: it names a pid and a path on a possibly shared host.
@@ -1888,5 +1897,114 @@ describe("the recorded log tail", () => {
     };
     await runner(h, BINARY_APPLY);
     expect(parseUpdateRun(h.files.read(RUN_FILE))?.logTail).toContain("Failed with result");
+  });
+});
+
+describe("collie update --to-tag", () => {
+  // The pure resolver first: the four refusals and the one happy path, decided without an install.
+  const TAGS = parseApiTags([
+    { name: "v1.0.0", sha: "a" },
+    { name: "v1.1.0", sha: "b" },
+    { name: "v1.2.0-beta.1", sha: "c" },
+    { name: "v2.0.0", sha: "d" },
+  ]);
+
+  test("to-tag pins the plan to that exact release, not to the highest one", () => {
+    const plan = planToTag({ tags: TAGS, installed: "1.0.0", wanted: "v1.1.0" });
+    expect(plan.kind).toBe("pinned");
+    expect(plan.kind === "pinned" && plan.target.tag).toBe("v1.1.0");
+    // The bare spelling resolves to the same tag: a caller composing argv writes one or the other.
+    expect(planToTag({ tags: TAGS, installed: "1.0.0", wanted: "1.1.0" }).kind).toBe("pinned");
+  });
+
+  test("to-tag refuses a tag that does not exist upstream", () => {
+    const plan = planToTag({ tags: TAGS, installed: "1.0.0", wanted: "v9.9.9" });
+    expect(plan.kind).toBe("refused");
+    expect(plan.kind === "refused" && plan.reason).toContain("no release tag");
+  });
+
+  test("to-tag refuses a prerelease", () => {
+    const plan = planToTag({ tags: TAGS, installed: "1.0.0", wanted: "v1.2.0-beta.1" });
+    expect(plan.kind === "refused" && plan.reason).toContain("prerelease");
+  });
+
+  test("to-tag refuses a tag that is not higher than the installed version", () => {
+    const plan = planToTag({ tags: TAGS, installed: "1.1.0", wanted: "v1.0.0" });
+    expect(plan.kind === "refused" && plan.reason).toContain("never downgrades");
+    // Equal is refused too. There is no "re-install this version" spelling here.
+    expect(planToTag({ tags: TAGS, installed: "1.1.0", wanted: "v1.1.0" }).kind).toBe("refused");
+  });
+
+  test("to-tag refuses a major crossing", () => {
+    const plan = planToTag({ tags: TAGS, installed: "1.0.0", wanted: "v2.0.0" });
+    expect(plan.kind === "refused" && plan.reason).toContain("crosses a major");
+  });
+
+  test("to-tag reads both spellings off the argv and blank is absent", () => {
+    expect(wantsToTag(["update", "--to-tag", "v1.1.0"])).toBe("v1.1.0");
+    expect(wantsToTag(["update", "--to-tag=v1.1.0"])).toBe("v1.1.0");
+    expect(wantsToTag(["update"])).toBeNull();
+    expect(wantsToTag(["update", "--to-tag"])).toBeNull();
+    // `--to` is the detached runner's own flag and is NOT read as a target tag.
+    expect(wantsToTag(["_apply-update", "--to", "1.1.0"])).toBeNull();
+  });
+
+  test("to-tag on a binary install takes the named release", async () => {
+    const h = binaryHarness();
+    expect(await cmdUpdate(h.deps, ["--to-tag", `v${NEW}`])).toBe(EXIT.OK);
+    expect(parseUpdateRun(h.files.read(RUN_FILE))?.to).toBe(NEW);
+  });
+
+  test("to-tag on a binary install refuses a tag the remote does not publish", async () => {
+    const h = binaryHarness();
+    expect(await cmdUpdate(h.deps, ["--to-tag", "v9.9.9"])).toBe(EXIT.FAIL);
+    expect(h.io.stderr.join("\n")).toContain("no release tag");
+    // Nothing was staged: a refusal happens before any download.
+    expect(h.files.read(RUN_FILE)).toBeNull();
+  });
+});
+
+describe("the detached updater argv", () => {
+  test("detached updater argv keeps `--to`, and the follow flags never reach it", () => {
+    const argv = applyArgv({
+      to: "v1.1.0",
+      from: "v1.0.0",
+      version: "1.1.0",
+      commit: "abc1234",
+      kind: "checkout",
+      handoff: 42,
+    });
+    // `--to` is the RUNNER's own internal argv and is untouched by M16/04. `--to-tag` is a different
+    // flag on a different verb, and the two must never be read for one another.
+    expect(argv).toContain("--to");
+    expect(argv).not.toContain("--to-tag");
+    expect(argv).not.toContain("--run-id");
+    // The run id reaches the runner through the RECORD it picks up off disk, not through this argv.
+    expect(parseApplyArgs(argv)).toEqual({
+      to: "v1.1.0",
+      from: "v1.0.0",
+      version: "1.1.0",
+      commit: "abc1234",
+      kind: "checkout",
+      handoff: 42,
+    });
+  });
+});
+
+describe("the update run id", () => {
+  test("run id rides the record when the caller names one, and is absent when it does not", async () => {
+    const withId = binaryHarness();
+    expect(await cmdUpdate(withId.deps, ["--run-id", "r-42"])).toBe(EXIT.OK);
+    expect(parseUpdateRun(withId.files.read(RUN_FILE))?.runId).toBe("r-42");
+
+    const without = binaryHarness();
+    expect(await cmdUpdate(without.deps)).toBe(EXIT.OK);
+    expect(parseUpdateRun(without.files.read(RUN_FILE))?.runId).toBeUndefined();
+  });
+
+  test("run id reads both spellings and never picks up the runner's own --to", () => {
+    expect(wantsRunId(["update", "--run-id", "r-1"])).toBe("r-1");
+    expect(wantsRunId(["update", "--run-id=r-1"])).toBe("r-1");
+    expect(wantsRunId(["update", "--to-tag", "v1.1.0"])).toBeNull();
   });
 });

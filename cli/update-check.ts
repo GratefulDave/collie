@@ -31,7 +31,16 @@ import {
   sshRunner,
 } from "./remote.ts";
 import { realExec, realFiles, realNet, type Exec, type Files, type Net } from "./sys.ts";
-import { MAJOR_ACTION, parseApiTags, parseRemoteTags, planUpdate, type ReleaseTag } from "./update.ts";
+import { tagRemote } from "./update-remote.ts";
+import {
+  MAJOR_ACTION,
+  parseApiTags,
+  parseRemoteTags,
+  planToTag,
+  planUpdate,
+  type ReleaseTag,
+  wantsToTag,
+} from "./update.ts";
 
 // `collie update --check` — the read-only preflight (M15/03).
 //
@@ -323,7 +332,11 @@ export function treeCheck(deps: UpdateCheckDeps): PreflightCheck {
  * The plan is `cli/update.ts`'s own — this must not re-derive a target, or the preflight and the
  * verb would be able to disagree about what an update is going to take.
  */
-export async function upstreamCheck(deps: UpdateCheckDeps, install: InstallKind): Promise<PreflightCheck> {
+export async function upstreamCheck(
+  deps: UpdateCheckDeps,
+  install: InstallKind,
+  toTag: string | null = null,
+): Promise<PreflightCheck> {
   const configured = updateRepoOf(deps.ctx.env);
   const installed = manifestVersionFrom(deps.files.read(join(deps.ctx.root, "herdr-plugin.toml")));
 
@@ -351,6 +364,17 @@ export async function upstreamCheck(deps: UpdateCheckDeps, install: InstallKind)
 
   const listed = await listTags(deps, install, configured);
   if (!listed.ok) return red("upstream", listed.reason, listed.remedy);
+
+  // `--to-tag` asks a different question of the same listing: not "what would an update take" but
+  // "does THIS release resolve here, and may this install take it". It is what a peer following its
+  // lead asks before it spawns anything (M16/04), and it is answered by the same `listTags()`
+  // through the same `tagRemote()` — no second listing, no credential, no new mechanism.
+  if (toTag !== null) {
+    const pinned = planToTag({ tags: listed.tags, installed, wanted: toTag });
+    return pinned.kind === "refused"
+      ? red("upstream", pinned.reason, "the release this collie was asked to take is not one it may take")
+      : green("upstream", `${pinned.target.tag} resolves on github.com/${configured} — this install may take it`);
+  }
 
   const head = isCheckout(install)
     ? deps.exec.capture("git", gitArgs(deps.ctx.root, ["rev-parse", "HEAD"])).stdout.trim()
@@ -401,33 +425,6 @@ type TagListing =
 const LS_REMOTE_TIMEOUT_MS = 15_000;
 
 /**
- * The URL a READ-ONLY tag listing should use for `origin`.
- *
- * Listing the tags of a public repository must not depend on a credential. The bridge runs as a
- * systemd user service with no access to the operator's SSH agent, so `git ls-remote origin` on a
- * checkout whose origin is `git@github.com:AltanS/collie.git` fails with "Permission denied
- * (publickey)" — a red preflight that has nothing to do with whether an update could succeed.
- * A GitHub SSH remote is therefore listed over anonymous HTTPS instead. Every other URL is used
- * exactly as git reports it: a self-hosted mirror or a local path is not ours to rewrite.
- */
-export function anonymousTagUrl(url: string): string {
-  const raw = url.trim();
-  const scp = /^git@github\.com:(.+)$/i.exec(raw);
-  const ssh = /^ssh:\/\/git@github\.com\/(.+)$/i.exec(raw);
-  const path = scp?.[1] ?? ssh?.[1];
-  if (path === undefined) return raw;
-  const repo = path.replace(/\/+$/, "").replace(/\.git$/, "");
-  return repo === "" ? raw : `https://github.com/${repo}.git`;
-}
-
-/** What `origin` is called on the wire for a read-only listing — the URL, or the name as a fallback. */
-function tagRemote(deps: UpdateCheckDeps): string {
-  const r = deps.exec.capture("git", gitArgs(deps.ctx.root, ["remote", "get-url", "origin"]));
-  const url = r.found && r.code === 0 ? r.stdout.trim() : "";
-  return url === "" ? "origin" : anonymousTagUrl(url);
-}
-
-/**
  * Why a `git ls-remote` failed, in the only two families a remedy can differ on.
  *
  * `network` is the one the operator fixes by getting the machine online; everything else is the
@@ -459,7 +456,7 @@ const TAG_REMEDY = {
  */
 async function listTags(deps: UpdateCheckDeps, install: InstallKind, repo: string): Promise<TagListing> {
   if (isCheckout(install)) {
-    const remote = tagRemote(deps);
+    const remote = tagRemote(deps.exec, deps.ctx.root);
     const ls = deps.exec.capture(
       "git",
       gitArgs(deps.ctx.root, ["ls-remote", "--tags", remote]),
@@ -544,12 +541,12 @@ export function serviceCheck(deps: UpdateCheckDeps): PreflightCheck {
 }
 
 /** Every instance check, in the order they print. */
-export async function instanceChecks(deps: UpdateCheckDeps): Promise<PreflightCheck[]> {
+export async function instanceChecks(deps: UpdateCheckDeps, toTag: string | null = null): Promise<PreflightCheck[]> {
   const install = classifyInstall(probeInstall(deps, deps.ctx.root));
   const checks: PreflightCheck[] = [await doctorCheck(deps), diskCheck(deps, install)];
   if (buildsFromSource(install)) checks.push(bunCheck(deps));
   if (isCheckout(install)) checks.push(treeCheck(deps));
-  checks.push(await upstreamCheck(deps, install));
+  checks.push(await upstreamCheck(deps, install, toTag));
   checks.push(serviceCheck(deps));
   return checks;
 }
@@ -716,11 +713,19 @@ export async function packChecks(deps: UpdateCheckDeps): Promise<PreflightMember
  */
 export interface PreflightOptions {
   readonly local?: boolean;
+  /**
+   * Ask the `upstream` check about ONE exact release instead of "what would an update take" (M16/04).
+   *
+   * A peer following its lead runs the preflight it was going to run anyway and reads this check's
+   * verdict as its answer to "does the lead's tag exist upstream, and may I take it" — so the tag
+   * resolution and the health gate cost one subprocess between them rather than two.
+   */
+  readonly toTag?: string | null;
 }
 
 /** The whole document, assembled. Pure of output — {@link cmdUpdateCheck} decides how to print it. */
 export async function preflight(deps: UpdateCheckDeps, opts: PreflightOptions = {}): Promise<PreflightReport> {
-  const checks = await instanceChecks(deps);
+  const checks = await instanceChecks(deps, opts.toTag ?? null);
   // Skipped ENTIRELY under `--local`: no trust store read, no ssh, and no `pack` key in the report.
   const pack = opts.local === true ? undefined : await packChecks(deps);
   // A member's contribution to the TOP verdict is `topLevelMemberVerdict`, not its own `.verdict` —
@@ -770,7 +775,7 @@ function render(deps: UpdateCheckDeps, report: PreflightReport): void {
  * learns to pass `--force` to.
  */
 export async function cmdUpdateCheck(deps: UpdateCheckDeps, args: readonly string[] = []): Promise<number> {
-  const report = await preflight(deps, { local: wantsLocal(args) });
+  const report = await preflight(deps, { local: wantsLocal(args), toTag: wantsToTag(args) });
   if (args.includes("--json")) {
     // stdout and nothing else: the whole point of `--json` is that spec 05 and spec 06 can read it.
     deps.io.out(JSON.stringify(report, null, 2));

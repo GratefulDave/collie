@@ -433,7 +433,71 @@ export interface UpdateRun {
   logTail?: string;
   /** The command the operator runs by hand — carried only by `stuck`. */
   recovery?: string;
+  /**
+   * The run's own opaque id (M16/04). Absent on a run started before the pack learned to follow, and
+   * on a bridge that predates it — both read as "no run to key on", which is the closed case.
+   */
+  runId?: string;
+  /**
+   * The peer legs of a pack-wide run (M16/04). Absent on a solo run, and absent on a bridge that
+   * predates it — the page then falls back to the census rows, which is the same screen with older
+   * facts on it rather than a broken one.
+   */
+  peers?: UpdatePeerLeg[];
 }
+
+/**
+ * A peer's own answer about itself, gathered over the pack link (M16/03). The verdict and the
+ * reasons are that machine's own preflight, so a red here is a real red on that machine.
+ *
+ * `unknown` is a first-class verdict: the lead asked and got nothing back. It renders as unknown
+ * with a reason, never as green.
+ */
+export type UpdatePackVerdict = "green" | "amber" | "red" | "unknown";
+
+/** One member of the pack, as `GET /api/update/check` reports it (M16/03). */
+export interface UpdatePackMember {
+  /** The member's name, spelled the way the pack census spells it. */
+  name: string;
+  /** The version that member runs, or null when the lead could not learn it. */
+  version: string | null;
+  verdict: UpdatePackVerdict;
+  /** Why the verdict is what it is. A red or an unknown with no reason is a defect. */
+  reasons: string[];
+  /** When that member's answer was taken (epoch ms), or null when it never reported. A
+   *  six-hour-old green and a four-second-old green are different facts, so every row that has
+   *  reported is dated. */
+  asOf: number | null;
+}
+
+/** The bridge and the CLI (`bridge/pack/lead.ts`, `bridge/update-action.ts`, `cli/pack-update.ts`) know this row by this name. */
+export type PackUpdateRow = UpdatePackMember;
+
+/**
+ * One peer's leg of a pack-wide run (M16/04). Every field past the name is optional, because this
+ * arrives from a spec that lands beside this one and a reader must degrade rather than throw.
+ */
+export interface UpdatePeerLeg {
+  name: string;
+  state: UpdatePeerLegState;
+  /** The version that peer runs right now, when the lead knows it. */
+  version?: string | null;
+  /** Why the leg is where it is. Carried on a failure, and required on a rolled-back leg. */
+  reason?: string;
+  updatedAt?: number;
+}
+
+/**
+ * Where one peer's leg is, as the LEAD derived it from its sweep (M16/04, PACK_PROTOCOL.md §20).
+ *
+ * Deliberately not `UpdateRunState`: the lead never runs a peer's updater and never sees its
+ * staging, so it can only report what the link told it — behind and waiting, moving, arrived, fallen
+ * back, or gone quiet. The four run states it cannot distinguish all read as `updating`.
+ *
+ * The union stays open to the run states as well, because a bridge from before this split sent
+ * those, and a client that dropped such a leg would lose the row nobody may lose.
+ */
+export type UpdatePeerLegState = "waiting" | "updating" | "done" | "rolled-back" | "unreachable" | UpdateRunState;
 
 /** One preflight check (mirrors `cli/update-check.ts`). `id` is stable; the prose is not. */
 export interface PreflightCheck {
@@ -455,10 +519,16 @@ export interface PreflightReport {
  * `GET /api/update/check` — the update snapshot plus the preflight the button is gated on.
  *
  * `preflight: null` is a fact, not an omission: it means the check could not be run here, which
- * REFUSES an update rather than allowing one.
+ * REFUSES an update rather than allowing one. `pack` is optional because a bridge older than the
+ * pack-wide check omits it; that reads the same as "no peer rows" on the phone.
  */
 export interface UpdateCheckResponse extends UpdateInfo {
   preflight: PreflightReport | null;
+  /**
+   * Every peer's version and preflight (M16/03). Absent on a solo install, and absent on a bridge
+   * that predates the pack-wide check. Both read as "no peer rows", which is the same screen.
+   */
+  pack?: UpdatePackMember[];
 }
 
 /** `POST /api/update` — the 202. The run itself is followed on the snapshot from here. */

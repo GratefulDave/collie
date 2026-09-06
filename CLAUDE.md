@@ -36,31 +36,36 @@ not part of that agreement.
 version because you fixed something; the version moves once, when the release is cut.
 
 **Before committing any functional change** (anything under `bridge/`, `cli/`, `web/src/`,
-`web/public/`, `scripts/`, `systemd/`, or the manifest / package files) you MUST, **in the same
-commit**, add **one line** to `CHANGELOG.md` under `## [Unreleased]`, beneath `### Added`,
-`### Changed` or `### Fixed` — create the sub-heading if it isn't there yet. **Style: super crisp
-and short** — one line per change, no prose paragraphs. End the line with the issue or PR it
-answers where one exists (`… (#147)`), and with **no commit hash**: the hash doesn't exist yet, and
-the release commit adds it. Do not touch the three version files.
+`web/public/`, `scripts/`, `systemd/`, or the manifest / package files, minus the tests and hooks
+carved out below), you MUST, **in the same
+commit**, add **one line** to `CHANGELOG.md` at the end of the `## [Unreleased]` list so the list
+stays in landing order. **Style: short**: write one line per change with no prose paragraphs. End
+the line with the issue or PR it answers where one exists (`… (#147)`), and with **no commit
+hash**: the hash does not exist yet, and the release commit adds it. Do not touch the three
+version files.
 
 **Cutting a release is one `chore(release): x.y.z` commit** that does all of this and nothing else:
 
 1. **Pick the axis** from the *sum* of the Unreleased entries — what the operator has to do, not how
    visible any one change is:
-   - **PATCH** (`0.2.0 → 0.2.1`): the code now does what it was always meant to do — bug fixes and
-     internal refactors. A fix may well change what you see; that alone never promotes it. When the
-     correction is big enough that someone should read the notes, say so loudly in the CHANGELOG
-     entry rather than inflating the bump.
-   - **MINOR** (`0.2.0 → 0.3.0`): something is there that wasn't — a new capability, setting,
-     surface, or action. Existing setups keep working untouched.
-   - **MAJOR** (`0.2.0 → 1.0.0`): the operator must change something — a config key renamed or
-     removed, a contract broken, a workflow that used to work and now doesn't.
+   - **PATCH** (`0.2.0 → 0.2.1`): nothing to learn. Bug fixes, internal refactors, and small
+     additions that build on an existing verb or screen and change nothing about how you already
+     use Collie: a QR printed beside the pairing code, an extra column in `devices list`, a new
+     flag with a safe default. The phone folds a patch-only delta into its weekly update digest
+     (`DIGEST_PATCH_WINDOW_MS` in `bridge/update.ts`); the in-app band shows it at once.
+   - **MINOR** (`0.2.0 → 0.3.0`): something to learn, or worth hearing about today. A new verb,
+     a new page, a new pack capability, a changed default, anything that earns its own section
+     in `docs/`. The phone nudges within a day.
+   - **MAJOR** (`0.2.0 → 1.0.0`): the operator must change something. A config key renamed or
+     removed, a contract broken, a workflow that used to work and now does not.
+
+   The person cutting the release decides. When in doubt, pick patch.
 2. **Bump** all three version files to that number.
-3. **Rename `## [Unreleased]` to `## [x.y.z] - YYYY-MM-DD`**, real date, and **append each line's
-   short commit hash** in the file's link style —
-   `([abc1234](https://github.com/AltanS/collie/commit/abc1234))`. Tidy while you're there: merge or
-   reorder lines that grew untidy, and delete lines for changes that were reverted before the
-   release ever shipped.
+3. **Rename `## [Unreleased]` to `## [x.y.z] - YYYY-MM-DD`**, using the release date. The lines
+   remain in landing order, oldest first, because each was appended to the end. **Append each
+   line's short commit hash** in the link format
+   `([abc1234](https://github.com/AltanS/collie/commit/abc1234))`. Clean up the section: merge
+   or reorder lines as needed, and delete entries for changes reverted before release.
 4. **Re-create an empty `## [Unreleased]` heading above it.**
 5. **Run `scripts/check-version.sh`** — it must print `✓`. Then tag and push (next paragraph).
 
@@ -77,8 +82,13 @@ the line in a follow-up `docs(changelog):` commit or by amending the merge. When
 a release commit, drop that one — authorship is preserved and `main` stays unreleased until you cut
 it.)
 
-Doc-only changes (`*.md`) need neither a bump nor a CHANGELOG line. This is enforced two ways, but
-**you are the first line — do it as part of the change, not after**:
+Doc-only changes (`*.md`) need neither a bump nor a CHANGELOG line, and neither do **tests**
+(`*.test.ts`, `*.test.tsx`, `*.test.sh`) or **the git hooks** (`scripts/git-hooks/`). Both ship
+nothing: a test is not in the binary and not in `web/dist`, and a hook runs on a developer's machine
+at commit time and is not in the release tarball at all. No operator can see either change, so there
+is nothing to record. Touch one of them *and* the code under it and the ordinary rule is back — the
+source file is what the line is about. This is enforced two ways, but **you are the first line — do
+it as part of the change, not after**:
 
 **A docs change reaches colliepwa.dev only with a release.** Collie's `release.yml` tells the website
 on every tag, and the website re-quotes `docs/*.md` at the newest published release — so a doc-only
@@ -104,6 +114,11 @@ that release lands and you push, **always push a matching annotated git tag with
 `git tag -a vX.Y.Z -m "Collie X.Y.Z" && git push origin vX.Y.Z` (or `git push --follow-tags` so the
 tag ships *with* the release). One `v<x.y.z>` tag per shipped version on the remote.
 
+**The GitHub Release page is built, not written.** `release.yml` populates it with the update
+commands, a link to that version's section in `CHANGELOG.md`, and GitHub's generated notes:
+merged pull requests with their authors, new contributors, and the "Full Changelog" compare link
+listing every commit. Nobody writes release notes by hand.
+
 `scripts/check-tag.sh` checks this: with no arguments it asks whether the version the repo currently
 claims has a tag; given a rev-list selector it asks the same of every `chore(release):` commit the
 selector picks, reading the version from *that commit's* manifest. The **pre-push hook runs it over
@@ -126,6 +141,34 @@ depend on the caller's cwd and the unit name; the Herdr action runs from anywher
 install** (`scripts/install.sh`'s versioned layout) is not a Herdr plugin and has no such actions:
 there the spelling is `collie update` / `collie restart`, and a string that may be read on either
 kind must come from the install kind (`cli/install-kind.ts`), never assume one.
+
+## Docs style (`docs/*.md`, published to colliepwa.dev)
+
+The website re-quotes these pages, so they are read on a phone: the renderer scrolls a code block
+instead of wrapping it, renders a `>` blockquote as a card, and silently drops raw HTML. Write every
+page to be skimmed.
+
+- **Commands before prose.** A section that has something to run opens with the command, then
+  explains it.
+- **One numbered step is one sentence and one command.** A step that needs a code block holds the
+  block indented under it. Explanation past one sentence goes in a paragraph after the list, never
+  inside the step.
+- **A callout is a real blockquote** (`> **Note.**`, `> **Experimental.**`), never a bold sentence
+  buried in a paragraph. The site renders the blockquote as a card; the bold sentence is lost.
+  The site colours the card by its bold lead word: `Note.` blue; `Experimental.`, `Caution.`,
+  `Warning.` amber; `Never`, `Danger.` red; else neutral. A callout needing severity opens with
+  one of these words bold; the phrase may continue (`**Experimental in 1.0.**` keys experimental).
+- **One idea per paragraph, about four lines at 80 columns.** A caveat still stays in the same
+  sentence as the claim it qualifies. Split the material around it rather than let the paragraph
+  grow.
+- **A fact the reader needs now is stated inline**, the default, the path, the command, and the
+  link comes after, for the rest. `see X for where that lives` is the shape to avoid.
+- **Enumerable facts go in a table:** variables, flags, per-multiplexer differences.
+- **A code line fits 90 columns, trailing comment included.** The renderer scrolls, it does not
+  wrap, so a long comment goes on its own line above the value.
+- **Every `##` opens with a one-line summary**, before any detail.
+- **No raw HTML and no `<details>`.** The site drops both without a word. Tables and blockquotes are
+  safe.
 
 ## Build / run (operational facts that are easy to forget)
 
@@ -441,6 +484,8 @@ the pre-commit hook; a pure refactor takes the `SKIP_PACK_WIRE_CHECK=1` hatch
 **Code reaches a peer over the operator's own SSH, never over the pack link** — `pack add` installs
 it and `pack update` levels it, both pushing the lead's own commit as a `git bundle`; the link
 carries runtime data and never becomes a distribution channel
-([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md)). How the operator reached a member is
-remembered locally in `pack-ops.json`, which is never a wire field and never merged into the trust
+([ADR 0016](./.adr/0016-updates-ride-the-operators-ssh.md), addendum 2026-09-04: a peer may also
+level ITSELF to the release its lead is running, fetching that public tag from GitHub over anonymous
+HTTPS on its own decision, which adds no code, route or verb to the link). How the operator
+reached a member is remembered locally in `pack-ops.json`, which is never a wire field and never merged into the trust
 store.

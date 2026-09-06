@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
+import { updateStartVerdict, type PackUpdateRow } from "./update-action.ts";
+
 import {
   bridgeConfigBody,
   muxConfigBody,
@@ -1834,7 +1836,7 @@ describe("the update write gate — POST api/update rides the pane path's own ga
     const handler = src.slice(updateAt, src.indexOf("\n      }\n", updateAt));
     // The handoff is a plain call — nothing here awaits the child, and the answer carries the 202
     // that says "started", not the 200 that would say "finished".
-    expect(handler).toContain("const started = action.start({ major: verdict.major });");
+    expect(handler).toContain("const started = action.start({ major: verdict.major, runId });");
     expect(handler).not.toContain("await action.start");
     expect(handler).toContain("202,");
   });
@@ -1853,13 +1855,72 @@ describe("the update write gate — POST api/update rides the pane path's own ga
     expect(checkHandler).toContain("UPDATE_ON_DEMAND_POLL_TIMEOUT_MS");
   });
 
+  // ── THE PACK'S HALF (M16/03) ───────────────────────────────────────────────
+  // The card's read answers for every member, from what the sweep banked. The route itself lives
+  // inside `Bun.serve` and cannot be stood up here (CLAUDE.md), so what is pinned is its SHAPE —
+  // the same way every other assertion in this block is — and the decisions it delegates to are
+  // exercised for real in `update-action.test.ts` and `lead.test.ts`.
+  test("update check pack array: the key is always present, [] on a solo instance and on a peer", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const checkAt = src.indexOf('if (pathname === "/api/update/check" && req.method === "GET")');
+    const checkHandler = src.slice(checkAt, checkAt + 4500);
+    // `?? []` is the whole of it: a solo instance and a peer build no `packLead`, so the key is an
+    // empty array rather than an absent one — `preflight: null`'s stated reason, one field over.
+    expect(checkHandler).toContain("pack: opts.packLead?.updateRows() ?? []");
+    // Composed from the bank, not from a dial: the rows come off `PackLead`, which reads `PeerState`.
+    expect(checkHandler).not.toContain("packLead.forward");
+  });
+
+  test("update check dials nobody: the rows are read from the sweep's bank, never fetched", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const checkAt = src.indexOf('if (pathname === "/api/update/check" && req.method === "GET")');
+    const checkHandler = src.slice(checkAt, checkAt + 4500);
+    // The shape `status-wire.test.ts` uses: the surface the phone polls must not be able to make the
+    // lead dial a member. The ONE thing here that reaches a peer is the sweep — the same sweep the
+    // poll tick already runs, asked for one immediate pass and bounded — and nothing else.
+    for (const forbidden of ["client.snapshot", "peerClient", "proxy(", "fetch("]) {
+      expect(checkHandler).not.toContain(forbidden);
+    }
+    expect(checkHandler).toContain("opts.packLead?.updateRows()");
+  });
+
+  test("update check preflight fresh: the on-demand read fires ONE sweep asking for a fresh check", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const checkAt = src.indexOf('if (pathname === "/api/update/check" && req.method === "GET")');
+    const checkHandler = src.slice(checkAt, checkAt + 4500);
+    expect(checkHandler).toContain("opts.packLead?.sweep({ freshPreflight: true })");
+    expect([...checkHandler.matchAll(/sweep\(/g)]).toHaveLength(1);
+  });
+
+  test("update check answers a stale asOf, never a fabricated green: the wait is the existing bound", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const checkAt = src.indexOf('if (pathname === "/api/update/check" && req.method === "GET")');
+    const checkHandler = src.slice(checkAt, checkAt + 4500);
+    // The same race and the same constant the release check already uses. Past it the route answers
+    // with what the lead has — whose `asOf` is the peer's own stamp and says how old it is.
+    const races = [...checkHandler.matchAll(/Promise\.race\(\[/g)];
+    expect(races).toHaveLength(2);
+    expect([...checkHandler.matchAll(/UPDATE_ON_DEMAND_POLL_TIMEOUT_MS/g)]).toHaveLength(2);
+    // Nothing invents a verdict when the wait runs out: there is no green written into this handler.
+    expect(checkHandler).not.toContain('"green"');
+  });
+
+  test("the pack gates the confirm too: POST api/update reads the same banked rows", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const updateAt = src.indexOf('if (pathname === "/api/update" && req.method === "POST")');
+    const handler = src.slice(updateAt, src.indexOf("\n      }\n", updateAt));
+    // One confirm covers the pack, so one verdict covers the pack — and it is the SAME rows the
+    // card showed, from the same bank, decided by the one merge function in `update-action.ts`.
+    expect(handler).toContain("pack: opts.packLead?.updateRows() ?? []");
+  });
+
   test("update status: the run record reaches the phone through the status the card already polls", () => {
     const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
     // One status object, three surfaces: the snapshot's `update`, the forced check, and the card's
     // read. The run record rides all three rather than acquiring a fourth endpoint with its own
     // shape — the nine states are `bridge/update-run.ts`'s, and nothing re-spells them here.
-    expect(src).toContain("update: updateMonitor.status(),");
-    expect(src).toContain("...updateMonitor.status(), preflight: report");
+    expect(src).toContain("update: updateStatusWithPeers(),");
+    expect(src).toContain("...updateStatusWithPeers(), preflight: report");
     expect(src).not.toContain('"/api/update/status"');
   });
 });
@@ -2303,5 +2364,113 @@ describe("GET /api/launchers — this host's own rows, home included", () => {
     const res = await launchersRoute(() => Promise.resolve([]), null);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ launchers: [], home: homedir() });
+  });
+});
+
+// ── THE PACK'S RUN (M16/04) ─────────────────────────────────────────────────
+// The peer legs and the peers-only retry, both decided by the pure verdict and both read off what
+// the sweep banked. This route dials nobody, and a peers-only start spawns nothing here.
+
+describe("update status peers — the legs of a pack-wide run", () => {
+  test("update status peers ride the run record BOTH surfaces already poll, from one composer", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    // ONE composer, and both readers take it. The band reads the snapshot's `update`; the Updates
+    // page reads `GET /api/update/check`. Two compositions would be two objects that could disagree
+    // about the same run.
+    expect(src).toContain("update: updateStatusWithPeers(),");
+    expect(src).toContain("...updateStatusWithPeers(), preflight: report");
+    // From the queue the sweep folds, never from a dial: `updatePeers()` is a read of banked state,
+    // exactly as `updateRows()` is.
+    const at = src.indexOf("function updateStatusWithPeers()");
+    const composer = src.slice(at, at + 600);
+    expect(composer).toContain("opts.packLead?.updatePeers() ?? []");
+    expect(composer).toContain("run: { ...status.run, peers: legs }");
+    expect(composer).not.toContain("sweep(");
+    // And there is still no fourth endpoint with a fifth shape.
+    expect(src).not.toContain('"/api/update/status"');
+  });
+
+  test("retry pack update: a peers-only run has peer legs only and never touches a current lead", () => {
+    const current = "1.5.0";
+    const behind: PackUpdateRow = { name: "minibuch", version: "1.4.1", verdict: "green", reasons: [], asOf: 1 };
+    const state = {
+      current,
+      // A current lead has nothing above it to take. That is exactly when "Retry pack update" is the
+      // page's one action, and exactly when an ordinary start would refuse with `none_available`.
+      latest: current,
+      majorAvailable: null,
+      run: null,
+      lockHeld: false,
+      preflight: { schema: 1, verdict: "green" as const, checks: [] },
+      pack: [behind],
+    };
+    const verdict = updateStartVerdict({ confirm: true, target: null, major: false, peersOnly: true }, state);
+    expect(verdict).toEqual({ kind: "peers", to: current });
+
+    // Nothing to level ⇒ nothing to start. The button is not offered here, and the route refuses it.
+    const levelled: PackUpdateRow = { ...behind, version: current };
+    expect(
+      updateStartVerdict({ confirm: true, target: null, major: false, peersOnly: true }, { ...state, pack: [levelled] }),
+    ).toMatchObject({ kind: "refuse", status: 409 });
+
+    // A member that rolled back is the other half of the case, read off the legs.
+    expect(
+      updateStartVerdict(
+        { confirm: true, target: null, major: false, peersOnly: true },
+        { ...state, pack: [levelled], peers: [{ name: "minibuch", state: "rolled-back" }] },
+      ),
+    ).toEqual({ kind: "peers", to: current });
+  });
+
+  test("retry pack update: one confirm still covers the pack, so a red member refuses it", () => {
+    const red: PackUpdateRow = {
+      name: "minibuch",
+      version: "1.4.1",
+      verdict: "red",
+      reasons: ["less than 200 MB free on /"],
+      asOf: 1,
+    };
+    const verdict = updateStartVerdict(
+      { confirm: true, target: null, major: false, peersOnly: true },
+      {
+        current: "1.5.0",
+        latest: "1.5.0",
+        majorAvailable: null,
+        run: null,
+        lockHeld: false,
+        preflight: { schema: 1, verdict: "green", checks: [] },
+        pack: [red],
+      },
+    );
+    expect(verdict).toMatchObject({ kind: "refuse", status: 412 });
+  });
+
+  test("retry pack update: a confirm is still required, and a run in flight still refuses", () => {
+    const state = {
+      current: "1.5.0",
+      latest: "1.5.0",
+      majorAvailable: null,
+      run: null,
+      lockHeld: true,
+      preflight: { schema: 1, verdict: "green" as const, checks: [] },
+      pack: [],
+    };
+    expect(
+      updateStartVerdict({ confirm: false, target: null, major: false, peersOnly: true }, state),
+    ).toMatchObject({ kind: "refuse", status: 400 });
+    expect(
+      updateStartVerdict({ confirm: true, target: null, major: false, peersOnly: true }, state),
+    ).toMatchObject({ kind: "refuse", status: 409 });
+  });
+
+  test("the run id is minted once per confirm, on the server, and rides both legs of the start", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const updateAt = src.indexOf('if (pathname === "/api/update" && req.method === "POST")');
+    const handler = src.slice(updateAt, src.indexOf("\n      }\n", updateAt));
+    expect(handler).toContain("const runId = action.newRunId();");
+    expect(handler).toContain("action.beginPackRun?.({ runId, to: verdict.to })");
+    // A peers-only run starts no updater on this machine.
+    const peersBranch = handler.slice(handler.indexOf('if (verdict.kind === "peers")'));
+    expect(peersBranch.slice(0, peersBranch.indexOf("return json"))).not.toContain("action.start");
   });
 });

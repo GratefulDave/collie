@@ -98,7 +98,8 @@ export const en = {
   "settings.devices.revoke": "Revoke",
   "settings.devices.revokeAria": "Revoke {label}",
   "settings.devices.pair.title": "Pair this device",
-  "settings.devices.pair.hint": "Run {command} on the host and type the code it prints.",
+  "settings.devices.pair.hint":
+    "Run {command} on the host, then scan the code it prints or type it here.",
   "settings.devices.pair.codeLabel": "Pairing code",
   "settings.devices.pair.codePlaceholder": "8 characters",
   "settings.devices.pair.nameLabel": "Name for this device",
@@ -787,7 +788,6 @@ export const en = {
   "settings.updateCard.majorNote": "{version} is a new major.",
   "settings.updateCard.dismiss": "Remind me next digest",
   "settings.updateCard.dismissed": "Dismissed until the next digest.",
-  "settings.updateCard.packLead": "Peers are updated from the terminal: collie pack update",
   "settings.updateCard.details": "Details",
   "settings.updateCard.summary.checks.one": "{count} check",
   "settings.updateCard.summary.checks.other": "{count} checks",
@@ -817,6 +817,66 @@ export const en = {
   "settings.updateCard.retry": "Retry",
   "settings.updateCard.logTail": "Log tail",
   "settings.updateCard.versionUnknown": "an unknown version",
+
+  // --- settings.updateCard, the pack half (M16/01) ---
+  "settings.updateCard.actionPack": "Update pack to {version}",
+  "settings.updateCard.retryPack": "Retry pack update",
+  "settings.updateCard.packConfirmTitle": "Update the pack to {version}?",
+  "settings.updateCard.packConfirmBody": "This machine goes first. Each peer then levels itself to the same release, checks its own health and rolls back on its own if it fails.",
+  "settings.updateCard.packConfirmAction": "Yes, update the pack",
+  "settings.updateCard.retryConfirmTitle": "Retry the pack update?",
+  "settings.updateCard.retryConfirmBody": "This machine is already current, so only the peers run. Each one gets one more attempt.",
+  "settings.updateCard.retryConfirmAction": "Yes, retry",
+  "settings.updateCard.peers.label": "Pack members",
+  "settings.updateCard.peer.versionUnknown": "version unknown",
+  "settings.updateCard.peer.unknownReason": "we could not check this machine",
+  "settings.updateCard.peer.asOf": "checked {ago}",
+  "settings.updateCard.peer.verdict.green": "ready",
+  "settings.updateCard.peer.verdict.amber": "warnings",
+  "settings.updateCard.peer.verdict.red": "red",
+  "settings.updateCard.peer.verdict.unknown": "unknown",
+  "settings.updateCard.peer.state.waiting": "waiting",
+  "settings.updateCard.peer.state.updating": "updating",
+  "settings.updateCard.peer.state.unreachable": "unreachable",
+  "settings.updateCard.peer.state.preflight": "checking",
+  "settings.updateCard.peer.state.staging": "staging",
+  "settings.updateCard.peer.state.restarting": "restarting",
+  "settings.updateCard.peer.state.verifying": "verifying",
+  "settings.updateCard.peer.state.done": "updated",
+  "settings.updateCard.peer.state.rolledBack": "rolled back",
+  "settings.updateCard.peer.state.stuck": "stuck",
+  "settings.updateCard.peer.state.interrupted": "stopped",
+  "settings.updateCard.peer.state.idle": "waiting",
+
+  // --- updates (the page, and the Settings row that opens it), M16/01 ---
+  "updates.title": "Updates",
+  "updates.nav.back": "Back",
+  "updates.entry.title": "Updates",
+  "updates.entry.description": "Update Collie, and the pack with it.",
+  "updates.entry.status.updating": "Updating…",
+  "updates.entry.status.peersBehind.one": "{count} peer behind",
+  "updates.entry.status.peersBehind.other": "{count} peers behind",
+  "updates.entry.status.available": "{version} available",
+  "updates.entry.status.upToDate": "Up to date",
+
+  // --- updateRibbon (the ONE top-of-app update band), M16/02 ---
+  // Every string in this block is held to a 40-CHARACTER BUDGET in all six locales, enforced by
+  // `update-ribbon-i18n.test.ts`. One truncating row on a phone is about forty characters wide, and
+  // a line that overflows it in German or Japanese is a line nobody can read. The budget is measured
+  // with the slots filled: a version, a peer name, a count. `{reason}` is a peer's own prose of
+  // unbounded length, so it is cut on a word boundary before it ever reaches a string here and the
+  // Updates page carries it whole.
+  "updateRibbon.starting": "Starting update…",
+  "updateRibbon.fetching": "Updating to {version}. Fetching",
+  "updateRibbon.building": "Updating to {version}. Building",
+  "updateRibbon.restarting": "Updating to {version}. Restarting",
+  "updateRibbon.updated": "Updated to {version}. Tap to reload.",
+  "updateRibbon.peers.one": "Updating {count} peer: {names}",
+  "updateRibbon.peers.other": "Updating {count} peers: {names}",
+  "updateRibbon.peerRolledBack": "{name} rolled back: {reason}.",
+  "updateRibbon.seeUpdates": "See Updates.",
+  "updateRibbon.available": "Collie {version} available. Tap to update.",
+  "updateRibbon.dismiss": "Dismiss this version",
 } as const;
 
 /** Every key that exists, as a union of string literals. The completeness contract. */

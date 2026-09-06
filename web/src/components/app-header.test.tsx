@@ -468,6 +468,8 @@ const PaneRoute = () => (
 const SettingsLikeRoute = () => (
   <HoistedRoute name="settings" width="column" override={<button type="button">Back</button>} />
 );
+// The pane's shape, as a fourth type: `width="wide"` rather than the dashboard's `column`.
+const WideRoute = () => <HoistedRoute name="wide" width="wide" onHome={() => {}} />;
 
 function renderHoisted(initialEntry = "/") {
   const router = createMemoryRouter(
@@ -485,6 +487,7 @@ function renderHoisted(initialEntry = "/") {
           { index: true, element: <DashRoute /> },
           { path: "pane", element: <PaneRoute /> },
           { path: "settings", element: <SettingsLikeRoute /> },
+          { path: "wide", element: <WideRoute /> },
         ],
       },
     ],
@@ -622,6 +625,43 @@ describe("the ONE header — hoisted above the outlet", () => {
     expect(header?.className).not.toContain("max-w-screen-sm");
     await go("/settings");
     expect(header?.className).toContain("max-w-screen-sm");
+  });
+
+  it("gives the wide claim the md column, not the sm one the other routes take", async () => {
+    // The third value, added when the PWA stopped locking to portrait. The pane and history screens
+    // were `full`, which on a 1366px landscape iPad spread a header, two strips, a toolbar and a
+    // composer across the whole width above a ~620px mirror. They claim `wide` now: 768px, one
+    // breakpoint out from the 640px the dashboard uses, because a 640px column minus its gutters
+    // clips an 80-column mirror. The two must not collapse into one class.
+    const { container, go } = renderHoisted();
+    const header = container.querySelector("header");
+    await go("/wide");
+    expect(header?.className).toContain("max-w-screen-md");
+    expect(header?.className).not.toContain("max-w-screen-sm");
+    // …and it is still a centred column rather than the full-bleed `full` the pane used to claim.
+    expect(header?.className).toContain("mx-auto");
+    await go("/pane");
+    expect(header?.className).not.toContain("max-w-screen-md");
+  });
+
+  it("grows the wide claim past md on a desktop, and leaves the sm column flat", async () => {
+    // #166: flat at 768px, a 1920px desktop left 576px of dead margin on each side of a terminal
+    // mirror that had columns to spare. `wide` is a ladder now. The dashboard's `column` is NOT —
+    // a list row has no column count, so widening it only lengthens the line. That asymmetry is the
+    // whole fix, so both halves are asserted here.
+    //
+    // AgentChat's wrapper and history's carry this identical ladder. Nothing can check across the
+    // three files, so the string is pinned in one place: change it here and grep the other two.
+    const LADDER = ["max-w-screen-md", "lg:max-w-screen-lg", "xl:max-w-screen-xl", "2xl:max-w-[1400px]"];
+    const { container, go } = renderHoisted();
+    const header = container.querySelector("header");
+
+    await go("/wide");
+    for (const step of LADDER) expect(header?.className).toContain(step);
+
+    await go("/settings");
+    expect(header?.className).toContain("max-w-screen-sm");
+    for (const step of LADDER.slice(1)) expect(header?.className).not.toContain(step);
   });
 
   it("refuses to render a route header with no host above it", () => {
