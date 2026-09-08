@@ -128,6 +128,18 @@ const UPDATE_INFO_KEYS = {
   // renders. Both optional — an older bridge sends neither.
   newerVersions: true,
   run: true,
+  // The package manager's own upgrade command (M17/02). Optional: only a packaged install under a
+  // prefix Collie recognises has one to name.
+  packageCommand: true,
+  // The files on disk stopped naming the version this process runs (M17/02), and the command that
+  // clears it. Both optional — a bridge older than the field sends neither.
+  restartNeeded: true,
+  restartCommand: true,
+  // The two bands the operator can close (M17/08) — the offer for this host and the quiet notice
+  // about a machine a package manager owns. The bridge's facts, so the decision holds wherever the
+  // band is read next. Optional here: a bridge older than the fields sends neither.
+  dismissedVersion: true,
+  dismissedPackVersion: true,
 } satisfies Record<keyof UpdateInfo, true>;
 
 describe("solo zero-tax — the client's mirror types carry no pack dimension", () => {
@@ -196,13 +208,23 @@ describe("solo zero-tax — the client's mirror types carry no pack dimension", 
       "bridgeStale",
       "checkedAt",
       "current",
+      // The two bands the operator can close (M17/08) — optional here, because a bridge older than
+      // the fields sends neither.
+      "dismissedPackVersion",
+      "dismissedVersion",
       "installKind",
       "latest",
       "latestUrl",
       "majorAvailable",
       "majorUrl",
       "newerVersions",
+      // The package manager's own upgrade command (M17/02) — optional, present only on a packaged
+      // install under a prefix Collie recognises.
+      "packageCommand",
       "releaseAvailable",
+      // The command that clears the restart, optional beside the flag that raises it (M17/02).
+      "restartCommand",
+      "restartNeeded",
       "run",
     ]);
   });

@@ -109,12 +109,16 @@ export const ERROR_CODES = {
   /** This space is not in a Git work tree, so it has no worktrees to show. */
   "worktree.not_a_repo": "{reason}",
 
-  // ── Image upload: POST /api/pane/:id/upload → UploadResponse ───────────────────────
-  /** Refused on the declared Content-Length (413) or on the decoded size (200 + ok:false). */
-  "upload.too_large": "image too large (max 10 MB)",
+  // ── Attachment upload: POST /api/pane/:id/upload → UploadResponse ──────────────────
+  /**
+   * Refused on the declared Content-Length (413) or on the decoded size (200 + ok:false). The
+   * number is the HOST's own `COLLIE_MAX_UPLOAD_MB`, so it is interpolated rather than written:
+   * two members of one pack may answer this with two different sentences, both true.
+   */
+  "upload.too_large": "file too large (max {maxMb} MB)",
   /** The multipart body carried no `file` part. */
   "upload.no_file": "no file",
-  /** A content type Collie has no extension for — it will not write bytes it cannot name. */
+  /** Not an image Collie recognises and not a text type it accepts — it will not write bytes it cannot name. */
   "upload.bad_type": "unsupported type: {type}",
   /** The bytes arrived but the host write failed (disk full, permissions). */
   "upload.write_failed": "{reason}",
@@ -171,6 +175,12 @@ export const ERROR_CODES = {
   "update.target_mismatch": "this device asked for {asked}, but this collie would install {would}",
   /** Nothing newer to take. */
   "update.none_available": "there is no newer release to take",
+  /**
+   * A package manager owns this install's folder (ADR 0035). Its own preflight is GREEN, so nothing
+   * else on this gate would stop the start — which is exactly why this refusal exists here and not
+   * only in the client, whose disabled button this file's own contract calls a courtesy.
+   */
+  "update.packaged": "updates come from this machine's package manager — Collie does not replace its files",
   /** The handoff itself failed — nothing was staged and nothing restarted. */
   "update.start_failed": "the update could not be started: {reason}",
 } as const;

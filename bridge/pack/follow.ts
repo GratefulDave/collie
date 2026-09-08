@@ -1,3 +1,4 @@
+import type { InstallKind } from "../../cli/install-kind.ts";
 import { compareSemver, majorOf, parsePrereleaseTag } from "../update.ts";
 import type { PeerRunReport, PreflightReport } from "../update-action.ts";
 import { firstRed } from "../update-action.ts";
@@ -104,6 +105,7 @@ export function parseTurn(raw: string | null | undefined): { member: string; run
 
 /** Why a peer is not following. Every refusal is recorded, and every one of them names itself. */
 export type FollowRefusal =
+  | "install-is-packaged"
   | "own-build-not-a-release"
   | "lead-states-nothing"
   | "not-higher"
@@ -124,6 +126,17 @@ const refuse = (reason: FollowRefusal, detail: string): FollowDecision => ({ kin
 
 /** Everything the pure guards decide from. All of it is already on this machine. */
 export interface FollowFacts {
+  /**
+   * This peer's own install kind (ADR 0035). A `packaged` peer never follows: it cannot replace
+   * its own files, so `firstRed` — which the six-and-eight guards below rely on — finding nothing
+   * red proves nothing here. A packaged install's preflight is GREEN BY DESIGN, so without this
+   * guard a peer in that shape would sail through every other check, spawn a detached
+   * `cli/update.ts` that refuses on its own packaged branch, and repeat once an hour forever —
+   * the exact failure ADR 0035 exists to eliminate, on the pack-follow path instead of the phone tap.
+   * Checked FIRST, before the release-build guard, because it costs one comparison and never a
+   * subprocess, matching this function's own ordering rule (cheapest refusal first).
+   */
+  readonly installKind: InstallKind["kind"];
   /** This peer's own running version, bare — the same string it answers `hello` with. */
   readonly own: string;
   /** This peer's own member id, which is the name a turn addresses. */
@@ -147,6 +160,13 @@ export interface FollowFacts {
  * {@link followDecision} runs them in that position.
  */
 export function followGuards(f: FollowFacts): FollowDecision {
+  // ── 0. THIS PEER CANNOT REPLACE ITS OWN FILES ─────────────────────────────
+  // Ahead of guard 1 on purpose: a packaged install is disqualified regardless of what it is
+  // running or what its lead states, so there is nothing upstream of this worth evaluating first.
+  if (f.installKind === "packaged") {
+    return refuse("install-is-packaged", "updates come from this machine's package manager (ADR 0035)");
+  }
+
   // ── 1. RELEASE BUILDS ONLY ─────────────────────────────────────────────────
   // A `1.4.1-dev+ab12cd3` build never self-levels, full stop. **This is what keeps the dev lane
   // still**: the dev pack's peer is the `~/apps/collie-next` checkout on minibuch, built from a
@@ -271,6 +291,12 @@ export async function followDecision(f: FollowFacts, e: FollowEffects): Promise<
 
 /** What the follower needs from the process around it. Every one of them is a seam index.ts fills. */
 export interface PackFollowerDeps {
+  /**
+   * This peer's own install kind. A plain value, not a getter: like the version and member id below,
+   * it cannot change under a running process (`bridge/index.ts` probes it once, the same read the
+   * update preflight and monitor share).
+   */
+  readonly installKind: InstallKind["kind"];
   /** This peer's own bare version and member id, resolved once at boot like every other identity. */
   readonly self: () => { readonly version: string; readonly self: string };
   /** The run record on disk as of now, resolved. Re-read every time — that is the memory. */
@@ -318,6 +344,7 @@ export class PackFollower {
     if (this.deciding) return;
     const id = this.deps.self();
     const facts: FollowFacts = {
+      installKind: this.deps.installKind,
       own: id.version,
       self: id.self,
       leadRelease: headers.leadRelease,
@@ -358,8 +385,16 @@ export class PackFollower {
 
 // ── The lead's turn queue ────────────────────────────────────────────────────
 
-/** One peer's leg of a pack-wide run, as `GET /api/update/check` reports it. */
-export type PeerLegState = "waiting" | "updating" | "done" | "rolled-back" | "unreachable";
+/**
+ * One peer's leg of a pack-wide run, as `GET /api/update/check` reports it.
+ *
+ * `package-managed` is TERMINAL in the same sense `done` is: the queue never waits on it and a run
+ * completes with one present. It says the member's files belong to a package manager (ADR 0035), so
+ * nothing the lead can do moves that machine. It is additive-optional on the wire (PACK_PROTOCOL.md
+ * §7.1): a reader that does not know the value renders it as it renders any unknown state, and
+ * nothing ever branches on it to take an action.
+ */
+export type PeerLegState = "waiting" | "updating" | "done" | "rolled-back" | "unreachable" | "package-managed";
 
 /** One leg on the wire. Every field past the name is optional — a leg the lead knows little about. */
 export interface PeerLeg {
@@ -379,6 +414,14 @@ export interface TurnMember {
   readonly version: string | null;
   /** That member's own banked preflight verdict, or `null` — which is **unknown**, never green. */
   readonly verdict: "green" | "amber" | "red" | null;
+  /**
+   * That member's own install kind as its preflight reported it (§19), or absent.
+   *
+   * **Absent means unknown, and unknown is NOT packaged** — a member older than the field, or one
+   * this sweep never reached, behaves exactly as it did before the field existed. The kind is read,
+   * never a check id: an id labels a sentence and can be renamed, the kind is the fact.
+   */
+  readonly installKind?: InstallKind["kind"];
   /** Did this member answer THIS sweep? Three consecutive misses release its turn. */
   readonly answered: boolean;
   /** That member's own run record as it reported it (§20), or null. */
@@ -404,6 +447,14 @@ export class UpdateTurns {
   private held: string | null = null;
   private readonly missed = new Map<string, number>();
   private readonly legs = new Map<string, PeerLeg>();
+  /** Whether this run's settling line has been written. One per run, never one per sweep. */
+  private settledLogged = false;
+
+  /**
+   * `log` is where a `[pack]` line goes — `console.log`, the bridge's journal, unless a caller
+   * says otherwise. Injected so a test asserts the sentence and the suite stays silent.
+   */
+  constructor(private readonly log: (line: string) => void = (line) => console.log(line)) {}
 
   /** A run has started on this lead. Every peer behind `target` becomes a candidate. */
   begin(runId: string, target: string): void {
@@ -412,6 +463,7 @@ export class UpdateTurns {
     this.held = null;
     this.missed.clear();
     this.legs.clear();
+    this.settledLogged = false;
   }
 
   /** No run is being driven. The queue empties; nothing about it was ever on disk. */
@@ -420,6 +472,7 @@ export class UpdateTurns {
     this.held = null;
     this.missed.clear();
     this.legs.clear();
+    this.settledLogged = false;
   }
 
   /** The run this lead is currently driving, or null. */
@@ -457,12 +510,21 @@ export class UpdateTurns {
       const misses = m.answered ? 0 : (this.missed.get(m.memberId) ?? 0) + 1;
       this.missed.set(m.memberId, misses);
       const leg = legOf(m, { target, runId, misses, now });
+      const was = this.legs.get(m.memberId);
       this.legs.set(m.memberId, leg);
+      // `legOf` mints a fresh object every sweep, so the STATE is compared and never the object.
+      // That is what keeps a member sitting in `updating` for ten minutes to one line.
+      if (was?.state !== leg.state) {
+        this.log(
+          `[pack] update ${shortRunId(runId)}: ${m.memberId} ${was?.state ?? "new"} -> ${leg.state} (${leg.version ?? "unknown"})`,
+        );
+      }
       if (this.held === m.memberId && leg.state !== "waiting" && leg.state !== "updating") {
         this.held = null;
         released = true;
       }
     }
+    this.logSettled(runId);
 
     if (this.held === null) {
       const next = ordered.find((m) => eligible(m, this.legs.get(m.memberId)));
@@ -470,6 +532,33 @@ export class UpdateTurns {
     }
     return { released };
   }
+
+  /**
+   * Say that the run has stopped moving, once, the sweep every leg first reaches a terminal state.
+   *
+   * It is the line the 2026-09-07 drill wanted most: the pack levelled in seventeen seconds and the
+   * lead's own record still read "moving" a quarter of an hour later, with nothing in the journal to
+   * say which of the two was wrong.
+   */
+  private logSettled(runId: string): void {
+    if (this.settledLogged || this.legs.size === 0) return;
+    const legs = [...this.legs.values()];
+    if (legs.some((l) => l.state === "waiting" || l.state === "updating")) return;
+    this.settledLogged = true;
+    const count = (state: PeerLegState): number => legs.filter((l) => l.state === state).length;
+    const parts = [`${count("done")} peer(s) done`];
+    // Every other terminal state is named with its own count. Lumping them under "failed" would
+    // report a packaged member, which nothing failed at, as a failure.
+    for (const state of ["rolled-back", "unreachable", "package-managed"] as const) {
+      if (count(state) > 0) parts.push(`${count(state)} ${state}`);
+    }
+    this.log(`[pack] update ${shortRunId(runId)}: settled, ${parts.join(", ")}`);
+  }
+}
+
+/** A run id is long and opaque; eight characters is enough to grep one run out of a journal. */
+function shortRunId(runId: string): string {
+  return runId.slice(0, 8);
 }
 
 /** What one folded sweep answers. Named, because a turn being released is what earns a re-sweep. */
@@ -480,6 +569,8 @@ export interface TurnSweep {
 
 /** Whether a member may be handed the turn: behind, reachable, and preflight-clean. */
 function eligible(m: TurnMember, leg: PeerLeg | undefined): boolean {
+  // Every terminal state excludes, and `package-managed` is one of them — which is why a packaged
+  // member never receives `X-Pack-Update-Turn` without a second rule stated here.
   if (leg === undefined || leg.state !== "waiting") return false;
   // `null` is UNKNOWN and it blocks, exactly as it does on the card (§19): "we could not check this
   // machine" is not "this machine is fine".
@@ -514,6 +605,19 @@ function legOf(
   }
   if (a.misses >= TURN_MISSED_SWEEPS) {
     return { ...base, state: "unreachable", reason: `${m.memberId} has missed ${a.misses} sweeps` };
+  }
+  // A PACKAGE MANAGER OWNS THAT MACHINE (ADR 0035). It takes the place of `waiting` and NOTHING
+  // else, which is why it is read last of all.
+  //
+  // Every branch above it is a fact this sweep OBSERVED, and each one outranks it for its own
+  // reason. `done` is the truer sentence about a packaged member already on the target. A run
+  // record the member reported itself wins because the member is the only witness to its own run,
+  // and a packaged machine that is somehow moving is a thing the operator has to be able to see.
+  // `unreachable` wins because a packaged peer that has stopped answering is a peer nobody has
+  // heard from — saying "waits for its package manager" about it would state a calm fact about a
+  // machine that may be off.
+  if (m.installKind === "packaged") {
+    return { ...base, state: "package-managed", reason: `${m.memberId} takes its updates from its package manager` };
   }
   return { ...base, state: "waiting" };
 }

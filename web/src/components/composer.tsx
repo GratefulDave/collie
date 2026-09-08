@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent, CSSProperties, ReactNode } from "react";
 import { useRevalidator } from "react-router";
-import { Check, ImagePlus, Keyboard, Loader2, Mic, Send, Settings2, Slash, Square, Terminal, X, Zap } from "lucide-react";
+import { Check, FileText, Image, Keyboard, Loader2, Mic, Paperclip, Send, Settings2, Slash, Square, Terminal, X, Zap } from "lucide-react";
 
 import { applyDraftFontSize, fontStack, inputFocusZoomsPage } from "@/hooks/use-display-prefs";
 import type { DisplayPrefs } from "@/hooks/use-display-prefs";
@@ -11,6 +11,7 @@ import { useDirectTyping } from "@/hooks/use-direct-typing";
 import { useLocale } from "@/hooks/use-locale";
 import { t as translate, tn as translatePlural } from "@/lib/i18n";
 import { setStatus } from "@/lib/status";
+import { buzz } from "@/lib/haptics";
 import { stampSend } from "@/lib/poll-intent";
 import { useBusyWhile } from "@/lib/busy";
 import { cn } from "@/lib/utils";
@@ -22,11 +23,14 @@ import { QuickActionsContent } from "@/components/quick-actions";
 import { DisplayPrefsContent } from "@/components/display-prefs";
 import { SectionLabel } from "@/components/ui/section-label";
 import { Collapse } from "@/components/ui/collapse";
+import { ActionRow } from "@/components/action-sheet-rows";
+import { AnchoredMenu } from "@/components/ui/anchored-menu";
 import * as api from "@/lib/api";
 import { describeApiError, describeThrownError } from "@/lib/api-error-message";
 import { commandsFor } from "@/lib/agent-commands";
 import { useMuxCapability, useMuxUnsupportedKeys } from "@/lib/mux-capability";
-import { useOperatorCommands, useOperatorKeys } from "@/lib/operator-config";
+import { useOperatorCommands, useOperatorKeys, useUploadCapability } from "@/lib/operator-config";
+import { acceptAttribute, limitMb, offersFiles, PHOTO_ACCEPT, rejectAttachment, uploadLimits } from "@/lib/attachments";
 import { ctrlPresetsFor } from "@/lib/operator-keys";
 import { isDestructiveInput } from "@/lib/destructive";
 import { HostChip } from "@/components/host-chip";
@@ -117,13 +121,14 @@ interface ComposerProps {
   stepFontSize: (delta: number) => void;
   setRawTerminal: (raw: boolean) => void;
   setTapToFocus: (tapToFocus: boolean) => void;
+  setExpandClippedReply: (expandClippedReply: boolean) => void;
   /** Snap the mirror to the live tail (follow + revalidate + scroll) after a successful send. */
   onSent: () => void;
 }
 
 // The composer cluster at the bottom of the pane view — everything a phone keyboard can't do on its
 // own: quick actions, an agent-aware slash-command palette, an inline key tray (via
-// `pane.send_keys`), image upload, display prefs, and the reply Send (with a destructive-command
+// `pane.send_keys`), attachment upload, display prefs, and the reply Send (with a destructive-command
 // two-tap guard). Its state (draft, sending, upload, pending preview, its own Keys/Quick/Agent
 // sheets) is entirely local; it reaches AgentChat only through `onSent` (to re-follow the tail) and
 // exposes `focusInput` so the mirror tap can bring up the keyboard.
@@ -227,8 +232,12 @@ function ComposerDock({
   );
 }
 
+/** How long the attach button holds its pressed tone, in ms. Just under the sheet's own 240ms
+ *  entrance, so the flash hands over to the sheet rather than lingering behind it. */
+const ATTACH_PRESS_MS = 220;
+
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
-  { paneId, scope, agent, isShell, status, stale, gone, readOnly, hostBlock, composing, dialogPresent, text, terminalDraft, rawTerminalDraft, prefs, setWrap, stepFontSize, setRawTerminal, setTapToFocus, onSent },
+  { paneId, scope, agent, isShell, status, stale, gone, readOnly, hostBlock, composing, dialogPresent, text, terminalDraft, rawTerminalDraft, prefs, setWrap, stepFontSize, setRawTerminal, setTapToFocus, setExpandClippedReply, onSent },
   ref,
 ) {
   const revalidator = useRevalidator();
@@ -430,6 +439,8 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
 
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // The camera-roll half of the picker. See the two inputs below.
+  const photoRef = useRef<HTMLInputElement>(null);
   const direct = useDirectTyping({
     paneKey: `${scopeId}\0${paneId}`,
     inputRef,
@@ -473,7 +484,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // Three intervals, declared where the state already lives, so the Collie mark in the header spins
   // for exactly as long as the work does and not a frame longer. `sending` spans the whole guarded
   // send (type → settle → verify → submit), which is the interval the operator is actually waiting
-  // through; `uploading` spans the image POST; the recorder's `transcribing` phase spans the trip to
+  // through; `uploading` spans the attachment POST; the recorder's `transcribing` phase spans the trip to
   // the provider. Each is a boolean this component already renders from, so nothing new is tracked —
   // the mark just reads what the composer already knows.
   //
@@ -666,6 +677,46 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // visibility test here and the palette's own list below (same call, same arguments).
   const operatorCommands = useOperatorCommands();
   const commands = commandsFor(agent, operatorCommands);
+  // What this collie takes as an attachment, off the same one-shot /api/config read. On a bridge
+  // that publishes nothing (older than the field, or the read has not landed) `uploadLimits` answers
+  // with the contract that shipped before attachments — images, 10 MB — so the button is never
+  // dead and never offers what this host would refuse.
+  const limits = uploadLimits(useUploadCapability());
+  const accept = acceptAttribute(limits);
+  // Whether the attach button ASKS. On a host that takes images and nothing else there is one
+  // answer, so it opens the camera roll and no sheet is drawn.
+  const asksWhich = offersFiles(limits);
+  const [picking, setPicking] = useState(false);
+  /**
+   * THE ATTACH BUTTON'S OWN PRESS ECHO.
+   *
+   * Every other control on this row acknowledges a tap by changing what is on screen at once: Send
+   * empties the box, the mic starts counting, a key press flips its row accent. Attach hands the
+   * tap to something that is NOT on screen yet — a sheet 240ms away, or a native picker whose delay
+   * belongs to the phone and not to this app — so for that beat the tap looked lost.
+   *
+   * Two channels, deliberately, and the buzz is the one that matters: it lands under the thumb
+   * before any pixel can (`lib/haptics.ts`'s whole argument). The accent tone is the same "your
+   * press landed" language `quick-actions.tsx` and the dialog option rows already speak, so this
+   * adds no new vocabulary — only a control that was missing it.
+   *
+   * NOT `useActionEcho`: that hook's phases are about a bridge accepting an action, and there is no
+   * bridge here. Opening a picker is fire-and-forget, so the echo is a timer and nothing else.
+   */
+  const [pressed, setPressed] = useState(false);
+  const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (pressTimer.current !== null) clearTimeout(pressTimer.current);
+    };
+  }, []);
+
+  function echoAttachPress() {
+    buzz();
+    setPressed(true);
+    if (pressTimer.current !== null) clearTimeout(pressTimer.current);
+    pressTimer.current = setTimeout(() => setPressed(false), ATTACH_PRESS_MS);
+  }
   // The Keys tray's preset row, resolved the same way from the same one-shot read of /api/config.
   const keyPresets = ctrlPresetsFor(agent, useOperatorKeys());
   // Empty on every adapter that refuses nothing, and empty for Herdr's six as far as this tray is
@@ -937,13 +988,27 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     focusInputEnd();
   }
 
-  // Upload an image; on success append its host path to the composer so the user can add context.
-  // Shared by the file picker and clipboard paste.
-  async function uploadImage(file: File) {
+  // Upload an attachment; on success append its host path to the composer so the user can add
+  // context. Shared by the file picker and clipboard paste.
+  //
+  // The two local refusals below are an ECONOMY, never a gate: the bridge asks the same two
+  // questions again on arrival, and its answer is the one that counts (it can read the bytes, which
+  // is the only way to catch a binary wearing a `.md` name). Spending a phone's uplink on 40 MB to
+  // be told 10 is the limit is the thing worth not doing.
+  async function uploadFile(file: File) {
     if (locked) return;
+    const refusal = rejectAttachment(file, limits);
+    if (refusal === "tooLarge") {
+      setStatus(translate("composer.upload.tooLarge", { max: limitMb(limits) }), "error");
+      return;
+    }
+    if (refusal === "badType") {
+      setStatus(translate("composer.upload.badType", { name: file.name }), "error");
+      return;
+    }
     setUploading(true);
     try {
-      const res = await api.uploadImage(paneId, file, scope);
+      const res = await api.uploadFile(paneId, file, scope);
       if (res.ok) {
         const path = res.path;
         direct.deactivateSilently();
@@ -960,29 +1025,31 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
     }
   }
 
-  async function onPickImage(e: ChangeEvent<HTMLInputElement>) {
+  async function onPickFile(e: ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = ""; // allow re-picking the same file
     if (!file) return;
-    await uploadImage(file);
+    await uploadFile(file);
   }
 
-  // Paste an image straight from the clipboard (e.g. a screenshot) the same way the picker does.
-  // Only intercepts when the clipboard actually carries an image file — a plain text paste (the
-  // common case) falls through untouched.
-  function onPasteImage(e: ClipboardEvent<HTMLTextAreaElement>) {
+  // Paste a file straight from the clipboard (e.g. a screenshot) the same way the picker does.
+  //
+  // A PLAIN TEXT PASTE STILL FALLS THROUGH UNTOUCHED, and that stays true now that text files are
+  // attachable: the branch turns on `item.kind === "file"`, so pasted PROSE is prose and only a
+  // pasted FILE becomes an upload. Copying a `.md` in a file manager produces the second; selecting
+  // its contents in an editor produces the first, and neither has become the other.
+  function onPasteFile(e: ClipboardEvent<HTMLTextAreaElement>) {
     if (locked || direct.active) return;
     const items = e.clipboardData.items;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        const file = item.getAsFile();
-        if (file) {
-          e.preventDefault();
-          void uploadImage(file);
-          return;
-        }
-      }
+      if (item.kind !== "file") continue;
+      const file = item.getAsFile();
+      if (!file) continue;
+      if (rejectAttachment(file, limits) === "badType") continue;
+      e.preventDefault();
+      void uploadFile(file);
+      return;
     }
   }
 
@@ -1017,10 +1084,18 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
         </Collapse>
 
         {/* File input stays mounted here (not inside the keyboard-only key row) so the picker
-            callback survives the keyboard collapsing. Attach-image fires it from the reply-input row
+            callback survives the keyboard collapsing. Attach fires it from the reply-input row
             below (always visible, not gated behind the keyboard-open quick keys); structural commands
             (New tab/space, Kill) and Stop (Esc, in the Keys dock) live elsewhere. */}
-        <input ref={fileRef} type="file" accept="image/*" hidden onChange={onPickImage} />
+        {/* TWO inputs, because a phone's picker cannot be asked both questions at once. The
+            camera roll is offered only when EVERY entry in `accept` maps to a gallery, so the
+            extension list that makes a `.md` pickable is the very thing that hid the gallery on
+            both Android and iOS — the attach button opened the file browser and nothing else.
+            `PHOTO_ACCEPT` is the first input's whole answer; the second keeps the full list. Which
+            one fires is the sheet's question, and both land in the same `onPickFile`. */}
+        <input ref={photoRef} data-testid="attach-photos" type="file" accept={PHOTO_ACCEPT} hidden onChange={onPickFile} />
+        <input ref={fileRef} data-testid="attach-files" type="file" accept={accept} hidden onChange={onPickFile} />
+
         {/* Keys / Quick / Display dock — a single in-flow site ABOVE the Controls row (so the toggle
             you tapped stays put and the panel grows over the mirror, not the input). Whichever of the
             mutually exclusive drawers is active renders here via the shared ComposerDock chrome. Keys
@@ -1064,6 +1139,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               stepFontSize={stepFontSize}
               setRawTerminal={setRawTerminal}
               setTapToFocus={setTapToFocus}
+              setExpandClippedReply={setExpandClippedReply}
             />
           </ComposerDock>
         )}
@@ -1414,7 +1490,7 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
                     }
                   }
             }
-            onPaste={onPasteImage}
+            onPaste={onPasteFile}
             placeholder={
               gone
                 ? translate("composer.placeholder.gone")
@@ -1471,6 +1547,33 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             disabled={locked}
             rows={1}
           />
+            {/* The picker, anchored to the field so it opens ABOVE the button rather than over it
+                (ui/anchored-menu.tsx carries the measurement). Two rows, no confirm — each one
+                opens a native picker, which is its own decision point. The menu closes BEFORE the
+                click so it is not left standing behind the system UI, and the click still counts as
+                the user gesture the browser requires because both happen in this one handler. */}
+            <AnchoredMenu
+              open={picking}
+              onClose={() => setPicking(false)}
+              label={translate("composer.attach.title")}
+            >
+              <ActionRow
+                icon={<Image aria-hidden="true" className="size-4 shrink-0" />}
+                label={translate("composer.attach.photos")}
+                onClick={() => {
+                  setPicking(false);
+                  photoRef.current?.click();
+                }}
+              />
+              <ActionRow
+                icon={<FileText aria-hidden="true" className="size-4 shrink-0" />}
+                label={translate("composer.attach.files")}
+                onClick={() => {
+                  setPicking(false);
+                  fileRef.current?.click();
+                }}
+              />
+            </AnchoredMenu>
             <Button
               type="button"
               variant="ghost"
@@ -1478,16 +1581,39 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
               // bottom-1, not centred: the field grows upward as the draft wraps, and a vertically
               // centred button would drift up with it, away from the thumb and away from the send
               // button it pairs with. Pinned to the bottom it stays put at any height.
-              className="absolute bottom-1 right-1 size-9 rounded-full text-muted-foreground"
+              className={cn(
+                "absolute bottom-1 right-1 size-9 rounded-full text-muted-foreground",
+                // The press echo, in the tone this app already uses for "your press landed" —
+                // `variant="default"`, which is what a tapped quick reply and a busy dialog option
+                // both flip to. It was `bg-accent` first, and that was a token chosen by name
+                // rather than by looking: in the dark theme `accent` resolves to oklch(0.269),
+                // which is the SAME value as `muted` and sits 0.06 of lightness above the card it
+                // is drawn on. Measured through a real tap, it faded in over 180ms, held for 40,
+                // and faded out — a flash nobody could see on a phone. `primary` is oklch(0.922).
+                //
+                // `duration-0` on the way IN, and the base duration on the way out. A press has to
+                // answer immediately or it is not answering the press; the release is the part that
+                // wants easing. Removing both classes in one commit is what lets the exit animate.
+                // Lit for the press, and then for as long as the menu it opened is standing: the
+                // menu is anchored above rather than over the button precisely so this can be seen,
+                // and a trigger that went dark under its own open menu would waste that.
+                (pressed || picking) && "scale-95 bg-primary text-primary-foreground duration-0",
+              )}
               disabled={uploading || locked || direct.active}
               onPointerDown={(e) => e.preventDefault()}
-              onClick={() => fileRef.current?.click()}
+              onClick={() => {
+                echoAttachPress();
+                if (asksWhich) setPicking(true);
+                else photoRef.current?.click();
+              }}
               aria-label={translate("composer.attach.aria")}
+              aria-haspopup="dialog"
+              aria-expanded={asksWhich ? picking : undefined}
             >
               {uploading ? (
                 <Loader2 className="size-4 animate-spin" />
               ) : (
-                <ImagePlus className="size-4" />
+                <Paperclip className="size-4" />
               )}
             </Button>
           </div>

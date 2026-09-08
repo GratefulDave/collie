@@ -67,7 +67,13 @@ version files.
    `([abc1234](https://github.com/AltanS/collie/commit/abc1234))`. Clean up the section: merge
    or reorder lines as needed, and delete entries for changes reverted before release.
 4. **Re-create an empty `## [Unreleased]` heading above it.**
-5. **Run `scripts/check-version.sh`** — it must print `✓`. Then tag and push (next paragraph).
+5. **Bump `flake.lock` if it is to move at all** — in this commit and no other. The input is
+   pinned by revision, so a bump is two edits: the `rev` in `flake.nix`, then `nix flake lock` to
+   re-record it. The lock pins the toolchain the published binary is built with (*Build / run* →
+   the flake), so a lock that moved in a feature commit describes a build nothing records. This is
+   the only commit allowed to touch it, and `scripts/check-flake-lock.sh` refuses the others.
+   Leaving it alone is the ordinary case; a release does not owe the lock a bump.
+6. **Run `scripts/check-version.sh`** — it must print `✓`. Then tag and push (next paragraph).
 
 **A PR from a fork is the exception: leave all four files alone.** Bump nothing, add no CHANGELOG
 line — send the functional commits only. The version is the maintainer's to pick, because it depends
@@ -101,7 +107,8 @@ up either. To publish sooner, run the website's sync by hand against a ref:
 - A **git pre-commit hook** (`scripts/git-hooks/pre-commit`, activate once with
   `scripts/install-hooks.sh`) blocks a functional commit that neither adds a line under
   `## [Unreleased]` nor bumps the version, and blocks a release commit (version bumped) whose
-  `## [Unreleased]` section still has lines in it. Escape hatch for a single commit:
+  `## [Unreleased]` section still has lines in it. The same hook holds guard (D), which refuses a
+  staged `flake.lock` that is not part of a release commit. Escape hatch for a single commit:
   `SKIP_VERSION_CHECK=1 git commit …` (every `SKIP_*` hatch is listed under *Linting* below).
 
 **Publish every release you cut — tag it when you push it.** Cutting a release means the three
@@ -113,6 +120,32 @@ to, so an untagged version exists only as a CHANGELOG heading and nobody can ins
 that release lands and you push, **always push a matching annotated git tag with it** —
 `git tag -a vX.Y.Z -m "Collie X.Y.Z" && git push origin vX.Y.Z` (or `git push --follow-tags` so the
 tag ships *with* the release). One `v<x.y.z>` tag per shipped version on the remote.
+
+**A release is published only from a commit whose CI run succeeded.** `release.yml` enforces it: its
+first job, `gate`, looks up the `ci.yml` run for the tagged commit, waits while that run is still in
+flight, and refuses the release when the run failed, was cancelled, or never existed. 1.5.5 was
+published from a red commit because nothing joined the two workflows; now they are joined, and the
+whole matrix waits behind the gate.
+
+**Push `main` first, watch CI, then push the tag.** That is the recipe:
+
+```
+git push origin main
+gh run watch                 # or: gh run list --commit "$(git rev-parse HEAD)"
+git push origin vX.Y.Z
+```
+
+`git push --follow-tags` in one go still works, because the gate waits rather than races. The
+two-step form is preferred anyway, because a red CI then costs nothing: no tag exists yet, so you fix
+it on `main` and the release commit can still be amended before anything is public. Once the tag is
+pushed and CI is red, that door is shut: the fix is a follow-up patch release with a new tag, never a
+moved or re-pointed tag.
+
+**This is why pushes are held while a release is being cut.** `ci.yml`'s concurrency group is
+`ci-<ref>` with `cancel-in-progress`, so a second push to `main` cancels the release commit's run
+mid-flight. The gate then sees `cancelled`, not `success`, and refuses. Re-running CI for that commit
+and then re-running the Release workflow clears it, but the cheaper move is the old rule: hold the
+push until the release is out.
 
 **The GitHub Release page is built, not written.** `release.yml` populates it with the update
 commands, a link to that version's section in `CHANGELOG.md`, and GitHub's generated notes:
@@ -139,8 +172,13 @@ user-facing update/restart instructions as Herdr plugin actions** — `herdr plu
 update --plugin herdr.collie` (or `restart`) — never `bin/collie …` / `systemctl … collie`, which
 depend on the caller's cwd and the unit name; the Herdr action runs from anywhere. A **binary
 install** (`scripts/install.sh`'s versioned layout) is not a Herdr plugin and has no such actions:
-there the spelling is `collie update` / `collie restart`, and a string that may be read on either
-kind must come from the install kind (`cli/install-kind.ts`), never assume one.
+there the spelling is `collie update` / `collie restart`. A **packaged install** (a folder a package
+manager owns — read-only, outside `$HOME`, or root-owned) takes neither: `collie update` REFUSES
+there, so printing it is printing the command that fails. The spelling is the package manager's own
+command where the resolved prefix names one, and the boundary sentence alone where it does not
+([ADR 0035](./.adr/0035-a-packaged-install-is-not-ours-to-update.md)). A string that may be read
+on more than one kind must come from the install kind (`cli/install-kind.ts`), never assume one —
+and "which kinds are there" is now three answers, not two.
 
 ## Docs style (`docs/*.md`, published to colliepwa.dev)
 
@@ -213,6 +251,25 @@ page to be skimmed.
   every push — override once with `SKIP_TESTS=1 git push` (see *Linting* → escape hatches). The bits that genuinely need `Bun.serve` /
   `Bun.connect` (HTTP handlers, the socket client) stay unit-untested — Vitest-on-Node can't run them,
   so keep new backend logic pure/injectable enough for `bun test`, or exercise it through `web/`.
+- **`flake.nix` is the build environment, and `nix develop` is the reference.** It pins the five
+  tools this tree is built and checked with — Bun, Node, git, tmux, zellij — at one nixpkgs
+  revision, and `release.yml` builds every published payload inside it. Build and check through the
+  flake where you can (`nix develop --command bun run build`, and the same for `lint`, `test` and
+  both typechecks); a committed `.envrc` carries `use flake` for direnv users, and nobody is
+  obliged to allow it. **Do not install a build tool by hand** to get past a version problem — move
+  the pin, or say why you did not. Herdr is deliberately not pinned: it is the product's peer, not
+  one of Collie's build tools.
+- **`nix develop` is the reference, not a requirement.** A developer with no Nix works exactly as
+  today — `bun run build`, `bun run lint`, `bun test`, unchanged. No script, hook or `bun run`
+  target needs Nix to be installed.
+- **Never touch `flake.lock` outside a `chore(release): x.y.z` commit.** It records which toolchain
+  a published binary was built with, so a lock that moves in a feature commit means the binary a
+  bisect builds is not the binary the release built, and nothing in the tree says when it changed.
+  The release recipe (*Versioning*, step 5) is where it moves; `scripts/check-flake-lock.sh` refuses
+  it anywhere else, with `SKIP_FLAKE_LOCK_CHECK=1` as its own hatch. The guard judges a change to the
+  lock, so the first commit that adds it passes without a release commit. The pinned Bun must also stay
+  at or above `MIN_BUN` in `cli/update-check.ts` — they are one fact, and
+  `scripts/check-flake-bun.test.ts` fails when they drift apart.
 - Service: `systemd --user` unit `collie` on the deployment host; logs `journalctl --user -u collie -f`.
 - **Dependencies must be 7 days old to install** (`bunfig.toml` + `web/bunfig.toml`, mirrored in
   `.npmrc` for npm users) — a compromised release is usually pulled within hours. A brand-new
@@ -260,12 +317,13 @@ a single command; never export one.
 | `SKIP_VERSION_CHECK=1` | `git commit` (pre-commit hook) | the version-consistency + bump-on-change guard |
 | `SKIP_LINT_CHECK=1` | `git commit` (pre-commit hook) | oxlint over the staged files |
 | `SKIP_PACK_WIRE_CHECK=1` | `git commit` (pre-commit hook) | the pack-wire decision guard |
+| `SKIP_FLAKE_LOCK_CHECK=1` | `git commit` (pre-commit hook) | the `flake.lock`-only-in-a-release guard |
 | `SKIP_TYPECHECK=1` | `bun run build` / `collie build` | both typecheck steps |
 | `SKIP_TESTS=1` | `git push` (pre-push hook) | both test suites |
 | `SKIP_TAG_CHECK=1` | `git push` (pre-push hook) | the untagged-release warning |
 
-The pre-commit hook's three guards are **independent** — `SKIP_VERSION_CHECK=1` does not disarm the
-lint guard or the pack-wire guard.
+The pre-commit hook's four guards are **independent** — `SKIP_VERSION_CHECK=1` does not disarm the
+lint guard, the pack-wire guard or the `flake.lock` guard.
 
 ## Frontend data layer (React Router, not TanStack)
 
@@ -301,6 +359,13 @@ lint guard or the pack-wire guard.
   row in the pane sheet). `MuxPane.focused` is a fact the snapshot reports, and the terminal never
   moves the phone in the other direction — that may not become a side effect of navigation
   ([ADR 0031](./.adr/0031-freshness-is-a-declared-promise.md)).
+- **The "Full reply" card is gated on an identity check, not a length check.** The pane view re-shows
+  the newest journal turn only when the tail probe proves that turn IS the message on screen and the
+  head probe shows its start is not. A failed tail probe means render nothing — don't relax it to "the
+  newest journal turn", which would present a stale or still-streaming reply as the one you're reading
+  (`web/src/lib/latest-reply.ts`). It **replaces** the rows it covers rather than sitting above them
+  (`hideLeadingLines`), and that hiding is render-only, applied after every grammar has run over the
+  whole screen — never trim the text a detector, guard or draft probe sees.
 - **The operator's rows in `commands.toml` replace the shipped command catalog on the panes they
   address, never merge into it** ([ADR 0018](./.adr/0018-operator-command-rows-replace-the-catalog.md));
   the bridge re-reads the file behind an mtime check, so edits are live and need no restart.

@@ -159,7 +159,10 @@ const updateStatus: UpdateStatus = {
   majorAvailable: null,
   majorUrl: null,
   installKind: "detached-checkout",
+  dismissedVersion: null,
+  dismissedPackVersion: null,
   bridgeStale: false,
+  restartNeeded: false,
   checkedAt: null,
 };
 
@@ -321,6 +324,19 @@ const UPDATE_STATUS_KEYS = {
   run: true,
   // Every release newer than the running one (M15/05) — the card lists what one update folds in.
   newerVersions: true,
+  // The package manager's own upgrade command (M17/02). Optional: only a packaged install under a
+  // prefix Collie recognises has one to name.
+  packageCommand: true,
+  // The files on disk stopped naming the version this process runs (M17/02), and the command that
+  // clears it — the latter optional, because most installs never reach the state.
+  restartNeeded: true,
+  restartCommand: true,
+  // The two bands the operator can close (M17/08) — the offer for this host, and the quiet notice
+  // about a machine a package manager owns. Two decisions, two keys, both required and null when
+  // nothing was closed, so the golden below carries two more. They are facts about the HOST, which
+  // is the whole point: a dismissal kept per browser is a dismissal that holds in one browser.
+  dismissedVersion: true,
+  dismissedPackVersion: true,
 } satisfies Record<keyof UpdateStatus, true>;
 
 const WORKSPACE_KEYS = {
@@ -418,13 +434,23 @@ describe("solo zero-tax — wire shapes carry no pack dimension", () => {
       "bridgeStale",
       "checkedAt",
       "current",
+      // The two bands the operator can close (M17/08): this host's offer, and the quiet notice about
+      // a machine a package manager owns. Required and null when nothing was closed.
+      "dismissedPackVersion",
+      "dismissedVersion",
       "installKind",
       "latest",
       "latestUrl",
       "majorAvailable",
       "majorUrl",
       "newerVersions",
+      // The package manager's own upgrade command (M17/02) — optional, and present only on a
+      // packaged install under a prefix Collie recognises.
+      "packageCommand",
       "releaseAvailable",
+      // The command that clears the restart, optional beside the flag that raises it (M17/02).
+      "restartCommand",
+      "restartNeeded",
       // The detached updater's run record (M15/04) — optional, so an install that has never run one
       // sends no such key at all.
       "run",
@@ -591,6 +617,9 @@ describe("solo zero-tax — routes", () => {
       // (`collie pack update`), never over the link (ADR 0016).
       "/api/update",
       "/api/update/check",
+      // Closing the update band (M17/08) — solo, no pack sibling: it writes the lead's own update
+      // record, and the band a peer's operator closes is that machine's own decision.
+      "/api/update/dismiss",
       // The digest's "remind me next digest" dismiss — solo, no pack sibling: it writes the lead's
       // own notify record, and a peer never pushes an update notification of its own.
       "/api/update/snooze",
@@ -627,6 +656,7 @@ const CONFIG_KEYS = {
   themeFile: true,
   fontsDir: true,
   launchersFile: true,
+  maxUploadBytes: true,
   port: true,
   host: true,
   pollMs: true,
@@ -651,6 +681,7 @@ const CONFIG_KEYS = {
   stateDir: true,
   multiSession: true,
   skipServe: true,
+  uploadExtraTypes: true,
 } satisfies Record<keyof Config, true>;
 
 describe("solo zero-tax — config", () => {
@@ -670,6 +701,7 @@ describe("solo zero-tax — config", () => {
       "journalRoots",
       "keysFile",
       "launchersFile",
+      "maxUploadBytes",
       "multiSession",
       "mux",
       "muxEndpoint",
@@ -690,6 +722,7 @@ describe("solo zero-tax — config", () => {
       "transcript",
       "trustedUser",
       "trustedUserOptional",
+      "uploadExtraTypes",
       "vapidPrivate",
       "vapidPublic",
       "vapidSubject",
@@ -728,6 +761,7 @@ describe("solo zero-tax — config", () => {
       "COLLIE_GROK_ROOT",
       "COLLIE_HERDR_DIAL",
       "COLLIE_HOST",
+      "COLLIE_MAX_UPLOAD_MB",
       "COLLIE_MULTI_SESSION",
       "COLLIE_MUX",
       "COLLIE_MUX_ENDPOINT_",
@@ -748,6 +782,7 @@ describe("solo zero-tax — config", () => {
       "COLLIE_TRANSCRIPT_ROOT",
       "COLLIE_TRUSTED_USER",
       "COLLIE_TRUSTED_USER_OPTIONAL",
+      "COLLIE_UPLOAD_EXTRA_TYPES",
       "COLLIE_VAPID_PRIVATE",
       "COLLIE_VAPID_PUBLIC",
       "COLLIE_VAPID_SUBJECT",

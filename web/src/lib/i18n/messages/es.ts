@@ -30,6 +30,8 @@ export const es: Dictionary = {
   "settings.install.iosHint": "En iOS o iPadOS, selecciona Compartir y luego «Añadir a pantalla de inicio».",
   "settings.zen.title": "Modo zen",
   "settings.zen.description": "Añade una opción al menú de paneles para ocultar todo excepto el terminal.",
+  "settings.zen.auto.label": "Activar en horizontal",
+  "settings.zen.auto.hint": "Gira el teléfono de lado para abrir el modo zen automáticamente; gíralo de vuelta para cerrarlo.",
 
   // --- settings.handsFree ---
   "settings.handsFree.title": "Dictado directo",
@@ -46,6 +48,8 @@ export const es: Dictionary = {
     "Notificaciones bloqueadas en los permisos del navegador.",
   "settings.push.reason.unsupported": "Este navegador no soporta Web Push.",
   "settings.push.reason.default": "No se pudieron activar las notificaciones push.",
+  "settings.push.reason.timeout": "Se agotó el tiempo para configurar las notificaciones. Comprueba que este dispositivo pueda conectarse al servicio push y vuelve a intentarlo.",
+  "settings.push.availability.unavailable": "No se pudo comprobar la configuración de notificaciones. Revisa la conexión o inicia sesión de nuevo y vuelve a intentarlo.",
   "settings.push.availability.insecure":
     "No disponible en HTTP. Sirve Collie sobre HTTPS para habilitar push.",
   "settings.push.availability.serverOff":
@@ -139,6 +143,7 @@ export const es: Dictionary = {
   "settings.update.error": "Error al comprobar.",
   "settings.update.upToDate": "Actualizado",
   "settings.updateBanner.restart": "Reinicio del bridge requerido",
+  "settings.updateBanner.restartNeeded": "Collie fue reemplazado en el disco. Reinícialo.",
   "settings.updateBanner.releaseAvailable": "Collie {version} disponible",
   "settings.updateBanner.majorAvailable": "Collie {version}, nueva versión mayor",
   "settings.updateBanner.copyAria": "Copiar comando: {command}",
@@ -172,6 +177,9 @@ export const es: Dictionary = {
   "settings.display.tapToType.label": "Tocar para escribir",
   "settings.display.tapToType.hint":
     "Si esta activo, pulsar en cualquier parte abre el teclado. Si no, funciona como documento de texto y solo el editor abre el teclado.",
+  "settings.display.fullReply.label": "Respuesta completa",
+  "settings.display.fullReply.hint":
+    "La terminal de un agente no guarda historial, así que una respuesta larga pierde su inicio. Si esta activo, se muestra completa desde el registro del agente, en lugar de las lineas que cubre.",
   "settings.display.rawTerminal.label": "Terminal sin formato",
   "settings.display.rawTerminal.hint":
     "Muestra la sesion directa sin botones de interfaz ni barras. Util si un dialogo falla y requiere control manual mediante Teclas.",
@@ -209,7 +217,10 @@ export const es: Dictionary = {
   "composer.mic.manualHint": "Se insertará en el campo de texto",
   "composer.mic.stop": "Detener",
   "composer.mic.discardAria": "Descartar grabación",
-  "composer.attach.aria": "Adjuntar imagen",
+  "composer.attach.aria": "Adjuntar archivo",
+  "composer.attach.title": "Adjuntar",
+  "composer.attach.photos": "Fotos",
+  "composer.attach.files": "Archivos",
   "composer.send.typeAnyway": "¿Escribir de todos modos?",
   "composer.send.reallySend": "¿Confirmar envío?",
   "composer.send.stopTypingAria": "Detener escritura en la terminal",
@@ -228,7 +239,9 @@ export const es: Dictionary = {
   "composer.destructive.confirm": "Acción destructiva: {reason}. Pulsa Enviar de nuevo para confirmar.",
   "composer.destructive.confirmOnHost":
     "Acción destructiva: {reason} en {host}. Pulsa Enviar de nuevo para confirmar.",
-  "composer.upload.success": "Imagen adjunta. Ruta insertada en el mensaje.",
+  "composer.upload.success": "Archivo añadido, ruta en el mensaje",
+  "composer.upload.tooLarge": "El archivo supera los {max} MB, el límite en este collie.",
+  "composer.upload.badType": "Collie no puede adjuntar {name}.",
   "composer.noEcho.title": "Solicitud de contraseña: sin eco en terminal",
   "composer.noEcho.noLiveTyped":
     "El texto introducido está en el panel sin enviar. Esta vista no está en vivo y no permite enviar datos; responde directamente en la terminal.",
@@ -269,6 +282,9 @@ export const es: Dictionary = {
   "chat.scrollback.loading": "Cargando…",
   "chat.scrollback.noSessionReported":
     "{agent} no ha registrado ninguna sesión en Herdr. Instala o actualiza la integración de Herdr correspondiente y reinicia el agente en este panel.",
+  "chat.fullReply.title": "Respuesta completa",
+  "chat.fullReply.fromTranscript": "desde el registro",
+  "chat.fullReply.showingTerminal": "mostrando la terminal",
   "chat.output.empty": "(sin salida reciente)",
   "chat.switcher.aria": "Cambiar panel",
   "chat.switcher.title": "Cambiar panel",
@@ -380,6 +396,11 @@ export const es: Dictionary = {
   "status.count.working.other": "{count} en ejecución",
   "status.shellBadge": "shell",
   "status.dismissAria": "Descartar",
+  "status.detailAria": "Mostrar el mensaje completo",
+  "status.detail.title": "Qué salió mal",
+  "status.detail.copy": "Copiar",
+  "status.detail.copied": "Copiado",
+  "status.detail.dismiss": "Cerrar",
 
   // --- space (spaces overview/strip/view, tabs, panes, new-space) ---
   "space.overview.title": "Espacios",
@@ -699,10 +720,10 @@ export const es: Dictionary = {
   "apiError.launch.not_allowlisted": "Ese comando no está en tus lanzadores",
   "apiError.launch.pane_unknown": "Ese panel ya no existe, no se inició nada",
   "apiError.workspace.create_failed": "Error al crear el espacio: {reason}",
-  "apiError.upload.too_large": "La imagen supera el límite máximo de 10 MB.",
+  "apiError.upload.too_large": "El archivo es demasiado grande, el límite es {maxMb} MB.",
   "apiError.upload.no_file": "No se especificó ningún archivo.",
   "apiError.upload.bad_type": "Formato de archivo no admitido por Collie: {type}",
-  "apiError.upload.write_failed": "Error al escribir la imagen en el host: {reason}",
+  "apiError.upload.write_failed": "No se pudo guardar el archivo en el host: {reason}",
   "apiError.stt.unconfigured": "El servicio de dictado por voz no está configurado en este collie.",
   "apiError.stt.too_large": "La grabación excede la duración permitida. Use un audio más corto.",
   "apiError.stt.bad_format": "El navegador generó un formato de audio incompatible con Collie.",
@@ -758,6 +779,7 @@ export const es: Dictionary = {
   "apiError.update.major_confirm_required": "{version} pasa a una versión mayor y requiere confirmación explícita.",
   "apiError.update.target_mismatch": "Esta pantalla ofreció {asked}, pero este collie instalaría {would}. Recargue y vuelva a revisar.",
   "apiError.update.none_available": "No hay ninguna versión más reciente disponible.",
+  "apiError.update.packaged": "Las actualizaciones se gestionan con tu gestor de paquetes. Collie no reemplazará los archivos de esta instalación.",
   "apiError.update.start_failed": "No se pudo iniciar la actualización: {reason}",
   // --- settings.updateCard (the update card, M15/05) ---
   "settings.updateCard.title": "Actualizar Collie",
@@ -779,6 +801,7 @@ export const es: Dictionary = {
   "settings.updateCard.summary.amber.one": "{count} ámbar",
   "settings.updateCard.summary.amber.other": "{count} ámbar",
   "settings.updateCard.preflightUnavailable": "No se pudo ejecutar la comprobación previa en este equipo.",
+  "settings.updateCard.packageManaged": "Tu gestor de paquetes actualiza esta instalación. Collie no la actualizará desde aquí.",
   "settings.updateCard.remedy": "Solución: {command}",
   "settings.updateCard.confirmTitle": "¿Actualizar a {version}?",
   "settings.updateCard.confirmBody": "La sesión de terminal se mantiene activa. La vista móvil se interrumpe hasta 30 segundos.",
@@ -788,6 +811,7 @@ export const es: Dictionary = {
   "settings.updateCard.majorConfirmAction": "Sí, pasar a {version}",
   "settings.updateCard.cancel": "Cancelar",
   "settings.updateCard.starting": "Iniciando…",
+  "settings.updateCard.startingSlow": "Still starting. The host has not reported the run yet.",
   "settings.updateCard.state.preflight": "Comprobando este equipo…",
   "settings.updateCard.state.staging": "Preparando {version}…",
   "settings.updateCard.state.restarting": "Reiniciando. No es una interrupción del servicio.",
@@ -829,6 +853,7 @@ export const es: Dictionary = {
   "settings.updateCard.peer.state.verifying": "verificando",
   "settings.updateCard.peer.state.done": "actualizado",
   "settings.updateCard.peer.state.rolledBack": "revertido",
+  "settings.updateCard.peer.state.packageManaged": "espera al gestor de paquetes",
   "settings.updateCard.peer.state.stuck": "atascado",
   "settings.updateCard.peer.state.interrupted": "detenido",
   "settings.updateCard.peer.state.idle": "en espera",
@@ -848,8 +873,13 @@ export const es: Dictionary = {
   "updateRibbon.updated": "Actualizado a {version}. Toca y recarga.",
   "updateRibbon.peers.one": "Actualizando {count} par: {names}",
   "updateRibbon.peers.other": "Actualizando {count} pares: {names}",
+  "updateRibbon.packageManaged.one": "{names} espera a su gestor de paquetes",
+  "updateRibbon.packageManaged.other": "{names} esperan a su gestor de paquetes",
   "updateRibbon.peerRolledBack": "{name} revirtió: {reason}.",
   "updateRibbon.seeUpdates": "Ver Actualizaciones.",
   "updateRibbon.available": "Collie {version} disponible. Actualiza.",
+  "updateRibbon.availablePackaged": "Collie {version} disponible vía {manager}.",
+  "updateRibbon.availablePackagedUnnamed": "Collie {version} disponible.",
   "updateRibbon.dismiss": "Descartar esta versión",
+  "updateRibbon.hideNotice": "Ocultar este aviso",
 };

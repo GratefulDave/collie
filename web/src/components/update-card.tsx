@@ -72,6 +72,23 @@ const IN_FLIGHT: ReadonlySet<UpdateRunState> = new Set<UpdateRunState>([
  *  cadence is resolved from what the operator is doing, which is not this. */
 const RUN_POLL_MS = 2000;
 
+/**
+ * How long the card waits, after its own tap, before it says the start is TAKING A WHILE.
+ *
+ * A DISPLAY threshold and nothing else. It was a control-unlock once — the button came back after
+ * 30s — and that was a guess about how long an update takes dressed up as a safety valve: an
+ * in-place checkout writes its run record only AFTER it has built (`recordInPlaceRun` in
+ * cli/update.ts), and a build on a slow host outlives any number this file could pick. Unlocking
+ * there would re-open the double-tap window this state exists to close, on exactly the machines
+ * least able to afford it.
+ *
+ * What actually guards a second tap is the bridge: `POST /api/update` holds a lock and answers
+ * `update.in_progress`. The disabled button is a courtesy, so it may stay disabled for as long as
+ * the run takes; what it may NOT do is stay disabled and say nothing, which is what the second
+ * sentence below is for.
+ */
+const STARTED_SLOW_MS = 60_000;
+
 /** The freshest of the records this card can hold. `updatedAt` decides — the standby door and the
  *  front door are two readers of ONE file, so the newer reading is simply the newer reading. */
 function freshest(...runs: (UpdateRun | undefined)[]): UpdateRun | undefined {
@@ -116,6 +133,14 @@ export function UpdateCard() {
   const [standbyRun, setStandbyRun] = useState<UpdateRun | undefined>();
   const [confirming, setConfirming] = useState<Confirm | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * THE GAP THE SECOND TAP FITTED IN. `POST /api/update` answers before the detached updater has
+   * written anything, so for a beat there is no record at all: `running` was false, the button was
+   * live, and the band overhead already said "Starting update…". This is the card's own half of the
+   * band's (s), held HERE rather than read off `lib/update-ribbon`'s store — the card must go inert
+   * on its own tap, not because some other component happens to be mounted and to clear a flag.
+   */
+  const [started, setStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dismissed, setDismissed] = useState(false);
 
@@ -129,6 +154,10 @@ export function UpdateCard() {
   const run = freshest(standbyRun, snapshot?.run, check?.run);
   const runState = run?.state;
   const running = runState !== undefined && IN_FLIGHT.has(runState);
+  // Nothing on this card may be tapped while an update is being asked for, started, or driven.
+  // ONE reading, used by every control below, so a control cannot be forgotten in one of the three.
+  // `started` is the middle of those three and the one that was missing — see it below.
+  const moving = busy || started || running;
 
   // Whether this machine leads anybody. The roster answers it on every snapshot; the check's own
   // `pack` array answers it better, when the bridge is new enough to send one. Either is enough to
@@ -141,7 +170,24 @@ export function UpdateCard() {
   const hasPeers = rows.length > 0 || packLead;
   const behind = peersBehind(census, current);
   const rolledBack = peersRolledBack(legs);
-  const action = packAction({ releaseAvailable, hasPeers, behind, rolledBack });
+  // A packaged install never takes an update from here (ADR 0035): the root is not writable, the CLI
+  // refuses, and `POST /api/update` would do nothing but relay that refusal. Read HERE, above the
+  // action, because it is one of the facts that decides which action there is — not merely whether
+  // the button is greyed out.
+  const packageManaged = (snapshot?.installKind ?? check?.installKind) === "packaged";
+  // The command the HOST resolved for this machine's prefix. TWO levels, not three: the snapshot
+  // field since M17/02, then the preflight's own `package` check for a bridge older than that field.
+  // `check.packageCommand` is deliberately not a third — the snapshot and the check are the same
+  // `UpdateMonitor.status()` call, so a chain that read both would suggest they could disagree.
+  // The PHONE never derives the command: the prefix is on the host, and a second derivation here
+  // would be a second thing to drift.
+  const packageCommand = packageManaged
+    ? (snapshot?.packageCommand ?? check?.preflight?.checks.find((c) => c.id === PACKAGE_CHECK_ID)?.remedy ?? null)
+    : null;
+  // `leadCanTake: false` is what keeps the peers reachable from the phone. Without it the release
+  // short-circuit answered `update-pack`, the card disabled it, and a packaged lead with a peer a
+  // version behind was left with a disabled button and an explanation about its own install.
+  const action = packAction({ releaseAvailable, hasPeers, behind, rolledBack, leadCanTake: !packageManaged });
 
   const load = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -169,6 +215,27 @@ export function UpdateCard() {
   useEffect(() => {
     noteUpdateRun(runState);
   }, [runState]);
+
+  // (s) ends ONE way: the record speaks, and `running` takes the card from there. A POST that was
+  // accepted and then produced no record at all leaves the card inert — and that is the honest
+  // answer, because this card cannot tell that case apart from an update that is simply still
+  // building. The operator is not trapped: leaving `/settings/updates` unmounts this card, so
+  // coming back is the reset, and the bridge refuses a genuine second start on its own lock anyway.
+  useEffect(() => {
+    if (!started) return;
+    if (runState !== undefined && runState !== "idle") setStarted(false);
+  }, [started, runState]);
+
+  // The second sentence, on a timer that changes only WORDS. See {@link STARTED_SLOW_MS}.
+  const [startSlow, setStartSlow] = useState(false);
+  useEffect(() => {
+    if (!started) {
+      setStartSlow(false);
+      return;
+    }
+    const timer = setTimeout(() => setStartSlow(true), STARTED_SLOW_MS);
+    return () => clearTimeout(timer);
+  }, [started]);
 
   // The run poll. Only while a run is in flight, and it treats a failed front-door read as EXPECTED:
   // the bridge is restarting because that is what was asked for.
@@ -207,6 +274,7 @@ export function UpdateCard() {
       // immediately and hands off to a detached process, so the run record says nothing for a beat.
       // A silent band in that beat reads as "nothing happened" about the thing just consented to.
       noteUpdateStarted();
+      setStarted(true);
       setConfirming(null);
       if (answer.run !== null) setStandbyRun(answer.run);
       // Pull the snapshot now rather than waiting out the poll gap: the operator has just tapped,
@@ -217,6 +285,7 @@ export function UpdateCard() {
       // double tap lands here as `update.in_progress`, which is the idempotence being reported
       // rather than a second update being started.
       clearUpdateStarted(); // nothing was started, so the band must not say one was
+      setStarted(false);
       setError(describeThrownError(thrown));
       setConfirming(null);
     } finally {
@@ -234,9 +303,23 @@ export function UpdateCard() {
   }
 
   const redCheck = preflight?.checks.find((c) => c.verdict === "red");
-  const blocked = checked && (preflight === null || redCheck !== undefined);
+  // The buttons that move THIS machine are disabled for the same reason a red preflight disables
+  // them — the tap cannot succeed — but a packaged install is its own condition rather than a
+  // manufactured red, because NOTHING IS WRONG with it. Its preflight is green on purpose, and
+  // painting the card red would report a fault that does not exist.
+  const blocked = packageManaged || (checked && (preflight === null || redCheck !== undefined));
+  // A REAL red check wins over the package-managed sentence, not the other way round. A packaged
+  // install's own preflight is short and green BY DESIGN — but `doctor` and `service` still run on it
+  // (`cli/update-check.ts`'s packaged branch keeps both), and either can genuinely be red on a
+  // machine that also happens to be packaged. Checking packageManaged first would bury that fault
+  // under a sentence about a boundary that is working exactly as designed, on every visit, until the
+  // real problem is found some other way.
   const blockedReason =
-    redCheck !== undefined ? redCheck.reason : t("settings.updateCard.preflightUnavailable");
+    redCheck !== undefined
+      ? redCheck.reason
+      : packageManaged
+        ? t("settings.updateCard.packageManaged")
+        : t("settings.updateCard.preflightUnavailable");
 
   // Nothing to take: the running version already IS the newest, no major is waiting, and no run is
   // mid-flight. This is the state the operator sees on almost every visit, so it gets the loudest
@@ -285,39 +368,52 @@ export function UpdateCard() {
         </div>
       </div>
 
-      {run !== undefined && run.state !== "idle" && (
-        <RunSection
-          run={run}
-          // Retry re-opens the SAME confirm the first attempt went through. A dead end with no next
-          // action is what sends the operator to a terminal they may not have.
-          onRetry={() =>
-            setConfirming({
-              kind: "single",
-              version: run.to ?? latest ?? current,
-              major: false,
-              peersOnly: false,
-            })
-          }
-        />
-      )}
+      {/* EVERY ARRIVAL ON THIS CARD IS A `Collapse` (DESIGN.md §7, hard rule 1). The three sections
+          below are all async: the run record lands on a poll, and the peer lines and the preflight
+          land together when `GET /api/update/check` answers — which is a `doctor` and a `git`
+          away, so it is a second or two AFTER the card first paints. Mounted bare, each of them
+          teleported the action row down the screen while the operator's thumb was already on the
+          way to it. Wrapped, the row glides. */}
+      <Collapse open={run !== undefined && run.state !== "idle"}>
+        {run !== undefined && run.state !== "idle" ? (
+          <RunSection
+            run={run}
+            // Retry re-opens the SAME confirm the first attempt went through. A dead end with no next
+            // action is what sends the operator to a terminal they may not have.
+            onRetry={() =>
+              setConfirming({
+                kind: "single",
+                version: run.to ?? latest ?? current,
+                major: false,
+                peersOnly: false,
+              })
+            }
+          />
+        ) : null}
+      </Collapse>
 
       {/* The pack, as lines in this card. Drawn whether or not a run is in flight — a peer going
           quiet is exactly what the operator opened this page to see. On a solo install there is
           nothing here and the card grows no height at all. */}
-      {rows.length > 0 && <PeerSection rows={rows} />}
+      <Collapse open={rows.length > 0}>{rows.length > 0 ? <PeerSection rows={rows} /> : null}</Collapse>
 
-      {!running && (
-        <>
-          {preflight !== null && preflight.checks.length > 0 && (
-            <PreflightSection preflight={preflight} updateAvailable={updateAvailable} />
-          )}
+      {/* THE ACTION ROW STAYS PUT FOR THE WHOLE RUN. It used to unmount the moment a record
+          appeared, which is the same fault as the arrivals above wearing the opposite sign: the
+          card collapsed under the thumb at the one moment the operator was watching it. It is
+          DISABLED instead — `moving` covers the tap, the gap before the first record, and the run
+          itself, so there is no window in which the button can be pressed twice. */}
+      <Collapse open={preflight !== null && preflight.checks.length > 0}>
+        {preflight !== null && preflight.checks.length > 0 ? (
+          <PreflightSection preflight={preflight} updateAvailable={updateAvailable} />
+        ) : null}
+      </Collapse>
 
-          {confirming !== null ? (
+      {confirming !== null ? (
             <div className="border-t border-border p-4">
               <div className="text-sm font-medium">{confirmTitle(confirming)}</div>
-              <p className="mt-1 text-sm text-muted-foreground">{confirmBody(confirming)}</p>
+              <p className="mt-1 text-sm text-muted-foreground">{confirmBody(confirming, packageManaged)}</p>
               <div className="mt-3 flex items-center gap-2">
-                <Button size="sm" disabled={busy} onClick={() => void begin(confirming)}>
+                <Button size="sm" disabled={moving} onClick={() => void begin(confirming)}>
                   {busy && <Loader2 className="size-4 animate-spin" />}
                   {confirmAction(confirming)}
                 </Button>
@@ -333,10 +429,17 @@ export function UpdateCard() {
                   {/* THE action button. One of the three labels, never two of them, and the label
                       states what the tap will actually do: level this machine, level the pack, or
                       run the peers again once this machine is already current. */}
-                  {action !== "none" && (
+                  {/* On a packaged install the command REPLACES the button rather than greying it
+                      out: a disabled control is a thing to try again, and there is nothing here to
+                      try. "Retry pack update" survives, because levelling the peers is a different
+                      act that works fine from a lead that cannot move itself. */}
+                  {packageCommand !== null && (
+                    <code className="select-all rounded bg-muted px-2 py-1 font-mono text-xs">{packageCommand}</code>
+                  )}
+                  {action !== "none" && !(packageManaged && action !== "retry-pack") && (
                     <Button
                       size="sm"
-                      disabled={blocked && action !== "retry-pack"}
+                      disabled={moving || (blocked && action !== "retry-pack")}
                       onClick={() =>
                         setConfirming(
                           action === "retry-pack"
@@ -356,11 +459,11 @@ export function UpdateCard() {
                   {/* NOT a second update action: crossing a major is its own consent (ADR 0020),
                       the one thing the button above will never take. It appears only when a major
                       is actually waiting, which is rare, and it says "Cross", not "Update". */}
-                  {majorAvailable !== null && (
+                  {majorAvailable !== null && !packageManaged && (
                     <Button
                       variant="outline"
                       size="sm"
-                      disabled={blocked}
+                      disabled={moving || blocked}
                       onClick={() =>
                         setConfirming({
                           kind: "major",
@@ -377,15 +480,34 @@ export function UpdateCard() {
                       push — and there is nothing to snooze once this machine is already current, so
                       a retry-only state grows no ghost row. */}
                   {!dismissed && updateAvailable && (
-                    <Button variant="ghost" size="sm" onClick={() => void dismiss()}>
+                    <Button variant="ghost" size="sm" disabled={moving} onClick={() => void dismiss()}>
                       {t("settings.updateCard.dismiss")}
                     </Button>
                   )}
                 </div>
                 {/* The red's OWN reason, in place of a generic "unavailable" — a red preflight has to
-                    be legible without leaving the phone. */}
-                {blocked && action !== "retry-pack" && (
-                  <p className="text-xs text-status-blocked">{blockedReason}</p>
+                    be legible without leaving the phone.
+
+                    Printed even under a peers-only button, which is not disabled: the sentence says
+                    why THIS machine is not moving, and that is exactly the question a "Retry pack
+                    update" offered to a lead with a release waiting raises. Suppressing it there was
+                    how a packaged lead ended up with a button and no account of itself. */}
+                {/* NOT while the card is inert. The sentence explains why a tap would not
+                    succeed, and there is no tap to explain while one is already running — and
+                    during the restart gap the preflight read fails BECAUSE the bridge is down, so
+                    printing "the preflight couldn't be run" there draws the outage this card exists
+                    not to draw. */}
+                {blocked && !moving && <p className="text-xs text-status-blocked">{blockedReason}</p>}
+                {/* A DISABLED BUTTON MUST NOT BE SILENT. `running` has the run section above to
+                    narrate it; the gap before the first record had nothing, so the button simply
+                    went grey and stayed grey with no account of itself. */}
+                {started && (
+                  <p className="flex items-center gap-1.5 text-xs text-status-working">
+                    <Loader2 aria-hidden="true" className="size-3 shrink-0 animate-spin" />
+                    {startSlow
+                      ? t("settings.updateCard.startingSlow")
+                      : t("settings.updateCard.starting")}
+                  </p>
                 )}
                 {dismissed && <p className="text-xs text-muted-foreground">{t("settings.updateCard.dismissed")}</p>}
                 {majorAvailable !== null && (
@@ -396,13 +518,18 @@ export function UpdateCard() {
               </div>
             )
           )}
-        </>
-      )}
 
       {error !== null && <p className="border-t border-border px-4 py-2.5 text-xs text-status-blocked">{error}</p>}
     </Card>
   );
 }
+
+/**
+ * The `PreflightCheck.id` the CLI puts a packaged install's one line under — and the only place the
+ * phone reads a check by id. The KIND decides what the card does; this id only fetches the command
+ * that check already resolved, and its absence costs a command and nothing else.
+ */
+const PACKAGE_CHECK_ID = "package";
 
 /** The confirm's heading. Four asks, four sentences — a pack-wide run must not be consented to
  *  through the words written for one machine. */
@@ -413,10 +540,21 @@ function confirmTitle(ask: Confirm): string {
   return t("settings.updateCard.confirmTitle", { version: ask.version });
 }
 
-function confirmBody(ask: Confirm): string {
+/**
+ * The sentence under the title. `packageManaged` changes exactly one of them.
+ *
+ * The peers-only confirm normally reads "This machine is already current, so only the peers run" —
+ * true wherever that button used to appear, and FALSE on a packaged lead with a release waiting,
+ * which is the one place it can now appear as well. The reason that lead is sitting the run out is
+ * its install kind, not its version, so it says so instead. Neither sentence is new: a third one
+ * would be a seventh dictionary to keep in step with the other six for one branch.
+ */
+function confirmBody(ask: Confirm, packageManaged = false): string {
   if (ask.kind === "major") return t("settings.updateCard.majorConfirmBody", { version: ask.version });
   if (ask.kind === "pack") return t("settings.updateCard.packConfirmBody");
-  if (ask.kind === "retry") return t("settings.updateCard.retryConfirmBody");
+  if (ask.kind === "retry") {
+    return packageManaged ? t("settings.updateCard.packageManaged") : t("settings.updateCard.retryConfirmBody");
+  }
   return t("settings.updateCard.confirmBody");
 }
 

@@ -30,6 +30,8 @@ export const ja: Dictionary = {
   "settings.install.iosHint": "iOS または iPadOS では、ブラウザの共有メニューから「ホーム画面に追加」を選択します。",
   "settings.zen.title": "Zen モード",
   "settings.zen.description": "ペインメニューに、ターミナル以外のUI要素を非表示にする項目を追加します。",
+  "settings.zen.auto.label": "横向きで自動的に有効化",
+  "settings.zen.auto.hint": "本体を横向きにすると Zen モードが自動的に開き、縦に戻すと閉じます。",
 
   // --- settings.handsFree ---
   "settings.handsFree.title": "ハンズフリー音声入力",
@@ -45,6 +47,8 @@ export const ja: Dictionary = {
   "settings.push.reason.denied": "通知がブロックされています。ブラウザの設定で許可してください。",
   "settings.push.reason.unsupported": "使用中のブラウザはプッシュ通知に対応していません。",
   "settings.push.reason.default": "プッシュ通知を有効化できませんでした。",
+  "settings.push.reason.timeout": "通知の設定がタイムアウトしました。この端末がプッシュサービスに接続できることを確認して、もう一度お試しください。",
+  "settings.push.availability.unavailable": "通知の設定を確認できませんでした。接続を確認するか、再度ログインしてからお試しください。",
   "settings.push.availability.insecure":
     "HTTP 経由では利用できません。プッシュ通知には HTTPS 配信が必要です。",
   "settings.push.availability.serverOff":
@@ -137,6 +141,7 @@ export const ja: Dictionary = {
   "settings.update.error": "確認に失敗しました。",
   "settings.update.upToDate": "最新バージョンです",
   "settings.updateBanner.restart": "Bridgeの再起動が必要です",
+  "settings.updateBanner.restartNeeded": "ディスク上の Collie が置き換えられました。再起動してください。",
   "settings.updateBanner.releaseAvailable": "Collie {version} が利用可能です",
   "settings.updateBanner.majorAvailable": "Collie {version} (メジャーアップデート)",
   "settings.updateBanner.copyAria": "コマンドをコピー: {command}",
@@ -170,6 +175,9 @@ export const ja: Dictionary = {
   "settings.display.tapToType.label": "タップで入力開始",
   "settings.display.tapToType.hint":
     "有効時はターミナル領域のタップでキーボードが開きます。無効時はテキスト選択が優先され、キーボードは入力欄タップ時のみ開きます。",
+  "settings.display.fullReply.label": "最新の返答を全文表示",
+  "settings.display.fullReply.hint":
+    "エージェントのターミナルはスクロールバックを保持しないため、長い返答は冒頭が失われます。有効時はエージェント自身のログから全文を表示し、該当する行を置き換えます。",
   "settings.display.rawTerminal.label": "未加工ターミナル",
   "settings.display.rawTerminal.hint":
     "プロンプトボタンやステータス表示を除いた素の出力を表示します。ダイアログの表示崩れを手動で制御する際に使用します。",
@@ -207,7 +215,10 @@ export const ja: Dictionary = {
   "composer.mic.manualHint": "メッセージ入力欄に挿入されます",
   "composer.mic.stop": "停止",
   "composer.mic.discardAria": "録音を破棄",
-  "composer.attach.aria": "画像を添付",
+  "composer.attach.aria": "ファイルを添付",
+  "composer.attach.title": "添付",
+  "composer.attach.photos": "写真",
+  "composer.attach.files": "ファイル",
   "composer.send.typeAnyway": "強制的に入力しますか？",
   "composer.send.reallySend": "送信しますか？",
   "composer.send.stopTypingAria": "ターミナルへの入力を停止",
@@ -225,7 +236,9 @@ export const ja: Dictionary = {
   "composer.discard.confirmKeys.other": "もう一度タップすると待機中の{count}キーを破棄します",
   "composer.destructive.confirm": "破壊的操作: {reason}。確認のため送信を再タップしてください",
   "composer.destructive.confirmOnHost": "破壊的操作: {host}上の{reason}。確認のため送信を再タップしてください",
-  "composer.upload.success": "画像を追加しました。パスを入力欄に挿入しました",
+  "composer.upload.success": "ファイルを追加しました（パスを挿入）",
+  "composer.upload.tooLarge": "上限の {max} MB を超えています。",
+  "composer.upload.badType": "{name} は添付できません。",
   "composer.noEcho.title": "パスワード入力プロンプト: エコーバック無効",
   "composer.noEcho.noLiveTyped":
     "入力内容はペインに存在しますが未送信です。このビューはライブではないため送信できません。ターミナルで直接操作してください。",
@@ -266,6 +279,9 @@ export const ja: Dictionary = {
   "chat.scrollback.loading": "読み込み中…",
   "chat.scrollback.noSessionReported":
     "{agent} のセッションが Herdr に報告されていません。Herdr 連携をインストールまたは更新し、このペインでエージェントを再起動してください。",
+  "chat.fullReply.title": "返答の全文",
+  "chat.fullReply.fromTranscript": "ログより",
+  "chat.fullReply.showingTerminal": "ターミナルを表示中",
   "chat.output.empty": "(直近の出力なし)",
   "chat.switcher.aria": "ペインを切り替え",
   "chat.switcher.title": "ペインを切り替え",
@@ -376,6 +392,11 @@ export const ja: Dictionary = {
   "status.count.working.other": "{count}件が処理中です",
   "status.shellBadge": "シェル",
   "status.dismissAria": "閉じる",
+  "status.detailAria": "メッセージ全体を表示",
+  "status.detail.title": "エラー詳細",
+  "status.detail.copy": "コピー",
+  "status.detail.copied": "コピー完了",
+  "status.detail.dismiss": "閉じる",
 
   // --- space (spaces overview/strip/view, tabs, panes, new-space) ---
   "space.overview.title": "Space",
@@ -691,10 +712,10 @@ export const ja: Dictionary = {
   "apiError.launch.not_allowlisted": "そのコマンドはランチャーに登録されていません",
   "apiError.launch.pane_unknown": "そのペインは見つかりません。何も起動されませんでした",
   "apiError.workspace.create_failed": "スペースの作成に失敗しました: {reason}",
-  "apiError.upload.too_large": "画像サイズが上限の 10 MB を超えています。",
+  "apiError.upload.too_large": "ファイルが大きすぎます。上限は {maxMb} MB です。",
   "apiError.upload.no_file": "ファイルが指定されていません。",
   "apiError.upload.bad_type": "未対応のファイル形式です: {type}",
-  "apiError.upload.write_failed": "ホストへの画像保存に失敗しました: {reason}",
+  "apiError.upload.write_failed": "ホストに保存できませんでした: {reason}",
   "apiError.stt.unconfigured": "この collie では音声入力が設定されていません。",
   "apiError.stt.too_large": "録音時間が上限を超えています。短く録音してください。",
   "apiError.stt.bad_format":
@@ -749,6 +770,7 @@ export const ja: Dictionary = {
   "apiError.update.major_confirm_required": "{version} はメジャー更新です。個別の確認が必要です。",
   "apiError.update.target_mismatch": "画面上の対象は {asked} ですが、この collie にインストールされるのは {would} です。再読み込みして確認してください。",
   "apiError.update.none_available": "利用可能な新しいリリースはありません。",
+  "apiError.update.packaged": "更新はパッケージマネージャーから行われます。Collie はこのインストールのファイルを置換しません。",
   "apiError.update.start_failed": "更新を開始できませんでした: {reason}",
   // --- settings.updateCard (the update card, M15/05) ---
   "settings.updateCard.title": "Collie を更新",
@@ -770,6 +792,7 @@ export const ja: Dictionary = {
   "settings.updateCard.summary.amber.one": "黄 {count}件",
   "settings.updateCard.summary.amber.other": "黄 {count}件",
   "settings.updateCard.preflightUnavailable": "このマシンでは事前チェックを実行できませんでした。",
+  "settings.updateCard.packageManaged": "このインストールはパッケージマネージャーが更新します。Collie はここからは更新しません。",
   "settings.updateCard.remedy": "対処法: {command}",
   "settings.updateCard.confirmTitle": "{version} に更新しますか？",
   "settings.updateCard.confirmBody": "端末セッションは維持されます。スマホ画面は最大 30 秒間切断されます。",
@@ -779,6 +802,7 @@ export const ja: Dictionary = {
   "settings.updateCard.majorConfirmAction": "{version} にメジャー更新する",
   "settings.updateCard.cancel": "キャンセル",
   "settings.updateCard.starting": "開始中…",
+  "settings.updateCard.startingSlow": "Still starting. The host has not reported the run yet.",
   "settings.updateCard.state.preflight": "このマシンを確認中…",
   "settings.updateCard.state.staging": "{version} をステージング中…",
   "settings.updateCard.state.restarting": "再起動中。停止障害ではありません。",
@@ -820,6 +844,7 @@ export const ja: Dictionary = {
   "settings.updateCard.peer.state.verifying": "検証中",
   "settings.updateCard.peer.state.done": "更新済み",
   "settings.updateCard.peer.state.rolledBack": "ロールバック済み",
+  "settings.updateCard.peer.state.packageManaged": "パッケージマネージャーを待機中",
   "settings.updateCard.peer.state.stuck": "停止",
   "settings.updateCard.peer.state.interrupted": "中断",
   "settings.updateCard.peer.state.idle": "待機中",
@@ -839,8 +864,13 @@ export const ja: Dictionary = {
   "updateRibbon.updated": "{version} に更新完了。タップして再読み込み。",
   "updateRibbon.peers.one": "{count}台のピアを更新中: {names}",
   "updateRibbon.peers.other": "{count}台のピアを更新中: {names}",
+  "updateRibbon.packageManaged.one": "{names} はパッケージマネージャー待ち",
+  "updateRibbon.packageManaged.other": "{names} はパッケージマネージャー待ち",
   "updateRibbon.peerRolledBack": "{name} がロールバック: {reason}。",
   "updateRibbon.seeUpdates": "更新画面を確認。",
   "updateRibbon.available": "Collie {version} を利用可能。タップして更新。",
+  "updateRibbon.availablePackaged": "Collie {version}（{manager}）が利用可能。",
+  "updateRibbon.availablePackagedUnnamed": "Collie {version} が利用可能。",
   "updateRibbon.dismiss": "このバージョンを非表示",
+  "updateRibbon.hideNotice": "この通知を非表示",
 };

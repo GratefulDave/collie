@@ -25,6 +25,7 @@ import {
   parsePairRequest,
   parseSnoozeRequest,
   replyPane,
+  requestBodyCap,
   requestDevice,
   resolveStaticPath,
   sendReplySteps,
@@ -61,6 +62,8 @@ import {
 import { neverProxy } from "./pack/fixtures.ts";
 import { PackLead } from "./pack/lead.ts";
 import { PackRegistry } from "./pack/registry.ts";
+import { DEFAULT_MAX_UPLOAD_BYTES } from "./uploads.ts";
+import { MAX_STT_AUDIO_BYTES } from "./stt/http.ts";
 import { computeEtag } from "./http-cache.ts";
 import {
   MUX_LOGO_PATH,
@@ -80,6 +83,23 @@ import type { StateEngine } from "./state-engine.ts";
 function req(headers: Record<string, string>): Request {
   return new Request("http://collie.invalid/api/snapshot", { headers });
 }
+
+describe("requestBodyCap", () => {
+  test("is the upload cap plus headroom at the default", () => {
+    expect(requestBodyCap(cfg())).toBe(DEFAULT_MAX_UPLOAD_BYTES + 2 * 1024 * 1024);
+  });
+
+  test("never drops below what /api/stt reads, so a small upload cap cannot mute the microphone", () => {
+    // The floor `COLLIE_MAX_UPLOAD_MB=1` would otherwise stop the runtime at 3 MB, and a voice note
+    // between 3 and 8 MB would die there instead of getting the handler's own `stt.too_large`.
+    const cap = requestBodyCap(cfg({ maxUploadBytes: 1024 * 1024 }));
+    expect(cap).toBeGreaterThan(MAX_STT_AUDIO_BYTES);
+  });
+
+  test("follows the operator's number up when it is the larger of the two", () => {
+    expect(requestBodyCap(cfg({ maxUploadBytes: 64 * 1024 * 1024 }))).toBe(64 * 1024 * 1024 + 2 * 1024 * 1024);
+  });
+});
 
 function cfg(overrides: Partial<Config> = {}): Config {
   return {
@@ -127,6 +147,8 @@ function cfg(overrides: Partial<Config> = {}): Config {
     stateDir: "/tmp/state",
     multiSession: true,
     skipServe: false,
+    maxUploadBytes: DEFAULT_MAX_UPLOAD_BYTES,
+    uploadExtraTypes: [],
     ...overrides,
   };
 }
@@ -1616,11 +1638,13 @@ function leadOverDeadPeer(): PackLead {
     ],
   });
   return new PackLead({
+    log: () => {},
     registry,
     // Every dial fails, exactly as `PeerClient` reports a peer that is off: a value, not a throw.
     snapshot: async () => ({ ok: false, state: "unreachable", reason: "connection refused", receivedAt: 1 }),
     proxy: neverProxy,
     self: { id: "desk", name: "the herd" },
+    maxUploadBytes: DEFAULT_MAX_UPLOAD_BYTES,
   });
 }
 
@@ -1912,6 +1936,32 @@ describe("the update write gate — POST api/update rides the pane path's own ga
     // One confirm covers the pack, so one verdict covers the pack — and it is the SAME rows the
     // card showed, from the same bank, decided by the one merge function in `update-action.ts`.
     expect(handler).toContain("pack: opts.packLead?.updateRows() ?? []");
+  });
+
+  test("the band's dismiss carries a scope, and the monitor decides what it costs", () => {
+    const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+    const at = src.indexOf('if (pathname === "/api/update/dismiss" && req.method === "POST")');
+    expect(at).toBeGreaterThan(0);
+    const handler = src.slice(at, src.indexOf("\n      }\n", at));
+    // Read-level, exactly like the snooze beside it — declining a notification about your own
+    // machine is not terminal-driving.
+    expect(handler).toContain('guard(req, cfg, "read", pairing)');
+    // One call, and the monitor is what decides whether the digest is snoozed with it. If the route
+    // ever spells that itself, the rule can be edited apart from the record it belongs to.
+    expect(handler).toContain('await updateMonitor.dismiss(version, asked ?? "offer")');
+    expect(handler).not.toContain("snoozeDigest");
+    // WHICH band, because they are two decisions. An absent scope reads as the offer, which is what
+    // every client before the pack states could close.
+    expect(handler).toContain('asked !== "offer" && asked !== "pack"');
+    expect(handler).toContain('text("bad scope", 400)');
+    // A version, checked before anything is written: the band is keyed by version, so an empty one
+    // would dismiss nothing and pin the store to a fact that is not one.
+    expect(handler).toContain('typeof version !== "string"');
+    expect(handler).toContain("400");
+    // It answers the same object the snooze does, so the tab that tapped is already up to date.
+    expect(handler).toContain("updateMonitor.status()");
+    // And it starts nothing: closing a band is not an update.
+    expect(handler).not.toContain("action.start");
   });
 
   test("update status: the run record reaches the phone through the status the card already polls", () => {

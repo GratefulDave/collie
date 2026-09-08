@@ -1,4 +1,9 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { loadConfig } from "./config.ts";
 
 import {
   type ApiTag,
@@ -15,12 +20,14 @@ import {
   parseReleaseManifest,
   parseSemverTag,
   parseTagsResponse,
+  restartCommandFor,
   shouldNotify,
   stampOf,
   updateDigestBody,
   updatesNewerThan,
   UpdateMonitor,
   type UpdateMonitorDeps,
+  UpdateStateStore,
   type UpdateStore,
 } from "./update.ts";
 
@@ -290,21 +297,44 @@ describe("stampOf", () => {
 function fakeStore(
   initial: string | null = null,
   pushedAt: string | null = null,
-): UpdateStore & { saved: string[]; pushes: string[] } {
+): UpdateStore & { saved: string[]; pushes: string[]; closed: string[]; writes: number } {
   let last = initial;
   let stamp = pushedAt;
+  let dismissed: string | null = null;
+  let dismissedPack: string | null = null;
   const saved: string[] = [];
   const pushes: string[] = [];
+  const closed: string[] = [];
+  const counter = { writes: 0 };
   return {
     saved,
     pushes,
+    closed,
+    get writes() {
+      return counter.writes;
+    },
     lastNotified: () => last,
     lastPushedAt: () => stamp,
     setLastNotified: async (v, at) => {
+      counter.writes += 1;
       last = v;
       stamp = at;
       saved.push(v);
       pushes.push(at);
+    },
+    dismissedVersion: () => dismissed,
+    dismissedPackVersion: () => dismissedPack,
+    setDismissed: async (scope, v, notified) => {
+      counter.writes += 1;
+      if (scope === "offer") dismissed = v;
+      else dismissedPack = v;
+      closed.push(`${scope}:${v}`);
+      if (notified !== undefined) {
+        last = notified.version;
+        stamp = notified.pushedAt;
+        saved.push(notified.version);
+        pushes.push(notified.pushedAt);
+      }
     },
   };
 }
@@ -327,9 +357,94 @@ describe("the update run record on the snapshot", () => {
     expect(monitor.status().run).toEqual(run);
   });
 
+  it("names the package command only where the host resolved one", () => {
+    // Assigned, never spread as `undefined`: an install with none must carry NO key. The phone's
+    // fallback to the preflight remedy depends on the difference between absent and empty.
+    expect("packageCommand" in makeMonitor().monitor.status()).toBe(false);
+    const packaged = makeMonitor({ installKind: "packaged", packageCommand: "sudo pacman -Syu collie-bin" });
+    expect(packaged.monitor.status().packageCommand).toBe("sudo pacman -Syu collie-bin");
+  });
+
   it("an install that has never updated carries no run key at all", () => {
     const { monitor } = makeMonitor();
     expect("run" in monitor.status()).toBe(false);
+  });
+});
+
+describe("restart needed — the files moved under a running process", () => {
+  it("is quiet while disk still names the version this process runs", () => {
+    const status = makeMonitor().monitor.status();
+    expect(status.restartNeeded).toBe(false);
+    // Nothing to restart, nothing to name: the command key is absent, not empty.
+    expect("restartCommand" in status).toBe(false);
+  });
+
+  it("is raised the moment a live read disagrees with the version captured at boot", () => {
+    // Exactly what `pacman -Syu` does: the files become 1.6.0 while this process is still 1.5.0.
+    let onDisk = "1.5.0";
+    const { monitor, tick } = makeMonitor({
+      current: "1.5.0",
+      bootVersion: "1.5.0",
+      liveVersion: () => onDisk,
+    });
+    expect(monitor.status().restartNeeded).toBe(false);
+    onDisk = "1.6.0";
+    tick(10_000); // past the throttle the read shares with `bridgeStale`
+    expect(monitor.status().restartNeeded).toBe(true);
+
+    // Not latched: a package manager that puts the old files back leaves a process that matches disk
+    // again, and asking for a restart nobody needs is worse than saying nothing.
+    onDisk = "1.5.0";
+    tick(10_000);
+    expect(monitor.status().restartNeeded).toBe(false);
+  });
+
+  it("is raised when the EXECUTABLE moved and no version string did — the same-version rebuild", () => {
+    // `pacman -U` of a new pkgrel: the files on disk still name 1.5.0, the process still runs 1.5.0,
+    // and the binary behind it is a different file. Version-only detection is blind to this.
+    let replaced = false;
+    const { monitor, tick } = makeMonitor({
+      current: "1.5.0",
+      installKind: "packaged",
+      bootVersion: "1.5.0",
+      liveVersion: () => "1.5.0",
+      exeReplaced: () => replaced,
+    });
+    expect(monitor.status().restartNeeded).toBe(false);
+    replaced = true;
+    tick(10_000); // the same throttle the version read is behind
+    const status = monitor.status();
+    expect(status.restartNeeded).toBe(true);
+    expect(status.restartCommand).toBe("collie restart");
+
+    // Not latched, exactly as the version half is not.
+    replaced = false;
+    tick(10_000);
+    expect(monitor.status().restartNeeded).toBe(false);
+  });
+
+  it("restart command for the install kind, never a hard-coded string", () => {
+    // Two spellings, and the kind is the whole of what picks one (M14/01 §5.3).
+    expect(restartCommandFor("detached-checkout", null)).toBe("herdr plugin action invoke restart --plugin herdr.collie");
+    // A named instance is registered with Herdr under its own suffixed plugin id, and the bare id is
+    // the host's FIRST Collie — so printing it would restart a service this one does not own.
+    expect(restartCommandFor("detached-checkout", "next")).toBe(
+      "herdr plugin action invoke restart --plugin herdr.collie-next",
+    );
+    // A PACKAGED install takes the `collie` verb like any other non-Herdr kind. Our package ships no
+    // unit file at all — `collie start` writes the operator's own `--user` unit — so the system-unit
+    // spelling would name a unit that does not exist and ask for a password to restart it.
+    for (const kind of ["packaged", "linked-clone", "binary", "unknown"] as const) {
+      expect(restartCommandFor(kind, "next")).toBe("collie restart");
+    }
+    expect(restartCommandFor("packaged", null)).not.toContain("sudo");
+
+    // And the snapshot names the one this machine takes, off the same function.
+    const swapped = { bootVersion: "1.5.0", liveVersion: () => "1.6.0" };
+    for (const kind of ["packaged", "detached-checkout", "binary"] as const) {
+      const status = makeMonitor({ installKind: kind, ...swapped }).monitor.status();
+      expect(status.restartCommand).toBe(restartCommandFor(kind, null));
+    }
   });
 });
 
@@ -347,6 +462,12 @@ function makeMonitor(over: Partial<UpdateMonitorDeps> = {}) {
     repo: "AltanS/collie",
     current: "0.11.0",
     installKind: "detached-checkout",
+    instance: null,
+    packageCommand: null,
+    bootVersion: "0.11.0",
+    liveVersion: () => "0.11.0",
+    // The executable is where it was unless a case moves it — the ordinary machine.
+    exeReplaced: () => false,
     startupStamp: "STAMP@boot",
     fetchTags: async () => apiTags("v0.12.0"),
     bridgeStamp: () => "STAMP@boot",
@@ -471,6 +592,9 @@ describe("UpdateMonitor", () => {
     const wrapped: UpdateStore = {
       lastNotified: store.lastNotified,
       lastPushedAt: store.lastPushedAt,
+      dismissedVersion: store.dismissedVersion,
+      dismissedPackVersion: store.dismissedPackVersion,
+      setDismissed: store.setDismissed,
       setLastNotified: async (v, at) => {
         order.push(`persist:${v}`);
         await store.setLastNotified(v, at);
@@ -676,5 +800,108 @@ describe("parseReleaseManifest", () => {
     expect(v.ok).toBe(true);
     if (!v.ok) return;
     expect(v.manifest.artifacts).toHaveLength(1);
+  });
+});
+
+// ── The band's dismissal (M17/08) ─────────────────────────────────────────────
+//
+// A dismissal is a decision about THIS MACHINE's update, so it is kept here rather than in one
+// browser's storage — and it is one act, not two: the version is recorded and the digest is snoozed
+// in the same call, because closing the band and then being pushed the same version tomorrow is the
+// app arguing with a decision already made.
+
+const dismissDirs: string[] = [];
+async function tempCfg() {
+  const stateDir = await mkdtemp(join(tmpdir(), "collie-update-dismiss-"));
+  dismissDirs.push(stateDir);
+  return { ...loadConfig(), stateDir };
+}
+
+afterAll(async () => {
+  await Promise.all(dismissDirs.map((d) => rm(d, { recursive: true, force: true })));
+});
+
+describe("the dismissed version", () => {
+  it("round-trips both scopes through the store, in one file beside the push record", async () => {
+    const cfg = await tempCfg();
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedVersion()).toBeNull(); // nothing saved yet reads as nothing dismissed
+    expect(store.dismissedPackVersion()).toBeNull();
+
+    await store.setDismissed("offer", "1.6.0", { version: "1.6.0", pushedAt: "2026-09-07T09:00:00.000Z" });
+    await store.setDismissed("pack", "1.5.0");
+
+    const reloaded = new UpdateStateStore(cfg);
+    await reloaded.load();
+    expect(reloaded.dismissedVersion()).toBe("1.6.0");
+    // Two decisions, two fields: the pack notice was put down at a DIFFERENT version and neither
+    // overwrote the other.
+    expect(reloaded.dismissedPackVersion()).toBe("1.5.0");
+    // The offer's dismissal folded the snooze into the same write — a crash between two writes
+    // cannot leave a band closed with the push still armed for it.
+    expect(reloaded.lastNotified()).toBe("1.6.0");
+    expect(reloaded.lastPushedAt()).toBe("2026-09-07T09:00:00.000Z");
+  });
+
+  it("reads a record that carries neither key as nothing dismissed", async () => {
+    const cfg = await tempCfg();
+    await Bun.write(
+      join(cfg.stateDir, "update-state.json"),
+      JSON.stringify({ lastNotified: "1.5.0", lastPushedAt: "2026-09-06T09:00:00.000Z" }),
+    );
+    const store = new UpdateStateStore(cfg);
+    await store.load();
+    expect(store.dismissedVersion()).toBeNull();
+    expect(store.dismissedPackVersion()).toBeNull();
+    expect(store.lastNotified()).toBe("1.5.0"); // and the record beside them is still believed
+  });
+
+  it("a dismissed offer for the release upstream names also snoozes the digest, in one write", async () => {
+    const { monitor, store } = makeMonitor();
+    await monitor.checkRelease();
+    expect(store.saved).toEqual(["0.12.0"]); // the first push announced it
+    const before = store.writes;
+
+    await monitor.dismiss("0.12.0");
+    expect(store.closed).toEqual(["offer:0.12.0"]);
+    expect(store.lastNotified()).toBe("0.12.0");
+    expect(store.writes - before).toBe(1); // one act, one write
+    expect(monitor.status().dismissedVersion).toBe("0.12.0");
+  });
+
+  it("a dismiss with scope pack hides a notice and leaves lastNotified alone", async () => {
+    const { monitor, store } = makeMonitor();
+    await monitor.checkRelease();
+    const notified = store.lastNotified();
+
+    await monitor.dismiss("0.12.0", "pack");
+    expect(store.closed).toEqual(["pack:0.12.0"]);
+    // The push is about THIS machine; the notice was about another one. Hiding it silences nothing.
+    expect(store.lastNotified()).toBe(notified);
+    expect(monitor.status().dismissedPackVersion).toBe("0.12.0");
+    expect(monitor.status().dismissedVersion).toBeNull(); // and the offer is untouched
+  });
+
+  it("a dismissed offer for a version that is not latest leaves lastNotified alone", async () => {
+    const { monitor, store } = makeMonitor();
+    await monitor.checkRelease();
+    const notified = store.lastNotified();
+
+    // Closing a band about 0.11.9 says nothing about the 0.12.0 the digest would push, and moving
+    // the record there would swallow the version upstream is actually naming.
+    await monitor.dismiss("0.11.9");
+    expect(monitor.status().dismissedVersion).toBe("0.11.9");
+    expect(store.lastNotified()).toBe(notified);
+  });
+
+  it("a dismiss is not a mute — a newer release is a different version and raises the band", async () => {
+    const { monitor } = makeMonitor();
+    await monitor.checkRelease();
+    await monitor.dismiss("0.12.0");
+    expect(monitor.status()).toMatchObject({ latest: "0.12.0", dismissedVersion: "0.12.0" });
+    // The snapshot keeps saying a release is available; only the BAND reads the two together, and it
+    // reads them as different facts the moment upstream moves on.
+    expect(monitor.status().releaseAvailable).toBe(true);
   });
 });

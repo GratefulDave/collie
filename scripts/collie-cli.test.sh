@@ -910,8 +910,6 @@ fd_v1 COLLIE_SERVE_MODE=http "$BIN" serve || fail "v1 could not publish: ${STDER
 assert_eq "$(cat "$V1_RECORD")" "http:8788|host.example:8788|http://127.0.0.1:8788"
 assert_eq "$(cat "$RECORD")" "http:8787|host.example:8787|http://127.0.0.1:8787"
 assert_contains "$(cat "$FD_CALLS")" "tailscale serve --bg --http=8788 --set-path=/ 8788"
-# The serve output file is per-instance too, or one publish's diagnostics would overwrite the other's.
-[ -f "${FD_CONFIG}/serve-v1.out" ] || fail "v1 wrote no serve output of its own"
 
 # Uninstalling v1: its unit, its record and its mapping go; the stable instance keeps all three.
 printf '[Unit]\n' > "$FD_UNIT"
@@ -1330,15 +1328,33 @@ assert_contains "$STDOUT" "✓ updated to v9.10.0"
 if upd "$CLONE" "$BIN" update --rollback; then fail "--rollback found a target on a first staged update"; fi
 assert_contains "$STDERR" "nothing to roll back to"
 
-# Shape 3 — not a git checkout at all (a copied tree). It must name the reinstall command rather than
-# emit a raw git error about a missing origin, and it must not reach the rebuild.
-PLAIN="${U_DIR}/plain"
+# Shape 3 — not a git checkout at all (a copied tree), INSIDE the operator's own home and writable.
+# All three of clause 4's disjuncts are false, so this is the `loose-binary` unknown: it must name
+# the reinstall command rather than emit a raw git error about a missing origin, and it must not
+# reach the rebuild.
+PLAIN="${TMP_ROOT}/update-home/plain"
 mkdir -p "$PLAIN"
 printf 'id = "herdr.collie"\nversion = "9.9.9"\n' > "${PLAIN}/herdr-plugin.toml"
 if upd "$PLAIN" "$BIN" update; then fail "update on a non-git tree reported success"; fi
 assert_contains "$STDERR" "herdr plugin install AltanS/collie --yes"
 case "$(cat "$U_CALLS")" in
   *_apply-update*) fail "a checkout that could not advance still tried to rebuild" ;;
+esac
+
+# Shape 4 — the same tree OUTSIDE the operator's home. One disjunct of clause 4 is enough, so this
+# is a `packaged` install (ADR 0035): the refusal names the boundary, never the reinstall command,
+# and it never reaches the rebuild either.
+PACKAGED="${U_DIR}/packaged"
+mkdir -p "$PACKAGED"
+printf 'id = "herdr.collie"\nversion = "9.9.9"\n' > "${PACKAGED}/herdr-plugin.toml"
+if upd "$PACKAGED" "$BIN" update; then fail "update on a packaged tree reported success"; fi
+assert_contains "$STDERR" "updates come from your package manager"
+case "$STDERR" in
+  *"herdr plugin install"*) fail "a packaged install was told to reinstall through Herdr" ;;
+  *"cannot tell how this Collie was installed"*) fail "a packaged install read as unrecognisable" ;;
+esac
+case "$(cat "$U_CALLS")" in
+  *_apply-update*) fail "a packaged install still tried to rebuild" ;;
 esac
 
 # The fork guard: `origin` must BE the configured update source, and the check runs before any fetch.

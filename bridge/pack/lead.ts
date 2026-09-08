@@ -110,6 +110,11 @@ export function dueForProbe(memory: PeerMemory | undefined, now: number): boolea
 export interface PackLeadDeps {
   readonly registry: PackRegistry;
   /**
+   * `cfg.maxUploadBytes` — this lead's own attachment cap, forwarded into every §13 pre-check.
+   * Per host, so a member on a different `COLLIE_MAX_UPLOAD_MB` is legal and answers for itself.
+   */
+  readonly maxUploadBytes: number;
+  /**
    * `(link) => the peer's /pack/v1/snapshot outcome`. Injected so the sweep is testable without TLS.
    *
    * `freshPreflight` is §19's one header reaching through: the phone's own on-demand read asks every
@@ -177,6 +182,15 @@ export interface PackLeadDeps {
    */
   readonly pairing?: PairingDistribution;
   readonly now?: () => number;
+  /**
+   * Where a `[pack]` line goes. Defaults to `console.log`, which is the bridge's journal.
+   *
+   * Injected for the reason `snapshot` is: a test asserts the sentence rather than the side effect,
+   * and a suite that exercises a hundred sweeps stays silent. It changes nothing about the sweep —
+   * every line below is emitted on a state CHANGE, so a member that keeps saying the same thing
+   * costs one line ever, not one per tick.
+   */
+  readonly log?: (line: string) => void;
 }
 
 /**
@@ -263,6 +277,12 @@ export interface WarrantDistribution {
  */
 export class PackLead {
   private readonly memory = new Map<string, PeerMemory>();
+  /**
+   * The state each member's last journal line named. A line is written when this string changes and
+   * never otherwise, so the sweep's 1.5 s cadence cannot turn a down peer into a stream.
+   */
+  private readonly loggedState = new Map<string, string>();
+  private readonly log: (line: string) => void;
   private readonly now: () => number;
   private sweeping = false;
   /** Members with a verdict probe in flight. At most one per member, ever — see {@link probe}. */
@@ -274,6 +294,7 @@ export class PackLead {
 
   constructor(private readonly deps: PackLeadDeps) {
     this.now = deps.now ?? Date.now;
+    this.log = deps.log ?? ((line) => console.log(line));
   }
 
   /**
@@ -295,6 +316,7 @@ export class PackLead {
       // stale row — the registry's contract, and its body goes with it.
       for (const id of this.deps.registry.prune()) {
         this.memory.delete(id);
+        this.loggedState.delete(id);
         this.deps.onPeerGone?.(id);
       }
 
@@ -349,6 +371,7 @@ export class PackLead {
         const previous = this.memory.get(memberId);
         const next = foldPeerMemory(previous, outcome, this.now());
         this.memory.set(memberId, next);
+        this.logVerdict(memberId, outcome, previous, next);
         // Identity, not equality: `parsePeerSnapshot` mints a fresh object on every success and the
         // fold RETAINS the old one on every failure, so `!==` is exactly "this poll produced a body".
         // An unchanged peer still yields a new object each poll — a diff of nothing, which is what
@@ -365,7 +388,7 @@ export class PackLead {
         const members = due.map((link): TurnMember => {
           const outcome = outcomes.get(link.memberId);
           const state = this.deps.registry.state(link.memberId);
-          return {
+          const turnMember: TurnMember = {
             memberId: link.memberId,
             enrolledAt: follow.enrolledAt(link.memberId),
             version: state.version,
@@ -375,6 +398,11 @@ export class PackLead {
             // construction, the same cast and the same reason as `parsePeerPreflight`'s above.
             run: outcome?.ok === true ? parsePeerRun(outcome.value as JsonValue) : null,
           };
+          // §19's field, banked with the rest of that member's own report. Assigned only when the
+          // member named a kind: absent is what "this member named no kind" has to look like, and
+          // absent counts as not packaged.
+          const kind = state.preflight?.installKind;
+          return kind === undefined ? turnMember : { ...turnMember, installKind: kind };
         });
         if (follow.turns.observe(members, this.now()).released) this.resweep();
       }
@@ -393,6 +421,50 @@ export class PackLead {
     } finally {
       this.sweeping = false;
     }
+  }
+
+  /**
+   * Name one member's verdict in the journal, **once per transition**.
+   *
+   * The 2026-09-07 drill is the whole argument: a run sat on the incompatible ladder for fifteen
+   * minutes and the journal held not one line about it, so the cause had to be inferred from the
+   * arithmetic. The key is the state the line named, so a member repeating itself writes nothing and
+   * an advance of the backoff writes exactly one line.
+   */
+  private logVerdict(
+    memberId: string,
+    outcome: PeerOutcome<unknown>,
+    previous: PeerMemory | undefined,
+    next: PeerMemory,
+  ): void {
+    // The runs count is part of the key: each step of the ladder is its own transition, and the
+    // operator needs the step it reached, not just that it is on one.
+    const key = outcome.ok
+      ? "ok"
+      : outcome.state === "incompatible"
+        ? `incompatible:${next.incompatibleRuns}`
+        : outcome.state;
+    if (this.loggedState.get(memberId) === key) return;
+    const first = this.loggedState.get(memberId) === undefined;
+    this.loggedState.set(memberId, key);
+    if (outcome.ok) {
+      // A member's first answer is not a recovery, so it says nothing — the pack page already
+      // renders a healthy peer, and a line per member per boot would be noise.
+      if (first) return;
+      const runs = previous?.incompatibleRuns ?? 0;
+      this.log(
+        runs > 0
+          ? `[pack] ${memberId}: reachable again after ${runs} incompatible verdict(s)`
+          : `[pack] ${memberId}: reachable again`,
+      );
+      return;
+    }
+    if (outcome.state === "incompatible") {
+      const seconds = Math.round(incompatibleBackoffMs(next.incompatibleRuns) / 1000);
+      this.log(`[pack] ${memberId}: incompatible (${outcome.reason}), next dial in ${seconds}s`);
+      return;
+    }
+    this.log(`[pack] ${memberId}: ${outcome.state} (${outcome.reason})`);
   }
 
   /**
@@ -611,6 +683,8 @@ export class PackLead {
       link: resolved.link,
       state: resolved.state,
       transport: this.deps.proxy,
+      // This lead's own cap, for §13's refuse-before-forward. The peer enforces its own on arrival.
+      maxUploadBytes: this.deps.maxUploadBytes,
       // Every landed forward refreshes this member's receipt, so a watched peer's freshness tracks
       // the phone's cadence rather than the sweep's idle one. The registry owns the rules (successes
       // only, reachable members only, monotone) — this class just supplies the member id.

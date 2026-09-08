@@ -53,6 +53,23 @@ const GREEN_SIX: PreflightReport = {
   ],
 };
 
+/** What a packaged install's own preflight looks like: short, green, and naming its command. */
+const PACKAGED: PreflightReport = {
+  schema: 1,
+  verdict: "green",
+  checks: [
+    { id: "doctor", verdict: "green", reason: "doctor reports no issues" },
+    {
+      id: "package",
+      verdict: "green",
+      reason: "updates come from your package manager",
+      remedy: "sudo pacman -Syu collie-bin",
+    },
+    { id: "upstream", verdict: "green", reason: "upstream is reachable" },
+    { id: "service", verdict: "green", reason: "collie.service is present" },
+  ],
+};
+
 /** Green overall, but one check inside it is red — the case a folded card must still surface. */
 const GREEN_WITH_ONE_RED: PreflightReport = {
   schema: 1,
@@ -647,11 +664,275 @@ describe("restarting gap is not an outage", () => {
   it("self-update hold: the bundle reload is held for the length of the run", async () => {
     const view = renderCard(info({ run: runAt("restarting") }));
     await screen.findByText("Restarting. This is not an outage.");
-    expect(isReloadHeld()).toBe(true);
+    // The hold is set in a passive effect; findByText only proves the commit, so the
+    // assertion waits for the effect rather than racing it (this bit CI once).
+    await waitFor(() => expect(isReloadHeld()).toBe(true));
     view.unmount();
 
     renderCard(info({ run: runAt("done") }));
     await screen.findByText("Updated to 1.4.0.");
-    expect(isReloadHeld()).toBe(false);
+    await waitFor(() => expect(isReloadHeld()).toBe(false));
+  });
+});
+
+// ── A packaged install (ADR 0035) ────────────────────────────────────────────
+// Its preflight is GREEN — nothing is wrong with it — but it can never take an update from this
+// card, because the CLI refuses on a root it cannot write and `POST /api/update` would only relay
+// that refusal. An enabled button here is a button that always fails.
+
+describe("UpdateCard — an install a package manager owns", () => {
+  it("shows the package command IN PLACE OF the update button, not a greyed-out one", async () => {
+    // A disabled control is a thing to try again, and there is nothing here to try. The command is
+    // the operator's next move, and it is selectable text so a phone can copy it.
+    const update = info({ installKind: "packaged" });
+    serveCheck(update, PACKAGED);
+    renderCard(update);
+    expect(await screen.findByText("sudo pacman -Syu collie-bin")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Update to 1\.4\.0/i })).not.toBeInTheDocument();
+    // The version is still on screen: that a release exists is worth knowing however it is taken.
+    expect(screen.getByText(/Newest 1\.4\.0/)).toBeInTheDocument();
+  });
+
+  it("takes the command off the snapshot first, and falls back to the preflight remedy", async () => {
+    // The snapshot carries the host's own answer since M17/02, so the card no longer has to dig it
+    // out of a check's remedy. It wins where both are present.
+    const fromSnapshot = info({ installKind: "packaged", packageCommand: "nix profile upgrade collie" });
+    serveCheck(fromSnapshot, PACKAGED);
+    const { unmount } = renderCard(fromSnapshot);
+    expect(await screen.findByText("nix profile upgrade collie")).toBeInTheDocument();
+    expect(screen.queryByText("sudo pacman -Syu collie-bin")).not.toBeInTheDocument();
+    unmount();
+
+    // And the fallback survives: a bridge older than the field still answers through the remedy.
+    const older = info({ installKind: "packaged" });
+    serveCheck(older, PACKAGED);
+    renderCard(older);
+    expect(await screen.findByText("sudo pacman -Syu collie-bin")).toBeInTheDocument();
+  });
+
+  it("with no command to name, the sentence stands alone and the button is still gone", async () => {
+    // The prefix named no manager this build knows, so the CLI's `package` check carries no remedy.
+    const update = info({ installKind: "packaged" });
+    serveCheck(update, {
+      ...PACKAGED,
+      checks: PACKAGED.checks.map((c) =>
+        c.id === "package" ? { id: c.id, verdict: c.verdict, reason: c.reason } : c,
+      ),
+    });
+    renderCard(update);
+    expect(await screen.findByText(/package manager updates this install/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Update to 1\.4\.0/i })).not.toBeInTheDocument();
+  });
+
+  it("says who does update it, instead of showing a preflight failure that did not happen", async () => {
+    const update = info({ installKind: "packaged" });
+    serveCheck(update, GREEN_SIX);
+    renderCard(update);
+    expect(await screen.findByText(/package manager updates this install/i)).toBeInTheDocument();
+  });
+
+  it("offers no major crossing either — that is the same refusal, not a separate path", async () => {
+    const update = info({
+      installKind: "packaged",
+      majorAvailable: "2.0.0",
+      majorUrl: "https://github.com/AltanS/collie/releases/tag/v2.0.0",
+    });
+    serveCheck(update, PACKAGED);
+    renderCard(update);
+    expect(await screen.findByText("sudo pacman -Syu collie-bin")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Cross to 2\.0\.0/i })).not.toBeInTheDocument();
+  });
+
+  it("a green preflight on any other kind still leaves the action enabled", async () => {
+    // The control that keeps the case above from passing for the wrong reason.
+    const update = info({ installKind: "detached-checkout" });
+    serveCheck(update, GREEN_SIX);
+    renderCard(update);
+    const button = await screen.findByRole("button", { name: /Update to 1\.4\.0/i });
+    await waitFor(() => expect(button).toBeEnabled());
+  });
+
+  // ── AND ITS PEERS ARE STILL REACHABLE FROM HERE ────────────────────────────
+  //
+  // The lead cannot take the release. Levelling the peers to the build it ALREADY runs is a
+  // different act and it works — `bridge/update-action.ts` decides the peers-only start above its
+  // own packaged refusal for exactly this reason. What used to happen instead: the release
+  // short-circuit answered "Update pack to 1.4.0", the card disabled it, and the peers were
+  // unreachable from the phone with an explanation that talked only about this machine.
+
+  it("offers the peers-only run to a packaged lead whose peer is a version behind", async () => {
+    const user = userEvent.setup();
+    const update = info({ installKind: "packaged" });
+    const behind: UpdatePackMember[] = [
+      { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
+    ];
+    serveCheck(update, PACKAGED, behind);
+    let sent: StartBody | undefined;
+    server.use(
+      http.post("/api/update", async ({ request }) => {
+        sent = await readStart(request);
+        return HttpResponse.json({ ok: true, to: "1.3.0", major: false, run: null });
+      }),
+    );
+    renderCard(update, LEAD_ROSTER);
+
+    const button = await screen.findByRole("button", { name: "Retry pack update" });
+    expect(button).toBeEnabled();
+    // The disabled release button is gone rather than sitting beside it: one action button, and it
+    // is the one whose tap can succeed.
+    expect(screen.queryByRole("button", { name: /Update pack to/ })).not.toBeInTheDocument();
+    // The card still says why THIS machine is not moving — that is the question a peers-only
+    // button raises while "Newest 1.4.0" is on screen above it.
+    expect(screen.getByText(/package manager updates this install/i)).toBeInTheDocument();
+
+    await user.click(button);
+    // Not "This machine is already current": it is not, and the confirm may not say it is.
+    expect(screen.getByText("Retry the pack update?")).toBeInTheDocument();
+    expect(screen.queryByText(/already current/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/package manager updates this install/i).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "Yes, retry" }));
+    await waitFor(() => expect(sent).toBeDefined());
+    // Peers only, to the build this lead runs — never to the release it cannot take.
+    expect(sent).toMatchObject({ confirm: true, peersOnly: true, target: "1.3.0", major: false });
+  });
+
+  // THE CONTROL. Same packaged lead, same release, and the one difference is that no peer needs
+  // levelling — so there is nothing for the release branch to yield to, and the disabled button
+  // stays as the card's only way to say a release exists and this machine is not taking it.
+  it("names the command and no button at all when no peer needs levelling", async () => {
+    const update = info({ installKind: "packaged" });
+    const level: UpdatePackMember[] = [
+      { name: "minibuch", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
+    ];
+    serveCheck(update, PACKAGED, level);
+    renderCard(update, LEAD_ROSTER);
+    expect(await screen.findByText("sudo pacman -Syu collie-bin")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update pack to 1.4.0" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry pack update" })).not.toBeInTheDocument();
+    expect(screen.getByText(/package manager updates this install/i)).toBeInTheDocument();
+  });
+
+  // The second control: an ORDINARY lead in the identical pack shape still leads with its own
+  // update. Revert `leadCanTake` and this keeps passing while the two above stop — which is what
+  // makes them a statement about the install kind rather than about being behind.
+  // An ORDINARY lead can land in `retry-pack` too — already current on releases, itself blocked by
+  // a genuinely red check, with a peer behind. The reason line is shown here on purpose: it answers
+  // exactly the question a "Retry pack update" button raises while this machine is not moving, and
+  // suppressing it (the pre-fix shape) is what let a packaged lead's OWN reason go unsaid. This is
+  // the case the review asked to see covered, not a boundary the card is trying to avoid.
+  it("an ordinary lead's own red reason shows under retry-pack too, not only a packaged lead's", async () => {
+    const update = info({ installKind: "detached-checkout", releaseAvailable: false });
+    const behind: UpdatePackMember[] = [
+      { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
+    ];
+    serveCheck(update, RED, behind);
+    renderCard(update, LEAD_ROSTER);
+    const button = await screen.findByRole("button", { name: "Retry pack update" });
+    // NOT disabled: retry-pack is exempt from `blocked` (a peers-only run works even while this
+    // machine's own preflight is red — the two are unrelated moves). The point of this test is the
+    // REASON line, which is now shown alongside it rather than swallowed.
+    await waitFor(() => expect(button).toBeEnabled());
+    const reasonLine = document.querySelector("p.text-status-blocked");
+    expect(reasonLine).toHaveTextContent("2 tracked files are modified");
+  });
+
+  it("control: an ordinary lead with a peer behind still takes the release itself", async () => {
+    const update = info({ installKind: "detached-checkout" });
+    const behind: UpdatePackMember[] = [
+      { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
+    ];
+    serveCheck(update, GREEN_SIX, behind);
+    renderCard(update, LEAD_ROSTER);
+    const button = await screen.findByRole("button", { name: "Update pack to 1.4.0" });
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(screen.queryByRole("button", { name: "Retry pack update" })).not.toBeInTheDocument();
+  });
+
+  // A REAL fault must never hide behind the package-manager sentence. Before this, `packageManaged`
+  // was checked first, so a packaged install with an actually broken preflight check (its own
+  // service or doctor, both of which the packaged instance-check list still runs) showed only
+  // "your package manager updates this install" — true, and useless for finding the real problem.
+  it("shows the genuine red reason, not the package-manager sentence, when BOTH are true", async () => {
+    const update = info({ installKind: "packaged" });
+    serveCheck(update, RED);
+    renderCard(update);
+    // The red reason appears twice by design — once in the checks list, once as the blocked-reason
+    // line — so this waits for it to land at all and then reads the specific line rather than
+    // asserting a single match, which the details list already rules out.
+    await waitFor(() => expect(screen.getAllByText("2 tracked files are modified").length).toBeGreaterThan(0));
+    const reasonLine = document.querySelector("p.text-status-blocked");
+    expect(reasonLine).toHaveTextContent("2 tracked files are modified");
+    expect(screen.queryByText(/package manager updates this install/i)).not.toBeInTheDocument();
+  });
+});
+
+// ── THE CARD GOES INERT ON ITS OWN TAP, AND STAYS PUT WHILE IT DOES ─────────────────────────────
+//
+// Two faults, one shape. `POST /api/update` answers before the updater has written anything, so
+// there was a beat with no run record: the button was live and a second tap fitted in it. And the
+// whole action row used to unmount the moment a record appeared, so the card collapsed under the
+// thumb at the one moment the operator was watching it.
+describe("the action row while an update is being asked for and driven", () => {
+  it("disables the button between the tap and the first run record", async () => {
+    const user = userEvent.setup();
+    let posts = 0;
+    server.use(
+      http.post("/api/update", () => {
+        posts++;
+        // `run: null` is the gap itself: accepted, and nothing to show for it yet.
+        return HttpResponse.json({ ok: true, to: "1.4.0", major: false, run: null }, { status: 202 });
+      }),
+    );
+    renderCard(info());
+    await user.click(await screen.findByRole("button", { name: "Update to 1.4.0" }));
+    await user.click(screen.getByRole("button", { name: "Yes, update" }));
+    await waitFor(() => expect(posts).toBe(1));
+
+    const button = await screen.findByRole("button", { name: "Update to 1.4.0" });
+    await waitFor(() => expect(button).toBeDisabled());
+    await user.click(button);
+    expect(posts).toBe(1);
+  });
+
+  it("says what it is waiting for, and says it louder when the start is slow", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    server.use(
+      http.post("/api/update", () =>
+        HttpResponse.json({ ok: true, to: "1.4.0", major: false, run: null }, { status: 202 }),
+      ),
+    );
+    renderCard(info());
+    await user.click(await screen.findByRole("button", { name: "Update to 1.4.0" }));
+    await user.click(screen.getByRole("button", { name: "Yes, update" }));
+    const button = await screen.findByRole("button", { name: "Update to 1.4.0" });
+    await waitFor(() => expect(button).toBeDisabled());
+    // A disabled button must never be a silent one.
+    expect(await screen.findByText("Starting…")).toBeInTheDocument();
+
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(
+      await screen.findByText("Still starting. The host has not reported the run yet."),
+    ).toBeInTheDocument();
+    // The words changed. The BUTTON did not: an in-place checkout writes its record only after it
+    // has built, so a wall clock cannot tell a slow build from a dead updater, and unlocking on one
+    // would re-open the double tap on exactly the slowest machines.
+    expect(button).toBeDisabled();
+  });
+
+  it("keeps the button on screen — disabled — for the whole run, instead of unmounting it", async () => {
+    renderCard(info({ run: runAt("restarting") }));
+    const button = await screen.findByRole("button", { name: "Update to 1.4.0" });
+    expect(button).toBeDisabled();
+    expect(screen.getByText("Restarting. This is not an outage.")).toBeInTheDocument();
+  });
+
+  it("the preflight arrives inside a Collapse, so the button does not teleport when doctor lands", async () => {
+    renderCard(info());
+    // The list is the card's only async arrival above the action row. Its wrapper is the sanctioned
+    // one (DESIGN.md §7, hard rule 1); a bare mount is what moved the row.
+    const check = await screen.findByText("4.2 GB free");
+    expect(check.closest("[data-slot='collapse']")).not.toBeNull();
   });
 });

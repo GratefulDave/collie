@@ -25,6 +25,65 @@ Configuration and state sit outside the checkout and persist across updates
 devices and `stt.json` are in the state dir, `~/.local/state/collie` unless `COLLIE_STATE_DIR`
 moves it.
 
+## A packaged install
+
+Where your package manager installed Collie, it updates Collie, and everything below this section
+does not apply:
+
+```bash
+sudo pacman -Syu collie-bin    # or `nix profile upgrade collie`, or `brew upgrade collie`
+```
+
+Collie recognises this install from shapes on disk: no `.git`, no `versions/` layout, the manifest
+the release payload carries, and a root that is read-only, outside your home directory, or owned by
+root. Any one of the last three is enough. It then refuses to update in place and names the command
+where it can tell which manager owns the folder:
+
+```
+error: /opt/collie is a packaged install — updates come from your package manager.
+       `collie update` will not replace its files.
+       Take the new version with: sudo pacman -Syu collie-bin
+```
+
+Where the prefix names no manager Collie knows, it prints the first two lines and stops rather than
+guessing a command you cannot run.
+
+`collie doctor` reports the same install as healthy, and the phone's update card still shows that a
+newer release exists — with the package command in place of the update button.
+
+> **Note.** This is not a limitation to work around. The folder belongs to your package manager, and
+> replacing its files out from under it would leave its database lying about what is installed.
+> `sudo collie update` refuses the same way.
+
+To take a new version, run your package manager and then restart the service:
+
+```bash
+paru -Syu collie-bin                              # Arch, or your AUR helper of choice
+nix profile upgrade collie                        # Nix
+mise upgrade --bump github:AltanS/collie          # mise
+collie restart
+```
+
+A mise install is the odd one out: Collie does not read it as packaged, because the tree sits in
+your home directory with no `.git` and no `versions/` layout, so `collie update` declines with
+`cannot tell how this Collie was installed` and names no manager. mise still owns it. See
+[Install](install.md#mise).
+
+The restart is the part Collie cannot do for you, and it is not optional. Your package manager swaps
+the files under the running bridge, so that process keeps executing the old code while it already
+reports the new version. Collie sees that mismatch and says so: `collie doctor` raises
+`restart-pending`, and the phone shows a "Bridge restart needed" banner reading "Collie was replaced
+on disk. Restart it." Both clear the moment `collie restart` has run.
+
+In a [pack](pack.md#members-that-were-not-installed-by-installsh), a packaged member never takes an
+update from the phone. The pack lists it as "waits for the package manager" and counts the run as
+complete without it, so the two commands above are what levels it.
+
+A packaged **lead** declines only its own move. The phone still levels every member to the version
+the lead is running, and one confirm covers them. After the two commands above have moved the lead,
+nothing levels by itself: tap the Updates page once more and the members follow to the lead's new
+version.
+
 ## Update, from the phone or the terminal
 
 Two update paths exist, and both run the same steps on each host: stage the new release beside the
@@ -294,6 +353,28 @@ The updater writes one record, `<state dir>/update.json` (by default
 state, the version the run came from, the version it was going to, the updater's pid, and on a
 failure a tail of the service log and the recovery command.
 
+An update the phone started does not print to your terminal at all. It runs under a transient
+systemd unit of its own, named `collie-api-update-<stamp>`, and `--collect` removes that unit as
+soon as it exits, so its transcript is only in the journal:
+
+```bash
+journalctl --user -u 'collie-api-update-*' --since '30 min ago'
+```
+
+That is where to look when the phone reported success and something downstream did not happen — a
+warning that the run record could not be written, for instance, which is a lead that updated itself
+and will not level its pack. The bridge's own journal carries the other half: one
+`[pack] update <run id>: levelling peers to <version>` line per run, when the lead picks the record
+up. No such line, and the turns never started.
+
+### A pre-1.5.4 update stuck at bunx
+
+Before version 1.5.4, updates started from a phone run in a transient systemd user unit that lacks
+your PATH. When Bun lives only in `~/.bun/bin` on a checkout install, the checkout advances, but the
+rebuild fails with `bunx: command not found`. Fix this by running `collie update` once from a
+terminal where Bun is on PATH, or run the Herdr action, whose shim locates Bun itself. Either method
+rebuilds the advanced checkout. Starting in 1.5.4, the updater finds Bun on its own.
+
 Beside it sits `<state dir>/update.lock`, holding a pid and a timestamp. One run at a time. A record
 that still reads `preflight`, `staging`, `restarting` or `verifying`, has not moved for 10 minutes,
 and whose pid is no longer in the process table, is over: it reads as `interrupted`, and a new run
@@ -475,7 +556,7 @@ ls ~/.local/share/collie/versions/
 To install a specific version directly:
 
 ```bash
-COLLIE_TAG=v1.0.0 curl -fsSL https://colliepwa.dev/install.sh | sh
+curl -fsSL https://colliepwa.dev/install.sh | COLLIE_TAG=v1.0.0 sh
 ```
 
 For checkouts or Herdr installs, run `git checkout <tag>` or

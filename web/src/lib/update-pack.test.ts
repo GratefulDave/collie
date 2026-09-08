@@ -93,6 +93,32 @@ describe("peersBehind", () => {
   });
 });
 
+describe("a packaged member", () => {
+  it("is left out of the peers-behind count — the operator cannot clear it from here", () => {
+    const pack = [
+      member({ name: "a", version: "1.3.0" }),
+      member({ name: "b", version: "1.3.0", installKind: "packaged" }),
+    ];
+    expect(peersBehind(pack, "1.4.0")).toBe(1);
+    // Absent means unknown, and unknown counts as not packaged: an older bridge behaves as before.
+    expect(peersBehind([member({ name: "b", version: "1.3.0" })], "1.4.0")).toBe(1);
+  });
+
+  it("says what it is waiting on, in neutral weight, whether the census or a leg reports it", () => {
+    const fromCensus = peerRows([member({ name: "b", version: "1.3.0", installKind: "packaged" })])[0]!;
+    expect(fromCensus.word).toBe("waits for the package manager");
+    expect(fromCensus.reason).toBeNull();
+    expect(fromCensus.inFlight).toBe(false);
+    // Rank 5 is `done`'s bucket — the neutral dot, never the blocked one.
+    expect(fromCensus.rank).toBe(5);
+
+    const fromLeg = peerRows([], [{ name: "b", state: "package-managed" }])[0]!;
+    expect(fromLeg.word).toBe("waits for the package manager");
+    expect(fromLeg.reason).toBeNull();
+    expect(fromLeg.rank).toBe(5);
+  });
+});
+
 describe("peersRolledBack", () => {
   it("counts every leg that ended badly, not only a rollback", () => {
     const legs: UpdatePeerLeg[] = [
@@ -134,5 +160,37 @@ describe("packAction", () => {
 
   it("offers nothing when the whole pack is level", () => {
     expect(packAction({ releaseAvailable: false, hasPeers: true, behind: 0, rolledBack: 0 })).toBe("none");
+  });
+
+  // ── A LEAD THAT CANNOT TAKE THE RELEASE ITSELF (ADR 0035) ─────────────────
+
+  it("yields the release branch to the peers when this lead cannot take it", () => {
+    expect(
+      packAction({ releaseAvailable: true, hasPeers: true, behind: 1, rolledBack: 0, leadCanTake: false }),
+    ).toBe("retry-pack");
+    expect(
+      packAction({ releaseAvailable: true, hasPeers: true, behind: 0, rolledBack: 1, leadCanTake: false }),
+    ).toBe("retry-pack");
+  });
+
+  // THE CONTROL for the pair above: one field differs, and the answer goes back to the button the
+  // card disables. Revert the `leadCanTake` branch and the two cases above return `update-pack` —
+  // exactly this — while this one keeps passing.
+  it("control: the same pack on a lead that CAN take it still names the pack", () => {
+    expect(packAction({ releaseAvailable: true, hasPeers: true, behind: 1, rolledBack: 0 })).toBe("update-pack");
+    expect(
+      packAction({ releaseAvailable: true, hasPeers: true, behind: 1, rolledBack: 0, leadCanTake: true }),
+    ).toBe("update-pack");
+  });
+
+  it("keeps the release button when there is no peer to yield it to", () => {
+    // Nothing for a peers-only run to do, so the disabled button stays: it is the card's only way
+    // to say a release exists and this machine is not the one that takes it.
+    expect(
+      packAction({ releaseAvailable: true, hasPeers: false, behind: 0, rolledBack: 0, leadCanTake: false }),
+    ).toBe("update");
+    expect(
+      packAction({ releaseAvailable: true, hasPeers: true, behind: 0, rolledBack: 0, leadCanTake: false }),
+    ).toBe("update-pack");
   });
 });

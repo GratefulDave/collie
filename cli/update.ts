@@ -15,7 +15,7 @@ import {
 import { STALE_AFTER_MS, type UpdateRun } from "../bridge/update-run.ts";
 import { manifestVersionFrom, readBuildInfo } from "../bridge/version.ts";
 import { type BuildDeps, cmdBuild } from "./build.ts";
-import { logFilePath } from "./lifecycle.ts";
+import { logFilePath, systemdUserReachable } from "./lifecycle.ts";
 import {
   binaryLayout,
   type BinaryLayout,
@@ -27,11 +27,13 @@ import {
   originMatches,
   updateRepoOf,
   DEFAULT_UPDATE_REPO,
+  PACKAGED_SENTENCE,
 } from "./install-kind.ts";
-import type { Environment, EnvVars } from "./context.ts";
+import { packageCommand } from "./package-command.ts";
+import { herdrActionCommand, type Environment, type EnvVars } from "./context.ts";
 import { EXIT } from "./io.ts";
 import { cmdLink, isCollieBinaryPath, type LinkReader, linkPath, type LinkWriter } from "./link.ts";
-import type { Exec, Files, Net, NetFailure } from "./sys.ts";
+import { type Exec, type Files, type Net, type NetFailure, type ResolvedTool, resolveTool } from "./sys.ts";
 import { tagRemote } from "./update-remote.ts";
 import { collieBinary, unitName } from "./unit.ts";
 import {
@@ -49,6 +51,7 @@ import {
   readRun,
   reduce,
   releaseLock,
+  type RunEvent,
   serviceLogTail,
   takeLock,
   writeRun,
@@ -102,8 +105,29 @@ export interface UpdateDeps extends BuildDeps {
 // already spells them `from "./update.ts"`.
 export { isManagedCheckout };
 
-/** The command that consents to a major crossing — printed wherever one is refused. */
-export const MAJOR_ACTION = "herdr plugin action invoke update-major --plugin herdr.collie";
+/**
+ * The Bun this update will RUN, or null when there is none — the same lookup `update --check`'s
+ * preflight reports (`cli/update-check.ts`) and the same one the shim bootstraps with.
+ *
+ * Not `exec.which("bun")`. Herdr invokes a plugin action with no login shell, so the directory the
+ * operator's profile exports is simply absent from PATH, and a bare name would refuse an update the
+ * shim would have built without complaint (#169). The preflight already told the operator it found
+ * a Bun at an absolute path; the verb has to run THAT one, or the two disagree on the same host.
+ *
+ * Callers spawn `path` and pass its `dirname` as the child's PATH prefix: `bun cli/main.ts build`
+ * spawns `bun` again by name for the two installs and the Vite build.
+ */
+function resolveBun(deps: UpdateDeps): ResolvedTool | null {
+  return resolveTool(deps.exec, deps.files, deps.ctx.env, deps.ctx.home, "bun");
+}
+
+/**
+ * The command that consents to a major crossing — printed wherever one is refused.
+ *
+ * A function of the instance, not a constant: on a named instance the bare `herdr.collie` names the
+ * host's FIRST Collie, so an operator following it would cross a major on the wrong service.
+ */
+export const majorAction = (instance: string | null): string => herdrActionCommand("update-major", instance);
 
 // ── Target selection (pure — ADR 0020) ───────────────────────────────────────
 // A routine `update` no longer means "the tip of the default branch": it means "the newest RELEASE
@@ -464,7 +488,7 @@ function printCurrent(deps: UpdateDeps, at: ReleaseTag): void {
 function announceMajor(deps: UpdateDeps, higher: ReleaseTag | null): void {
   if (higher === null) return;
   deps.io.out(`note: Collie ${higher.version} is out — a NEW MAJOR, which a routine update never takes.`);
-  deps.io.out(`      Read its release notes, then consent to it with:  ${MAJOR_ACTION}`);
+  deps.io.out(`      Read its release notes, then consent to it with:  ${majorAction(deps.ctx.instance)}`);
 }
 
 /**
@@ -480,6 +504,14 @@ export interface CheckoutOutcome {
    * `cmdUpdate` skips the rebuild on false, so this must never be optimistic.
    */
   moved: boolean;
+  /**
+   * The version this advance was AIMED at, or null when it aimed at nothing (every failure, every
+   * "nothing to take"). Answered by the code that chose the target, never re-read off disk
+   * afterwards: the manifest is rewritten by the checkout, so reading it back would be trusting the
+   * very step whose success is in question — and on a linked clone, which fast-forwards a branch,
+   * there is no chosen tag to read at all. It is what an in-place run records as its `to`.
+   */
+  to: string | null;
   /**
    * The next major's release, when one exists and we did not just take it — re-printed at the very
    * END of the transcript, which is the part the operator reads.
@@ -519,11 +551,11 @@ export function updateCheckout(
   if (!isGitCheckout(deps.exec, root)) {
     deps.io.err(`error: ${root} is not a git checkout — refresh it with:`);
     deps.io.err("       herdr plugin install AltanS/collie --yes");
-    return { code: EXIT.FAIL, moved: false, higher: null };
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
   }
 
   // BEFORE any fetch, and therefore before any `checkout --detach --force`. See {@link assertOrigin}.
-  if (!assertOrigin(deps)) return { code: EXIT.FAIL, moved: false, higher: null };
+  if (!assertOrigin(deps)) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
 
   const installed = installedVersion(deps);
   const toTag = opts.toTag ?? null;
@@ -547,7 +579,7 @@ function updateLinked(
   if (toTag !== null) {
     deps.io.err("error: `--to-tag` names a release tag, and this checkout follows a branch.");
     deps.io.err("       Take that release by hand with `git checkout <tag>` and rebuild.");
-    return { code: EXIT.FAIL, moved: false, higher: null };
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
   }
   const headNow = (): string => deps.exec.capture("git", gitArgs(root, ["rev-parse", "HEAD"])).stdout.trim();
   const before = headNow();
@@ -557,7 +589,7 @@ function updateLinked(
   // different commits, and a gate that judged one while the pull took the other would refuse a
   // fast-forward that never leaves the major (and, after 1.0 lands on `main`, would refuse EVERY
   // pull on a 0.x branch). Judge exactly the commit the pull will land on.
-  if (git(["fetch", "origin"]) !== EXIT.OK) return { code: EXIT.FAIL, moved: false, higher: null };
+  if (git(["fetch", "origin"]) !== EXIT.OK) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
   const upstream = deps.exec.capture(
     "git",
     gitArgs(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]),
@@ -574,9 +606,9 @@ function updateLinked(
     if (!crossMajor && majorVerdict(installed, fetched) === "crosses") {
       deps.io.out(`refusing to update: ${installed} → ${fetched} (${ref}) crosses a MAJOR version.`);
       deps.io.out("A major means you have to change something — so it is never taken by a routine update.");
-      deps.io.out(`Read its release notes, then consent to it with:  ${MAJOR_ACTION}`);
+      deps.io.out(`Read its release notes, then consent to it with:  ${majorAction(deps.ctx.instance)}`);
       deps.io.out("(nothing was pulled — this checkout is unchanged)");
-      return { code: EXIT.OK, moved: false, higher: null };
+      return { code: EXIT.OK, moved: false, to: null, higher: null };
     }
   }
   deps.io.out("updating Collie (git pull --ff-only)…");
@@ -584,7 +616,7 @@ function updateLinked(
   // A `--ff-only` pull that finds nothing to take succeeds and moves no commit — the linked-clone
   // spelling of "already current". Compare HEAD across the pull rather than parsing git's wording:
   // "Already up to date." is a translated, version-dependent sentence, and the sha is neither.
-  return { code, moved: code === EXIT.OK && headNow() !== before, higher: null };
+  return { code, moved: code === EXIT.OK && headNow() !== before, to: null, higher: null };
 }
 
 /**
@@ -604,7 +636,7 @@ function updateManaged(
   const ls = deps.exec.capture("git", gitArgs(root, ["ls-remote", "--tags", tagRemote(deps.exec, root)]));
   if (!ls.found || ls.code !== 0) {
     deps.io.err("error: could not list the upstream release tags — is the remote reachable?");
-    return { code: EXIT.FAIL, moved: false, higher: null };
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
   }
   const head = deps.exec.capture("git", gitArgs(root, ["rev-parse", "HEAD"])).stdout.trim();
   const managedTags = parseRemoteTags(ls.stdout);
@@ -615,7 +647,7 @@ function updateManaged(
   });
   if (!asked.ok) {
     deps.io.err(`error: ${asked.reason}.`);
-    return { code: EXIT.FAIL, moved: false, higher: null };
+    return { code: EXIT.FAIL, moved: false, to: null, higher: null };
   }
   const plan = asked.plan;
 
@@ -625,27 +657,27 @@ function updateManaged(
     // branch points at today", which is unreleased work nobody consented to.
     if (plan.newest === null) {
       deps.io.err("error: no release tags on origin — cannot pin an unversioned checkout.");
-      return { code: EXIT.FAIL, moved: false, higher: null };
+      return { code: EXIT.FAIL, moved: false, to: null, higher: null };
     }
     deps.io.out(
       `updating Collie (Herdr-managed checkout: no readable version — pinning to newest release tag ${plan.newest.tag})…`,
     );
     const pinned = detachOnto(deps, git, plan.newest.tag);
-    return { code: pinned, moved: pinned === EXIT.OK, higher: null };
+    return { code: pinned, moved: pinned === EXIT.OK, to: plan.newest.version, higher: null };
   }
   if (plan.kind === "no-higher-major") {
     printNoHigherMajor(deps, plan.major);
-    return { code: EXIT.OK, moved: false, higher: null };
+    return { code: EXIT.OK, moved: false, to: null, higher: null };
   }
   if (plan.kind === "no-release") {
     printNoRelease(deps, plan.major, "leaving this checkout where it is");
     announceMajor(deps, plan.higher);
-    return { code: EXIT.OK, moved: false, higher: plan.higher };
+    return { code: EXIT.OK, moved: false, to: null, higher: plan.higher };
   }
   if (plan.kind === "current") {
     printCurrent(deps, plan.at);
     announceMajor(deps, plan.higher);
-    return { code: EXIT.OK, moved: false, higher: plan.higher };
+    return { code: EXIT.OK, moved: false, to: null, higher: plan.higher };
   }
   deps.io.out(
     plan.crossesMajor
@@ -656,7 +688,7 @@ function updateManaged(
   if (code === EXIT.OK && !plan.crossesMajor) announceMajor(deps, plan.higher);
   // A crossing just TOOK `higher`; naming it again at the end of the transcript would advertise the
   // release the operator is now standing on.
-  return { code, moved: code === EXIT.OK, higher: plan.crossesMajor ? null : plan.higher };
+  return { code, moved: code === EXIT.OK, to: plan.target.version, higher: plan.crossesMajor ? null : plan.higher };
 }
 
 /** Fetch the release tag `tag` and re-detach onto it, the way Herdr got this checkout here. */
@@ -784,7 +816,7 @@ function installIsIntact(deps: UpdateDeps): boolean {
  */
 function closeWithMajor(deps: UpdateDeps, higher: ReleaseTag | null): void {
   if (higher === null) return;
-  deps.io.out(`note: Collie ${higher.version} is out — a NEW MAJOR. Take it with:  ${MAJOR_ACTION}`);
+  deps.io.out(`note: Collie ${higher.version} is out — a NEW MAJOR. Take it with:  ${majorAction(deps.ctx.instance)}`);
 }
 
 /** The check is `hooks status --check`, which answers in milliseconds; a longer wait is a hang. */
@@ -841,7 +873,7 @@ export async function cmdApplyUpdate(deps: UpdateDeps, args: readonly string[] =
     // service is untouched and consistent — but the operator has to know the update did not land.
     deps.io.err("error: update stopped — the checkout advanced but the build failed.");
     deps.io.err("       The running bridge and the served UI are unchanged. Fix the build and re-run");
-    deps.io.err("       `herdr plugin action invoke update --plugin herdr.collie`.");
+    deps.io.err(`       \`${herdrActionCommand("update", deps.ctx.instance)}\`.`);
     return built;
   }
   const restarted = await deps.restart();
@@ -851,6 +883,67 @@ export async function cmdApplyUpdate(deps: UpdateDeps, args: readonly string[] =
   // `build` just wrote this binary from the code we are running, so it is the new list, not ours.
   nudgeHooks(deps, collieBinary(deps.ctx.root));
   return EXIT.OK;
+}
+
+/**
+ * Record an IN-PLACE update that has already succeeded, so a restarted lead can find its pack turns.
+ *
+ * The other two update paths reach the record through {@link handOff}, which writes it before it
+ * launches the detached runner and then leaves the runner to drive it. This path has no runner: the
+ * `_apply-update` child builds, restarts and verifies inside its own process, and until now it wrote
+ * nothing at all. `--run-id` was accepted, carried the whole way here and dropped, because
+ * `wantsRunId` was read at the two `handOff` calls and nowhere else.
+ *
+ * The cost was not the missing `--status` line. `settleUpdateGate` in `bridge/index.ts` re-derives
+ * the pack's turn queue from this file, because the update restarts the very bridge that held the
+ * queue in memory and the record is the only thing that survives it. No record, so the gate returned
+ * early on every tick forever, so no peer was ever handed its turn — the lead updated itself and the
+ * pack sat still until the operator tapped "Retry pack update" by hand. Every install from an
+ * ordinary git checkout had this, which is the documented default.
+ *
+ * ONE WRITE, AFTER THE FACT, and that is the honest shape here. The child has already returned 0,
+ * which means it built, restarted and verified; walking the record through those states one at a
+ * time would be narrating a machine that has finished running. `idleRun` rather than the record on
+ * disk for the same reason {@link handOff} uses it: the previous run's terminal state is a log, not
+ * a state this run must transition out of.
+ *
+ * `pass` here means WHAT THIS PATH CAN KNOW: the child returned 0, so it built, restarted the
+ * service and returned without an error. It is not the health-gate pass the detached runner writes,
+ * because an in-place checkout has no gate to poll — ADR 0006 gives it no previous version on disk
+ * to roll back to, so there is nothing a failed probe could do but say so. Reading `done` here as
+ * "the runner verified it" would be reading more than the word carries on this path.
+ *
+ * Best-effort. A failed write must not turn a successful update into a failed command — the new
+ * version is already built, restarted and serving. It IS said out loud, because a silent failure
+ * here is the very bug this function exists to fix, wearing a success message.
+ */
+function recordInPlaceRun(
+  deps: UpdateDeps,
+  runId: string | null,
+  from: string | null,
+  to: string | null,
+  startedAt: number,
+): void {
+  // TWO clocks, not one. `begin` carries the real start, taken before the advance; everything after
+  // it carries now. A single `now` for all five would have written `startedAt === updatedAt` on a run
+  // that visibly took half a minute, and `collie update --status` prints both of those numbers.
+  const now = deps.now();
+  const events: RunEvent[] = [{ kind: "stage" }, { kind: "restart" }, { kind: "verify" }, { kind: "pass" }];
+  try {
+    const begun = reduce(idleRun(startedAt), { kind: "begin", from, to, pid: deps.pid, runId }, startedAt);
+    writeRun(deps.files, deps.ctx.stateDir, events.reduce((run, event) => reduce(run, event, now), begun));
+    // Only when a pack is actually waiting on it. A run with no id was started from a terminal by
+    // someone who never asked for one, and a line about peers there would be noise about nothing.
+    if (runId !== null) deps.io.out("  Pack turn recorded — peers level on this lead's next poll.");
+  } catch (err) {
+    // Said out loud, because the silence is the bug. The update itself stands — the new version is
+    // built, restarted and serving — but a pack will not level off a record that was not written,
+    // and an operator who does not know that is an operator watching a peer sit still for no
+    // visible reason. Name the manual way out in the same breath.
+    deps.io.err(`warning: the update landed, but its run record could not be written (${String(err)}).`);
+    deps.io.err("         A pack will not level its peers from this run. Level them from the phone's");
+    deps.io.err("         \"Retry pack update\", or run `collie update` on each peer.");
+  }
 }
 
 /**
@@ -883,6 +976,18 @@ export async function cmdUpdate(deps: UpdateDeps, args: readonly string[] = []):
   if (wantsStatus(args)) return cmdUpdateStatus(deps, args);
   if (args.includes("--rollback")) {
     if (install.kind === "binary") return await rollbackBinary(deps);
+    if (install.kind === "packaged") {
+      // Above the checkout branch on purpose: the message below it is three sentences about
+      // `versions/` layouts and `git checkout`, none of which exist here, and the real answer is the
+      // package manager's own downgrade (`pacman -U` from the cache, `brew` an older formula).
+      // The main refusal below names the command that takes the NEXT version; a rollback wants the
+      // previous one, which no `pacman -Syu` spelling reaches, so this one names the boundary and
+      // sends the operator to the manager rather than to a command.
+      deps.io.err(`error: ${deps.ctx.root} is a packaged install — ${PACKAGED_SENTENCE}, and Collie stages`);
+      deps.io.err("       no versions here to roll back to. Reinstall the previous version through");
+      deps.io.err("       your package manager.");
+      return EXIT.FAIL;
+    }
     if (staged && layout !== null) return await rollbackCheckout(deps, layout);
     deps.io.err("error: `--rollback` flips the `current` symlink back to the previous version, and this");
     deps.io.err("       install has no `versions/` layout to flip inside — a Herdr-managed checkout");
@@ -891,6 +996,18 @@ export async function cmdUpdate(deps: UpdateDeps, args: readonly string[] = []):
     return EXIT.FAIL;
   }
   if (install.kind === "binary") return await updateBinary(deps, args);
+  if (install.kind === "packaged") {
+    // Not a failure to diagnose — a boundary to respect (ADR 0035). The sentence is the shared one
+    // the preflight's `package` check and `doctor`'s install line print, so a reword reaches every
+    // surface at once. The COMMAND is named only where the resolved root names a manager we know;
+    // where it does not, Collie says the boundary and stops rather than guessing a manager and
+    // sending the operator after a package that may not exist.
+    const cmd = packageCommand(deps.ctx.root);
+    deps.io.err(`error: ${deps.ctx.root} is a packaged install — ${PACKAGED_SENTENCE}.`);
+    deps.io.err("       `collie update` will not replace its files.");
+    if (cmd !== null) deps.io.err(`       Take the new version with: ${cmd}`);
+    return EXIT.FAIL;
+  }
   if (install.kind === "unknown") {
     deps.io.err(`error: cannot tell how this Collie was installed (${unknownEvidence(deps, install.why)}).`);
     deps.io.err("       `collie update` will not guess. A git checkout refreshes with:");
@@ -900,6 +1017,13 @@ export async function cmdUpdate(deps: UpdateDeps, args: readonly string[] = []):
     return EXIT.FAIL;
   }
   if (staged && layout !== null) return await updateStagedCheckout(deps, layout, args);
+  // Read BEFORE the advance rewrites the manifest — this is the version being left behind, and it is
+  // the only moment it is still on disk. `handOff`'s callers get theirs from the `versions/` layout;
+  // an in-place checkout has no previous directory to name, so the manifest is the whole record of it.
+  const from = installedVersion(deps);
+  // The run's real start, for the record written at the end of it. Everything below this line is
+  // the run: the fetch, the advance, the build, the restart.
+  const startedAt = deps.now();
   const advanced = updateCheckout(deps, { crossMajor: wantsMajor(args), toTag: wantsToTag(args) });
   if (advanced.code !== EXIT.OK) return advanced.code;
   // Nothing was taken AND what is on disk is whole: stop here. This used to fall through, so
@@ -915,17 +1039,20 @@ export async function cmdUpdate(deps: UpdateDeps, args: readonly string[] = []):
     closeWithMajor(deps, advanced.higher);
     return EXIT.OK;
   }
-  if (deps.exec.which("bun") === null) {
+  const bun = resolveBun(deps);
+  if (bun === null) {
     deps.io.err("error: bun not found — the checkout advanced, but rebuilding needs Bun.");
     deps.io.err("       Install it from https://bun.sh and re-run update.");
     return EXIT.FAIL;
   }
   const r = deps.exec.runIn(
-    "bun",
+    bun.path,
     [join(deps.ctx.root, "cli", "main.ts"), "_apply-update"],
     deps.ctx.root,
+    dirname(bun.path),
   );
   if (!r.found || r.code !== 0) return EXIT.FAIL;
+  recordInPlaceRun(deps, wantsRunId(args), from, advanced.to, startedAt);
   // `_apply-update` ran as a child with our own stdio, so its `✓ update complete` is already on the
   // screen. This lands after it — the last line of the transcript.
   closeWithMajor(deps, advanced.higher);
@@ -1662,7 +1789,8 @@ async function updateStagedCheckout(
   const higher =
     plan.kind === "unknown-version" || (plan.kind === "advance" && plan.crossesMajor) ? null : plan.higher;
 
-  if (deps.exec.which("bun") === null) {
+  const bun = resolveBun(deps);
+  if (bun === null) {
     deps.io.err("error: bun not found — staging a version builds it, and that needs Bun.");
     deps.io.err("       Install it from https://bun.sh and re-run update. Nothing was changed.");
     return EXIT.FAIL;
@@ -1717,7 +1845,7 @@ async function updateStagedCheckout(
 
   // 3. The build, INSIDE the worktree and from the NEW source — the same handoff reason the in-place
   //    path re-execs for: the build logic that must run is the one that was just fetched.
-  const built = deps.exec.runIn("bun", [join(at, "cli", "main.ts"), "build"], at);
+  const built = deps.exec.runIn(bun.path, [join(at, "cli", "main.ts"), "build"], at, dirname(bun.path));
   if (!built.found || built.code !== 0) {
     deps.io.err(`error: update stopped at the BUILD stage — ${target.tag} did not build.`);
     deps.io.err("       `current` never moved: the running bridge and the served UI are unchanged.");
@@ -1964,7 +2092,7 @@ function handOff(
     args: applyArgv({ ...a, handoff: deps.pid }),
     unit: unitName(deps.ctx.instance),
     stamp: now.toString(36),
-    hasSystemdRun: deps.exec.which("systemd-run") !== null,
+    hasSystemdRun: deps.exec.which("systemd-run") !== null && systemdUserReachable(deps.exec),
     hasSetsid: deps.exec.which("setsid") !== null,
   });
   const pid = deps.exec.spawnDetached(plan.command, {

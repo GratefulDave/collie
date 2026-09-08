@@ -8,6 +8,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { clearStatus, useStatus } from "@/lib/status";
 import { isReloadHeld, __resetReloadGuard } from "@/lib/reload-guard";
 import { loadDraft } from "@/lib/drafts";
+import { __resetOperatorCommands } from "@/lib/operator-config";
 import { server } from "@/test/setup";
 import { fixtureServers, recordReply } from "@/test/handlers";
 import { PackProvider } from "./pack-provider";
@@ -67,11 +68,12 @@ function renderComposer(overrides: Partial<ComponentProps<typeof Composer>> = {}
     text: "pane output",
     terminalDraft: null,
     rawTerminalDraft: null,
-    prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
+    prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true },
     setWrap: vi.fn(),
     stepFontSize: vi.fn(),
     setRawTerminal: vi.fn(),
     setTapToFocus: vi.fn(),
+    setExpandClippedReply: vi.fn(),
     onSent: vi.fn(),
     ...overrides,
   };
@@ -118,11 +120,12 @@ function renderComposerWithStatus(
     text: "pane output",
     terminalDraft: null,
     rawTerminalDraft: null,
-    prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
+    prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true },
     setWrap: vi.fn(),
     stepFontSize: vi.fn(),
     setRawTerminal: vi.fn(),
     setTapToFocus: vi.fn(),
+    setExpandClippedReply: vi.fn(),
     onSent: vi.fn(),
     ...overrides,
   };
@@ -493,11 +496,12 @@ describe("Composer — send", () => {
               text="pane output"
               terminalDraft={null}
               rawTerminalDraft="leftover"
-              prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
+              prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true }}
               setWrap={vi.fn()}
               stepFontSize={vi.fn()}
               setRawTerminal={vi.fn()}
               setTapToFocus={vi.fn()}
+              setExpandClippedReply={vi.fn()}
               onSent={vi.fn()}
             />
           </>
@@ -586,11 +590,12 @@ describe("Composer — send", () => {
       text: "pane output",
       terminalDraft: null,
       rawTerminalDraft: null,
-      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
       setTapToFocus: vi.fn(),
+      setExpandClippedReply: vi.fn(),
       onSent: vi.fn(),
     };
     const router = createMemoryRouter([
@@ -682,11 +687,12 @@ describe("Composer — typing into the terminal", () => {
             text="pane output"
             terminalDraft={null}
             rawTerminalDraft={null}
-            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true }}
             setWrap={vi.fn()}
             stepFontSize={vi.fn()}
             setRawTerminal={vi.fn()}
             setTapToFocus={vi.fn()}
+            setExpandClippedReply={vi.fn()}
             onSent={vi.fn()}
           />
         </>
@@ -814,11 +820,12 @@ describe("Composer — typing into the terminal", () => {
             text="pane output"
             terminalDraft={null}
             rawTerminalDraft={null}
-            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true }}
             setWrap={vi.fn()}
             stepFontSize={vi.fn()}
             setRawTerminal={vi.fn()}
             setTapToFocus={vi.fn()}
+            setExpandClippedReply={vi.fn()}
             onSent={vi.fn()}
           />
         </>
@@ -1005,11 +1012,12 @@ describe("Composer — typing into the terminal", () => {
             text="pane output"
             terminalDraft={null}
             rawTerminalDraft={null}
-            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true }}
+            prefs={{ wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true }}
             setWrap={vi.fn()}
             stepFontSize={vi.fn()}
             setRawTerminal={vi.fn()}
             setTapToFocus={vi.fn()}
+            setExpandClippedReply={vi.fn()}
             onSent={vi.fn()}
           />
         </>
@@ -1114,6 +1122,7 @@ describe("Composer — the draft field wears its own size", () => {
         fontSize: 11,
         draftFontSize: 13,
         fontFamily: "jetbrains",
+        expandClippedReply: true,
         rawTerminal: false,
         tapToFocus: true,
       },
@@ -1723,11 +1732,12 @@ function renderDraftHarness(overrides: Partial<ComponentProps<typeof Composer>> 
       readOnly: false,
       dialogPresent: false,
       text: "pane output",
-      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
       setTapToFocus: vi.fn(),
+      setExpandClippedReply: vi.fn(),
       onSent: vi.fn(),
       ...rest,
       terminalDraft: stable,
@@ -1994,11 +2004,12 @@ describe("Composer — in-flight echo suppression (match-last-sent)", () => {
       text: "pane output",
       terminalDraft: draft,
       rawTerminalDraft: draft,
-      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
       setTapToFocus: vi.fn(),
+      setExpandClippedReply: vi.fn(),
       onSent: vi.fn(),
     };
     return (
@@ -2126,9 +2137,8 @@ describe("Composer — reload-guard hold (no-SW self-update safety gate)", () =>
     expect(isReloadHeld()).toBe(false);
 
     const file = new File(["x"], "shot.png", { type: "image/png" });
-    // SAFETY: the composer renders exactly one `input[type=file]` (its upload trigger), and
-    // `querySelector` is typed `Element | null` for an arbitrary selector string.
-    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    // SAFETY: `getByTestId` throws when the element is absent, and this id is on an `<input>`.
+    const fileInput = screen.getByTestId("attach-files") as HTMLInputElement;
     fireEvent.change(fileInput, { target: { files: [file] } });
 
     await waitFor(() => expect(isReloadHeld()).toBe(true)); // uploading → held
@@ -2148,7 +2158,7 @@ describe("Composer — quick keys / image attach", () => {
     expect(screen.queryByRole("button", { name: "Tab" })).not.toBeInTheDocument();
 
     // The attach button now lives on the always-visible reply-input row instead of the strip.
-    const attach = screen.getByRole("button", { name: "Attach image" });
+    const attach = screen.getByRole("button", { name: "Attach file" });
     expect(attach).toBeEnabled();
     await user.click(attach); // clickable without throwing (opens the hidden file input)
   });
@@ -2158,6 +2168,89 @@ describe("Composer — quick keys / image attach", () => {
     for (const d of ["1", "2", "3", "4", "5"]) {
       expect(screen.queryByRole("button", { name: d })).not.toBeInTheDocument();
     }
+  });
+});
+
+// The picker's own refusal (lib/attachments.ts), driven by what THIS bridge published on
+// /api/config's `upload` block — never the pre-attachment fallback, since every case here publishes
+// one. The store (lib/operator-config.ts) caches its one read for the life of a "page", so each case
+// resets it and republishes its own /api/config before rendering, and waits for the file input's
+// `accept` to reflect the published block before touching the picker — otherwise the assertion could
+// run against the LEGACY fallback the composer renders on its very first tick.
+describe("Composer — attachment limits published by this bridge", () => {
+  beforeEach(() => __resetOperatorCommands());
+  afterEach(() => __resetOperatorCommands());
+
+  function publishUpload(upload: { maxBytes: number; imageTypes: string[]; textTypes: string[] }) {
+    server.use(
+      http.get("/api/config", () => HttpResponse.json({ push: false, vapidPublicKey: "", upload })),
+    );
+  }
+
+  // The FILES input, not the photos one. The composer renders two (lib/attachments.ts explains
+  // why); the photos input's `accept` is the constant `image/*` and says nothing about what this
+  // bridge published, so every assertion here is about the second.
+  async function waitForPublishedAccept(accept: string) {
+    await waitFor(() => expect(screen.getByTestId("attach-files")).toHaveAttribute("accept", accept));
+  }
+
+  it("refuses a file larger than the published cap and never calls the upload API", async () => {
+    publishUpload({ maxBytes: 1 * 1024 * 1024, imageTypes: ["png"], textTypes: [] });
+    let uploadCalls = 0;
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/upload$/, () => {
+        uploadCalls++;
+        return HttpResponse.json({ ok: true, path: "/tmp/should-not-happen" });
+      }),
+    );
+    renderComposerWithStatus();
+    await waitForPublishedAccept("image/*,.png");
+
+    const file = new File(["x".repeat(2 * 1024 * 1024)], "shot.png", { type: "image/png" });
+    // SAFETY: `getByTestId` throws when the element is absent, and this id is on an `<input>`.
+    const fileInput = screen.getByTestId("attach-files") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent(/bigger than 1 MB/));
+    expect(uploadCalls).toBe(0);
+  });
+
+  it("uploads a .md file when the bridge published md in textTypes", async () => {
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: ["md"] });
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/upload$/, () => HttpResponse.json({ ok: true, path: "/tmp/notes.md" })),
+    );
+    renderComposer();
+    await waitForPublishedAccept("image/*,.png,.md");
+
+    const file = new File(["# hi"], "notes.md", { type: "text/markdown" });
+    // SAFETY: `getByTestId` throws when the element is absent, and this id is on an `<input>`.
+    const fileInput = screen.getByTestId("attach-files") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    const box = screen.getByPlaceholderText(/type a reply/i);
+    await waitFor(() => expect(box).toHaveValue("/tmp/notes.md"));
+  });
+
+  it("refuses a .rb file the bridge did not publish and never calls the upload API", async () => {
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: ["md"] });
+    let uploadCalls = 0;
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/upload$/, () => {
+        uploadCalls++;
+        return HttpResponse.json({ ok: true, path: "/tmp/should-not-happen" });
+      }),
+    );
+    renderComposerWithStatus();
+    await waitForPublishedAccept("image/*,.png,.md");
+
+    const file = new File(["puts 1"], "app.rb", { type: "text/x-ruby" });
+    // SAFETY: `getByTestId` throws when the element is absent, and this id is on an `<input>`.
+    const fileInput = screen.getByTestId("attach-files") as HTMLInputElement;
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    await waitFor(() => expect(screen.getByTestId("status")).toHaveTextContent("Collie can't attach app.rb."));
+    expect(uploadCalls).toBe(0);
   });
 });
 
@@ -2177,6 +2270,17 @@ describe("Composer — clipboard image paste", () => {
   });
 
   it("leaves a plain-text paste alone — no upload, nothing written by the paste handler", () => {
+    // The regression that matters most: `onPasteFile` only intercepts `item.kind === "file"`, so a
+    // clipboard item MSW/jsdom never sees as a file (kind "string", the shape a normal text copy
+    // produces) must fall straight through to the textarea's own paste handling — no upload call,
+    // no path written into the box.
+    let uploadCalls = 0;
+    server.use(
+      http.post(/\/api\/pane\/[^/]+\/upload$/, () => {
+        uploadCalls++;
+        return HttpResponse.json({ ok: true, path: "/tmp/should-not-happen" });
+      }),
+    );
     renderComposer();
     const box = screen.getByPlaceholderText(/type a reply/i);
     const item = { kind: "string", type: "text/plain", getAsFile: () => null };
@@ -2185,6 +2289,7 @@ describe("Composer — clipboard image paste", () => {
 
     expect(box).toHaveValue("");
     expect(screen.queryByText(/Image added/i)).not.toBeInTheDocument();
+    expect(uploadCalls).toBe(0);
   });
 });
 
@@ -2536,11 +2641,12 @@ describe("Composer — draft persistence", () => {
       text: "pane output",
       terminalDraft: null,
       rawTerminalDraft: null,
-      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true },
+      prefs: { wrap: true, fontSize: 11, draftFontSize: 14, fontFamily: "system", rawTerminal: false, tapToFocus: true, expandClippedReply: true },
       setWrap: vi.fn(),
       stepFontSize: vi.fn(),
       setRawTerminal: vi.fn(),
       setTapToFocus: vi.fn(),
+      setExpandClippedReply: vi.fn(),
       onSent: vi.fn(),
       ...overrides,
     };
@@ -2649,7 +2755,7 @@ describe("Composer — the placeholder cannot resize the field", () => {
 // `break-word` (the textarea's UA default) does not. `ui/chat/chat-input.tsx` carries
 // `field-sizing-content`, which is the property that turns an intrinsic width into a laid-out one,
 // so under the default the field's min-content width was the width of the longest unbreakable
-// token. `uploadImage()` appends exactly such a token — the bridge's host path for the attached
+// token. `uploadFile()` appends exactly such a token — the bridge's host path for the attached
 // image — so the composer row was laid out wider than the screen and Send, its last element,
 // landed past the right edge. Measured in Chrome at 390px; reported as "the Send button
 // disappeared after I uploaded a picture".
@@ -2682,5 +2788,126 @@ describe("Composer — a long upload path cannot widen the field", () => {
 
     await waitFor(() => expect(box).toHaveValue(path));
     expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();
+  });
+});
+
+// ── THE PICKER ASKS WHICH, BECAUSE ONE INPUT CANNOT ─────────────────────────────────────────────
+//
+// A phone offers the camera roll only when every entry in `accept` maps to a gallery, so the
+// extension list that makes a `.md` pickable is what hid the gallery: the attach button opened the
+// file browser and nothing else. Two inputs, and one question in front of them.
+describe("Composer — the attach picker offers photos as well as files", () => {
+  beforeEach(() => __resetOperatorCommands());
+  afterEach(() => __resetOperatorCommands());
+
+  function publishUpload(upload: { maxBytes: number; imageTypes: string[]; textTypes: string[] }) {
+    server.use(
+      http.get("/api/config", () => HttpResponse.json({ push: false, vapidPublicKey: "", upload })),
+    );
+  }
+
+  it("the photos input asks for image/* alone, whatever else the bridge publishes", async () => {
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: ["md", "ts"] });
+    renderComposer();
+    await waitFor(() =>
+      expect(screen.getByTestId("attach-files")).toHaveAttribute("accept", "image/*,.png,.md,.ts"),
+    );
+    expect(screen.getByTestId("attach-photos")).toHaveAttribute("accept", "image/*");
+  });
+
+  it("flashes the icon and buzzes on the tap, and lets go once nothing is standing on it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const buzzes: unknown[] = [];
+    // `navigator.vibrate` is undefined in jsdom, which is also how iOS Safari behaves — so the
+    // stub is what makes the call observable, not a change in behaviour.
+    Object.defineProperty(navigator, "vibrate", {
+      configurable: true,
+      value: (ms: number) => {
+        buzzes.push(ms);
+        return true;
+      },
+    });
+    // The PHOTOS-ONLY host, deliberately: there the tap opens a native picker and nothing else, so
+    // the flash is the whole of the acknowledgement and its timer is observable. On a host that
+    // opens the picker menu the button stays lit for as long as that menu stands, which the
+    // anchored-picker test above covers.
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: [] });
+    renderComposer();
+    await waitFor(() =>
+      expect(screen.getByTestId("attach-files")).toHaveAttribute("accept", "image/*,.png"),
+    );
+
+    // Anchored on whitespace: the ghost variant carries `hover:bg-accent` at rest, and a bare
+    // substring match would read that as the pressed tone on every render.
+    const PRESSED = /(^|\s)bg-primary(\s|$)/;
+    const attach = screen.getByRole("button", { name: "Attach file" });
+    expect(attach.className).not.toMatch(PRESSED);
+    await user.click(attach);
+    expect(buzzes).toHaveLength(1);
+    expect(attach.className).toMatch(PRESSED);
+
+    // The flash is a timer, not a state the button can get stuck in.
+    await vi.advanceTimersByTimeAsync(400);
+    await waitFor(() => expect(attach.className).not.toMatch(PRESSED));
+  });
+
+  it("opens the two-row picker on a bridge that takes text as well, ABOVE the button", async () => {
+    const user = userEvent.setup();
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: ["md"] });
+    renderComposer();
+    await waitFor(() =>
+      expect(screen.getByTestId("attach-files")).toHaveAttribute("accept", "image/*,.png,.md"),
+    );
+    const attach = screen.getByRole("button", { name: "Attach file" });
+    expect(attach).toHaveAttribute("aria-expanded", "false");
+    await user.click(attach);
+    expect(await screen.findByRole("button", { name: "Photos" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Files" })).toBeInTheDocument();
+    expect(attach).toHaveAttribute("aria-expanded", "true");
+    // ABOVE, not over. A bottom sheet covered this button 42ms after the tap, which is what made
+    // its press highlight unseeable; the anchor is what the highlight depends on.
+    expect(screen.getByRole("dialog").className).toMatch(/(^|\s)bottom-full(\s|$)/);
+    // And the trigger stays lit under its own open menu.
+    expect(attach.className).toMatch(/(^|\s)bg-primary(\s|$)/);
+  });
+
+  it("a photos-only bridge opens the camera roll directly — no sheet with one answer in it", async () => {
+    const user = userEvent.setup();
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: [] });
+    renderComposer();
+    await waitFor(() =>
+      expect(screen.getByTestId("attach-files")).toHaveAttribute("accept", "image/*,.png"),
+    );
+    let opened: string | null = null;
+    for (const id of ["attach-photos", "attach-files"]) {
+      screen.getByTestId(id).addEventListener("click", () => {
+        opened = id;
+      });
+    }
+    await user.click(screen.getByRole("button", { name: "Attach file" }));
+    expect(screen.queryByRole("button", { name: "Photos" })).not.toBeInTheDocument();
+    expect(opened).toBe("attach-photos");
+  });
+
+  it("each row opens its own input, and the sheet closes behind it", async () => {
+    const user = userEvent.setup();
+    publishUpload({ maxBytes: 10 * 1024 * 1024, imageTypes: ["png"], textTypes: ["md"] });
+    renderComposer();
+    await waitFor(() =>
+      expect(screen.getByTestId("attach-files")).toHaveAttribute("accept", "image/*,.png,.md"),
+    );
+    const opened: string[] = [];
+    for (const id of ["attach-photos", "attach-files"]) {
+      screen.getByTestId(id).addEventListener("click", () => opened.push(id));
+    }
+
+    await user.click(screen.getByRole("button", { name: "Attach file" }));
+    await user.click(await screen.findByRole("button", { name: "Photos" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Photos" })).not.toBeInTheDocument());
+
+    await user.click(screen.getByRole("button", { name: "Attach file" }));
+    await user.click(await screen.findByRole("button", { name: "Files" }));
+    expect(opened).toEqual(["attach-photos", "attach-files"]);
   });
 });

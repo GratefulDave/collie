@@ -17,7 +17,7 @@ import {
   type SeededFiles,
 } from "./fakes.ts";
 import type { Net } from "./sys.ts";
-import { parseUpdateRun, STALE_AFTER_MS, UPDATE_RUN_SCHEMA } from "../bridge/update-run.ts";
+import { packTurnStart, parseUpdateRun, STALE_AFTER_MS, UPDATE_RUN_SCHEMA } from "../bridge/update-run.ts";
 import {
   boundTail,
   healthTimeoutMs,
@@ -443,6 +443,14 @@ describe("updateCheckout", () => {
     expect(h.io.stdout.join("\n")).toContain("update-major --plugin herdr.collie");
   });
 
+  test("the consent command names THIS instance's plugin id, not the host's first Collie", () => {
+    // `COLLIE_INSTANCE=next` is registered with Herdr as `herdr.collie-next`. Printing the bare id
+    // here would send the operator to cross a major on a different service on the same host.
+    const h = linked("main", "1.0.0");
+    expect(updateCheckout({ ...h.deps, ctx: { ...h.deps.ctx, instance: "next" } }).code).toBe(EXIT.OK);
+    expect(h.io.stdout.join("\n")).toContain("update-major --plugin herdr.collie-next");
+  });
+
   test("--major lets the same clone through, on its branch and with its ff-only pull", () => {
     const h = linked("main", "1.0.0");
     expect(updateCheckout(h.deps, { crossMajor: true }).code).toBe(EXIT.OK);
@@ -728,10 +736,94 @@ describe("update", () => {
       ],
     });
     expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
-    expect(h.exec.calls).toContain(`${ROOT}$ bun ${ROOT}/cli/main.ts _apply-update`);
+    expect(h.exec.calls).toContain(`${ROOT}$ PATH=/fake:$PATH /fake/bun ${ROOT}/cli/main.ts _apply-update`);
     // Nothing of the second half ran in THIS process.
     expect(h.restarts).toBe(0);
     expect(h.exec.calls.some((c) => c.includes("check-version.sh"))).toBe(false);
+  });
+
+  test("the handoff re-execs the resolved Bun, even when PATH does not name it", async () => {
+    const h = harness({
+      installed: "0.31.1",
+      absent: ["bun"],
+      answers: [
+        ...MANAGED,
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
+        [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
+        ...SHALLOW,
+      ],
+    });
+    h.files.entries.set("/opt/bun/bin/bun", { text: "" });
+    h.deps.ctx.env.BUN_INSTALL = "/opt/bun";
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    expect(h.exec.calls).toContain(
+      `${ROOT}$ PATH=/opt/bun/bin:$PATH /opt/bun/bin/bun ${ROOT}/cli/main.ts _apply-update`,
+    );
+  });
+
+  test("records the run it just finished, so a restarted lead can find its pack turns", async () => {
+    // The bug this pins: the in-place path wrote nothing, so `settleUpdateGate` in bridge/index.ts
+    // re-read a file that was not there, `updateTurns.begin` never ran, and no peer was ever handed
+    // its turn. The lead updated itself and the pack sat still until the operator retried by hand.
+    const h = harness({
+      installed: "0.31.1",
+      answers: [
+        ...MANAGED,
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
+        [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
+        ...SHALLOW,
+      ],
+    });
+    expect(await cmdUpdate(h.deps, ["--run-id", "r-99"])).toBe(EXIT.OK);
+    const written = h.files.read(`${STATE}/update.json`);
+    const run = JSON.parse(written ?? "{}");
+    // `done` and a run id are the two things the gate reads; `to` is what the peers level to, and it
+    // is the version the tree advanced TO, never the one we booted on — the whole reason the read
+    // happens after the advance.
+    expect(run.state).toBe("done");
+    expect(run.runId).toBe("r-99");
+    expect(run.to).toBe(STAGED_TARGET);
+    expect(run.from).toBe("0.31.1");
+
+    // THE SEAM, held from both sides. The bug was never the missing file, it was that the bridge
+    // found nothing to start turns from. So the record this CLI just wrote goes through the BRIDGE's
+    // own parser and the BRIDGE's own predicate, and the pair it hands the turn queue is asserted
+    // here. Either side moving alone fails this test, which is what the old arrangement could not do.
+    expect(packTurnStart(parseUpdateRun(written))).toEqual({ runId: "r-99", to: STAGED_TARGET });
+  });
+
+  test("a run started from a terminal is recorded with no id, never a blank one", async () => {
+    const h = harness({
+      installed: "0.31.1",
+      answers: [
+        ...MANAGED,
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
+        [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
+        ...SHALLOW,
+      ],
+    });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    const written = h.files.read(`${STATE}/update.json`);
+    const run = JSON.parse(written ?? "{}");
+    expect(run.state).toBe("done");
+    expect(run.runId ?? null).toBeNull();
+    // And the gate correctly starts NOTHING from it: a run with no id was nobody's pack confirm.
+    expect(packTurnStart(parseUpdateRun(written))).toBeNull();
+  });
+
+  test("a build that fails records nothing — the lead did not move, so no peer may", async () => {
+    const h = harness({
+      installed: "0.31.1",
+      answers: [
+        ...MANAGED,
+        [`${GIT} ls-remote --tags ${TAG_REMOTE}`, { stdout: LS_REMOTE }],
+        [`${GIT} rev-parse HEAD`, { stdout: "a1a1a1a1\n" }],
+        ...SHALLOW,
+        [`${ROOT}$ PATH=/fake:$PATH /fake/bun ${ROOT}/cli/main.ts _apply-update`, { code: 1 }],
+      ],
+    });
+    expect(await cmdUpdate(h.deps, ["--run-id", "r-99"])).toBe(EXIT.FAIL);
+    expect(h.files.read(`${STATE}/update.json`)).toBeNull();
   });
 
   test("a checkout that would not advance never reaches the rebuild", async () => {
@@ -867,7 +959,7 @@ describe("update", () => {
       ],
     });
     expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
-    expect(h.exec.calls).toContain(`${ROOT}$ bun ${ROOT}/cli/main.ts _apply-update`);
+    expect(h.exec.calls).toContain(`${ROOT}$ PATH=/fake:$PATH /fake/bun ${ROOT}/cli/main.ts _apply-update`);
     // Twice: once at the decision, once at the end.
     expect(h.io.stdout.filter((l) => l.includes("update-major --plugin herdr.collie"))).toHaveLength(2);
     expect(h.io.stdout.at(-1)).toContain("Collie 1.0.0 is out — a NEW MAJOR. Take it with:");
@@ -1028,6 +1120,8 @@ interface BinaryOptions {
   hooksCheck?: Partial<import("./sys.ts").ExecResult>;
   /** What `/api/health` answers, in order — the detached runner's gate polls it (M15/04). */
   health?: readonly HealthReply[];
+  /** Extra scripted answers, appended after the fixture's own — e.g. a failing systemd bus probe. */
+  answers?: Scripted["answers"];
 }
 
 /** One `/api/health` answer for the fake net: down, deposed, or up as some version. */
@@ -1068,7 +1162,7 @@ function binaryHarness(over: BinaryOptions = {}): Harness {
     version("1.0.0"),
     [`${INST}/current/bin/collie hooks status --check`, over.hooksCheck ?? { code: EXIT.OK }],
   ];
-  const exec = fakeExec({ answers });
+  const exec = fakeExec({ answers: [...answers, ...(over.answers ?? [])] });
   const seed: SeededFiles = {
     [`${BROOT}/herdr-plugin.toml`]: 'id = "herdr.collie"\nversion = "1.0.0"\n',
     [`${BROOT}/bin/collie`]: "OLD BINARY",
@@ -1168,6 +1262,20 @@ describe("collie update on a binary install", () => {
     expect(h.exec.calls.join("\n")).not.toContain("bun ");
     // The state file says `staging`, so a bridge that comes up now reports a run in flight.
     expect(JSON.parse(h.files.read(`${STATE}/update.json`) ?? "{}").state).toBe("staging");
+    expect(h.exec.spawned[0]?.command[0]).toBe("systemd-run");
+  });
+
+  test("a systemd-run binary with no reachable user bus falls back to setsid, not a doomed handoff", async () => {
+    // The exact shape a container ships: the systemd package is on disk (`which systemd-run`
+    // finds it) but no user manager or session bus is running (`systemctl --user
+    // show-environment` fails) — the failure `handOff` used to miss, wedging every update behind
+    // a `systemd-run` that starts, can't reach the bus, and exits without ever handing off.
+    const h = binaryHarness({
+      others: ["0.9.0"],
+      answers: [["systemctl --user show-environment", { code: 1 }]],
+    });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    expect(h.exec.spawned[0]?.command[0]).toBe("setsid");
   });
 
   test("the runner flips `current` with one rename, restarts through it, and only then prunes", async () => {
@@ -1473,7 +1581,7 @@ describe("the staged checkout path", () => {
       `${GIT} worktree add --detach --force ${WT("v0.32.0")} refs/tags/v0.32.0`,
     );
     // The build runs INSIDE the worktree, from the source that was just checked out there.
-    expect(h.exec.calls).toContain(`${WT("v0.32.0")}$ bun ${WT("v0.32.0")}/cli/main.ts build`);
+    expect(h.exec.calls).toContain(`${WT("v0.32.0")}$ PATH=/fake:$PATH /fake/bun ${WT("v0.32.0")}/cli/main.ts build`);
     // The marker is the build's last act…
     expect(JSON.parse(h.files.read(`${WT("v0.32.0")}/.collie-build`) ?? "{}")).toEqual({
       version: "0.32.0",
@@ -1525,7 +1633,7 @@ describe("the staged checkout path", () => {
   });
 
   test("a build fail leaves `current` where it was, names the stage, and takes the worktree away", async () => {
-    const h = legacyClone({ answers: [[`${WT("v0.32.0")}$ bun`, { code: 1 }]] });
+    const h = legacyClone({ answers: [[`${WT("v0.32.0")}$ PATH=/fake:$PATH /fake/bun`, { code: 1 }]] });
     expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
     expect(h.io.stderr.join("\n")).toContain("stopped at the BUILD stage");
     expect(h.io.stderr.join("\n")).toContain("`current` never moved");
@@ -1535,6 +1643,33 @@ describe("the staged checkout path", () => {
     // …and both halves of the worktree go, directory and administrative record together.
     expect(h.files.ops).toContain(`rm -rf ${WT("v0.32.0")}`);
     expect(h.exec.calls).toContain(`${GIT} worktree prune`);
+  });
+
+  test("a Bun only off PATH still builds the stage, by its absolute path and on the child's PATH", async () => {
+    // #169's other half. The preflight already resolves Bun through the candidate list, so a Herdr
+    // action with no login shell reports GREEN — and the verb has to run the SAME Bun, or the
+    // operator is told the update can proceed by a check the update then contradicts.
+    const h = legacyClone({ absent: ["bun"] });
+    h.files.entries.set(`${HOME}/.bun/bin/bun`, { text: "" });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    // The directory rides along at the FRONT of the child's PATH, and that half is not decoration.
+    // A phone-started update runs in a transient systemd user unit with no operator PATH, and
+    // `bun cli/main.ts build` shells out to `bunx tsc` — found by NAME or not at all. A lab run on a
+    // host whose Bun lives only in `~/.bun/bin` advanced the checkout and then died there:
+    // `bunx: command not found`, exit 127, with no binary and no `web/dist` to show for it.
+    expect(h.exec.calls).toContain(
+      `${WT("v0.32.0")}$ PATH=${HOME}/.bun/bin:$PATH ${HOME}/.bun/bin/bun ${WT("v0.32.0")}/cli/main.ts build`,
+    );
+  });
+
+  test("the refusal is kept for the one case that earns it: nothing resolves anywhere", async () => {
+    // Same fixture as above minus the file — so what the guard reads is `resolveTool`'s null, never
+    // a bare `which` that a candidate would have answered.
+    const h = legacyClone({ absent: ["bun"] });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
+    expect(h.io.stderr.join("\n")).toContain("bun not found");
+    expect(h.io.stderr.join("\n")).toContain("Nothing was changed.");
+    expect(gitRuns(h.exec).join("\n")).not.toContain("worktree add");
   });
 
   test("a fetch that fails stops before any worktree is added", async () => {
@@ -2006,5 +2141,73 @@ describe("the update run id", () => {
     expect(wantsRunId(["update", "--run-id", "r-1"])).toBe("r-1");
     expect(wantsRunId(["update", "--run-id=r-1"])).toBe("r-1");
     expect(wantsRunId(["update", "--to-tag", "v1.1.0"])).toBeNull();
+  });
+});
+
+// ── The install `update` must decline ────────────────────────────────────────
+// A package manager laid this Collie down in a folder it owns. Declining is the correct outcome,
+// not a diagnosis failure — and it has to READ that way, because the shape used to fall out as
+// `unknown` and tell operators their packaged install was unrecognisable.
+
+describe("cmdUpdate — a folder a package manager owns", () => {
+  /** A root with a marker, no `.git`, and outside `$HOME` — `/opt/collie`, the fake's own root. */
+  function packaged() {
+    return harness({ answers: [[`${GIT} rev-parse --git-dir`, { code: 128 }]], installed: "1.5.2" });
+  }
+
+  test("it refuses, and never reaches git, bun or the network", async () => {
+    const h = packaged();
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
+    expect(h.exec.calls.some((c) => c.includes("ls-remote"))).toBe(false);
+    expect(h.exec.calls.some((c) => c.includes("bun"))).toBe(false);
+    expect(h.restarts).toBe(0);
+  });
+
+  test("it names the root and the boundary, and does not diagnose a fault", async () => {
+    const h = packaged();
+    await cmdUpdate(h.deps);
+    const said = h.io.stderr.join("\n");
+    expect(said).toContain(ROOT);
+    expect(said).toContain("updates come from your package manager");
+    // The old wording for this shape. Printing it here is the bug the kind exists to fix.
+    expect(said).not.toContain("cannot tell how this Collie was installed");
+    expect(said).not.toContain("herdr plugin install");
+  });
+
+  test("a root whose prefix names a manager gets the command; one nobody knows gets none", async () => {
+    // `/opt/collie` is where `collie-bin` installs, so the command is named. A root no manager
+    // claims gets the boundary and stops, rather than a command the operator cannot run.
+    const h = packaged();
+    await cmdUpdate(h.deps);
+    expect(h.io.stderr.join("\n")).toContain("Take the new version with: sudo pacman -Syu collie-bin");
+
+    const nameless = "/srv/collie";
+    const u = harness({ answers: [[`git -C ${nameless} rev-parse --git-dir`, { code: 128 }]], installed: "1.5.2" });
+    u.files.entries.set(`${nameless}/herdr-plugin.toml`, { text: 'version = "1.5.2"\n' });
+    expect(await cmdUpdate({ ...u.deps, ctx: { ...u.deps.ctx, root: nameless } })).toBe(EXIT.FAIL);
+    expect(u.io.stderr.join("\n")).toContain("updates come from your package manager");
+    expect(u.io.stderr.join("\n")).not.toContain("Take the new version with:");
+  });
+
+  test("`--rollback` gets this boundary too, not the checkout lecture", async () => {
+    // `--rollback` is dispatched above the kind fork, so before this it fell through to three
+    // sentences about `versions/` layouts and `git checkout v<version>` — none of which exist here.
+    const h = packaged();
+    expect(await cmdUpdate(h.deps, ["--rollback"])).toBe(EXIT.FAIL);
+    const said = h.io.stderr.join("\n");
+    expect(said).toContain("updates come from your package manager");
+    expect(said).not.toContain("git checkout");
+    expect(said).not.toContain("ADR 0006");
+  });
+
+  test("a writable, user-owned root INSIDE $HOME still reports the unknown it really is", async () => {
+    // The near-miss the predicate must keep refusing to claim: all three of clause 4's disjuncts are
+    // false here, so a tarball someone unpacked into their own home is still `loose-binary`.
+    const inHome = `${HOME}/collie`;
+    const h = harness({ answers: [[`git -C ${inHome} rev-parse --git-dir`, { code: 128 }]] });
+    h.files.entries.set(`${inHome}/herdr-plugin.toml`, { text: 'version = "1.5.2"\n' });
+    const deps = { ...h.deps, ctx: { ...h.deps.ctx, root: inHome } };
+    expect(await cmdUpdate(deps)).toBe(EXIT.FAIL);
+    expect(h.io.stderr.join("\n")).toContain("cannot tell how this Collie was installed");
   });
 });

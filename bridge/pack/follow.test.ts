@@ -23,6 +23,7 @@ import {
 import { member as fixtureMember, neverProxy } from "./fixtures.ts";
 import { PackLead } from "./lead.ts";
 import { PackRegistry } from "./registry.ts";
+import { DEFAULT_MAX_UPLOAD_BYTES } from "../uploads.ts";
 
 // The peer's eight guards and the lead's turn queue, both as data. Nothing here spawns anything:
 // the one detached-updater spawn is a seam, and the preflight subprocess is another, so the whole
@@ -44,6 +45,7 @@ const run = (over: Partial<UpdateRun> = {}): UpdateRun => ({
 });
 
 const facts = (over: Partial<FollowFacts> = {}): FollowFacts => ({
+  installKind: "detached-checkout",
   own: "1.4.0",
   self: "attic",
   leadRelease: "1.4.1",
@@ -102,6 +104,25 @@ describe("what a lead may state about itself", () => {
 });
 
 describe("the peer's guards", () => {
+  test("guard 0: a packaged peer refuses first, whatever else is true", () => {
+    // The regression this pins. A packaged install's preflight is GREEN BY DESIGN, so before
+    // this guard existed such a peer sailed straight through firstRed() in followDecision and spawned
+    // a `collie update` every hour that could only ever refuse — the exact failure ADR 0035 exists to
+    // eliminate, on this path instead of the phone tap. Every other fact here is otherwise a clean
+    // follow: a real answer would be `{ kind: "follow" }` without this guard.
+    const d = followGuards(facts({ installKind: "packaged" }));
+    expect(d.kind).toBe("refuse");
+    expect(d.kind === "refuse" && d.reason).toBe("install-is-packaged");
+  });
+
+  test("every other kind still reaches the ordinary guards", () => {
+    // The control: guard 0 must not fire on anything else, or it would silently stop every peer
+    // from following.
+    for (const kind of ["detached-checkout", "linked-clone", "binary", "unknown"] as const) {
+      expect(followGuards(facts({ installKind: kind })).kind).toBe("follow");
+    }
+  });
+
   test("guard 1: a dev build never follows, and says so", () => {
     const d = followGuards(facts({ own: "1.4.0-dev+ab12cd3" }));
     expect(d.kind).toBe("refuse");
@@ -216,11 +237,13 @@ describe("the follower spawns the one updater there is", () => {
   const follower = (over: {
     report?: PreflightReport | null;
     own?: string;
+    installKind?: FollowFacts["installKind"];
     record?: UpdateRun | null;
     start?: (a: { tag: string; runId: string }) => { ok: true } | { ok: false; reason: string };
   } = {}) => {
     const started: { tag: string; runId: string }[] = [];
     const f = new PackFollower({
+      installKind: over.installKind ?? "detached-checkout",
       self: () => ({ version: over.own ?? "1.4.0", self: "attic" }),
       run: () => over.record ?? null,
       preflight: () => Promise.resolve(over.report === undefined ? green : over.report),
@@ -251,6 +274,20 @@ describe("the follower spawns the one updater there is", () => {
     expect(f.last()?.kind).toBe("refuse");
   });
 
+  test("a packaged peer never spawns the updater, on a green preflight, granted a real turn", async () => {
+    // End to end, through the same entry point the router calls on every sweep. Before the guard-0
+    // fix this reached firstRed(green) === null and called deps.start() — spawning a `collie update`
+    // that would only ever refuse on its own packaged branch, once an hour, forever.
+    const { f, started } = follower({ installKind: "packaged" });
+    f.observe({ leadRelease: "1.4.1", turn: formatTurn("attic", RUN_ID) });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(started).toEqual([]);
+    const last = f.last();
+    expect(last?.kind).toBe("refuse");
+    expect(last?.kind === "refuse" && last.reason).toBe("install-is-packaged");
+  });
+
   test("an updater that will not start is recorded as a refusal rather than thrown", async () => {
     const { f } = follower({ start: () => ({ ok: false, reason: "systemd-run: no such unit" }) });
     f.observe({ leadRelease: "1.4.1", turn: formatTurn("attic", RUN_ID) });
@@ -272,7 +309,7 @@ describe("the lead's turn queue", () => {
   });
 
   test("one turn at a time, and nobody else is addressed", () => {
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     turns.begin(RUN_ID, "1.4.1");
     turns.observe(
       [member({ memberId: "attic", enrolledAt: 1 }), member({ memberId: "basement", enrolledAt: 2 })],
@@ -283,7 +320,7 @@ describe("the lead's turn queue", () => {
   });
 
   test("the queue is in trust-store enrolment order, not member-id order", () => {
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     turns.begin(RUN_ID, "1.4.1");
     // `attic` sorts first alphabetically and joined LAST, so enrolment order must hand the turn to
     // `zeta`. This is the whole of why the ordering is stated rather than left incidental.
@@ -293,7 +330,7 @@ describe("the lead's turn queue", () => {
   });
 
   test("a member whose preflight is unknown or red is never handed a turn", () => {
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     turns.begin(RUN_ID, "1.4.1");
     turns.observe(
       [
@@ -311,7 +348,7 @@ describe("the lead's turn queue", () => {
 
   test("the turn releases on the new version, on rolled-back, and on three missed sweeps", () => {
     // (a) the member reports the new version.
-    const onVersion = new UpdateTurns();
+    const onVersion = new UpdateTurns(() => {});
     onVersion.begin(RUN_ID, "1.4.1");
     onVersion.observe([member({ memberId: "attic" }), member({ memberId: "basement", enrolledAt: 2 })], NOW);
     const releasedByVersion = onVersion.observe(
@@ -322,7 +359,7 @@ describe("the lead's turn queue", () => {
     expect(onVersion.turnFor("basement")).not.toBeNull();
 
     // (b) the member reports rolled-back.
-    const onRollback = new UpdateTurns();
+    const onRollback = new UpdateTurns(() => {});
     onRollback.begin(RUN_ID, "1.4.1");
     onRollback.observe([member({ memberId: "attic" }), member({ memberId: "basement", enrolledAt: 2 })], NOW);
     const releasedByRollback = onRollback.observe(
@@ -340,7 +377,7 @@ describe("the lead's turn queue", () => {
     expect(onRollback.turnFor("basement")).not.toBeNull();
 
     // (c) three consecutive missed sweeps.
-    const onMisses = new UpdateTurns();
+    const onMisses = new UpdateTurns(() => {});
     onMisses.begin(RUN_ID, "1.4.1");
     onMisses.observe([member({ memberId: "attic" }), member({ memberId: "basement", enrolledAt: 2 })], NOW);
     let last = { released: false };
@@ -356,7 +393,7 @@ describe("the lead's turn queue", () => {
   });
 
   test("an immediate sweep is earned only by a release, never by an ordinary fold", () => {
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     turns.begin(RUN_ID, "1.4.1");
     expect(turns.observe([member({ memberId: "attic" })], NOW).released).toBe(false);
     expect(turns.observe([member({ memberId: "attic" })], NOW).released).toBe(false);
@@ -364,14 +401,14 @@ describe("the lead's turn queue", () => {
   });
 
   test("a lead restart re-grants rather than resuming a persisted turn", () => {
-    const before = new UpdateTurns();
+    const before = new UpdateTurns(() => {});
     before.begin(RUN_ID, "1.4.1");
     before.observe([member({ memberId: "attic" }), member({ memberId: "basement", enrolledAt: 2 })], NOW);
     expect(before.turnFor("attic")).not.toBeNull();
 
     // A brand-new instance IS the restarted lead: nothing about the queue was on disk, so it holds
     // no turn until a sweep re-derives one, and a member already on the new version is not in it.
-    const after = new UpdateTurns();
+    const after = new UpdateTurns(() => {});
     expect(after.turnFor("attic")).toBeNull();
     after.begin(RUN_ID, "1.4.1");
     after.observe([member({ memberId: "attic", version: "1.4.1" }), member({ memberId: "basement", enrolledAt: 2 })], NOW);
@@ -380,7 +417,7 @@ describe("the lead's turn queue", () => {
   });
 
   test("it never steps a peer down: a member ahead of the target is done, never a candidate", () => {
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     turns.begin(RUN_ID, "1.4.1");
     turns.observe([member({ memberId: "attic", version: "1.5.0" })], NOW);
     // Nothing in the queue can express "go back to 1.4.1", so the member simply holds no turn. The
@@ -390,8 +427,100 @@ describe("the lead's turn queue", () => {
     expect(turns.peerLegs().find((l) => l.name === "attic")?.state).toBe("done");
   });
 
+  test("package-managed is terminal: a run completes with a packaged member present", () => {
+    const turns = new UpdateTurns(() => {});
+    turns.begin(RUN_ID, "1.4.1");
+    turns.observe(
+      [
+        member({ memberId: "attic", enrolledAt: 1, installKind: "packaged" }),
+        member({ memberId: "basement", enrolledAt: 2 }),
+      ],
+      NOW,
+    );
+    const attic = turns.peerLegs().find((l) => l.name === "attic");
+    expect(attic?.state).toBe("package-managed");
+    // Terminal like `done`: the turn went straight past it to the next member, so nothing in the run
+    // is waiting on a machine that will never move.
+    expect(turns.turnFor("attic")).toBeNull();
+    expect(turns.turnFor("basement")).not.toBeNull();
+
+    // And the run completes with it present: `basement` reports the target, and the only member left
+    // is the packaged one, which holds no turn and blocks nothing.
+    const released = turns.observe(
+      [
+        member({ memberId: "attic", enrolledAt: 1, installKind: "packaged" }),
+        member({ memberId: "basement", enrolledAt: 2, version: "1.4.1" }),
+      ],
+      NOW,
+    );
+    expect(released.released).toBe(true);
+    expect(turns.turnFor("attic")).toBeNull();
+    expect(turns.peerLegs().every((l) => l.state !== "waiting" && l.state !== "updating")).toBe(true);
+  });
+
+  test("the lead never grants a turn to a packaged member, whatever else the sweep says", () => {
+    // Pure and offline: this is the whole of "the lead never grants a turn to a packaged member".
+    // Green preflight, reachable, behind the target — every reason to be handed the turn but one.
+    for (const over of [{ verdict: "green" as const }, { verdict: "amber" as const }, { answered: false }]) {
+      const turns = new UpdateTurns(() => {});
+      turns.begin(RUN_ID, "1.4.1");
+      turns.observe([member({ memberId: "attic", installKind: "packaged", ...over })], NOW);
+      expect(turns.turnFor("attic")).toBeNull();
+      expect(turns.peerLegs().find((l) => l.name === "attic")?.state).toBe("package-managed");
+    }
+
+    // A member that names NO kind is unknown, and unknown is not packaged: it is driven exactly as
+    // it was before the field existed.
+    const older = new UpdateTurns(() => {});
+    older.begin(RUN_ID, "1.4.1");
+    older.observe([member({ memberId: "attic" })], NOW);
+    expect(older.turnFor("attic")).not.toBeNull();
+  });
+
+  test("a packaged member that has gone quiet reads unreachable, not calm", () => {
+    // `package-managed` takes the place of `waiting` and nothing else. A machine nobody has heard
+    // from in three sweeps may be off, and "waits for its package manager" would be a calm sentence
+    // about a peer that is not answering at all.
+    const turns = new UpdateTurns(() => {});
+    turns.begin(RUN_ID, "1.4.1");
+    for (let i = 0; i < TURN_MISSED_SWEEPS; i += 1) {
+      turns.observe([member({ memberId: "attic", installKind: "packaged", answered: false })], NOW);
+    }
+    const leg = turns.peerLegs().find((l) => l.name === "attic")!;
+    expect(leg.state).toBe("unreachable");
+    expect(leg.reason).toContain("missed");
+    expect(turns.turnFor("attic")).toBeNull();
+  });
+
+  test("a packaged member's own run record wins: it reads updating, never package-managed", () => {
+    // The member is the only witness to its own run. A packaged machine that is somehow moving —
+    // an operator running the updater by hand on it — is exactly the thing the page must not hide.
+    const turns = new UpdateTurns(() => {});
+    turns.begin(RUN_ID, "1.4.1");
+    turns.observe(
+      [
+        member({
+          memberId: "attic",
+          installKind: "packaged",
+          run: { state: "verifying", to: "v1.4.1", runId: RUN_ID, reason: null, updatedAt: NOW },
+        }),
+      ],
+      NOW,
+    );
+    expect(turns.peerLegs().find((l) => l.name === "attic")?.state).toBe("updating");
+    // And it is still handed no turn: only a `waiting` leg is ever eligible.
+    expect(turns.turnFor("attic")).toBeNull();
+  });
+
+  test("a packaged member already on the target reads as done, which is the truer sentence", () => {
+    const turns = new UpdateTurns(() => {});
+    turns.begin(RUN_ID, "1.4.1");
+    turns.observe([member({ memberId: "attic", version: "1.4.1", installKind: "packaged" })], NOW);
+    expect(turns.peerLegs().find((l) => l.name === "attic")?.state).toBe("done");
+  });
+
   test("no run means no turn and no legs — a lead that has confirmed nothing states nothing", () => {
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     expect(turns.observe([member({ memberId: "attic" })], NOW).released).toBe(false);
     expect(turns.peerLegs()).toEqual([]);
     expect(turns.turnFor("attic")).toBeNull();
@@ -430,9 +559,10 @@ describe("a member's turn ends when its SWEEP reports the target version", () =>
       fixtureMember({ memberId: "attic", enrolledAt: 1 }),
       fixtureMember({ memberId: "basement", enrolledAt: 2 }),
     ];
-    const turns = new UpdateTurns();
+    const turns = new UpdateTurns(() => {});
     const registry = new PackRegistry({ sessions: { get: () => undefined }, self: "desk", members: () => roster });
     const lead = new PackLead({
+      log: () => {},
       registry,
       snapshot: async (link) => ({
         ok: true,
@@ -446,6 +576,7 @@ describe("a member's turn ends when its SWEEP reports the target version", () =>
       }),
       proxy: neverProxy,
       self: { id: "desk", name: "the herd" },
+      maxUploadBytes: DEFAULT_MAX_UPLOAD_BYTES,
       now: () => LEAD_NOW,
       follow: {
         leadRelease: () => "1.4.1",
@@ -486,5 +617,75 @@ describe("a member's turn ends when its SWEEP reports the target version", () =>
     expect(h.registry.state("attic").version).toBeNull();
     expect(h.turns.peerLegs().find((l) => l.name === "attic")?.state).toBe("waiting");
     expect(h.turns.turnFor("attic")).toBe(`attic;${RUN_ID}`);
+  });
+});
+
+// ── What the journal says about a run's legs ─────────────────────────────────
+//
+// 2026-09-07: the pack levelled at 17:43:40 and the lead's record still read "moving" at 17:58:07.
+// Both journals held one line for the whole run. These are the lines that would have settled it.
+
+describe("the turn queue names each leg change and the moment a run settles", () => {
+  const member = (over: Partial<TurnMember> & { memberId: string }): TurnMember => ({
+    enrolledAt: 1,
+    version: "1.4.0",
+    verdict: "green",
+    answered: true,
+    run: null,
+    ...over,
+  });
+
+  test("a leg change is one line, and an unchanged leg is none", () => {
+    const journal: string[] = [];
+    const turns = new UpdateTurns((line) => journal.push(line));
+    turns.begin(RUN_ID, "1.4.1");
+    turns.observe([member({ memberId: "attic" })], NOW);
+    turns.observe([member({ memberId: "attic" })], NOW);
+    turns.observe([member({ memberId: "attic", version: "1.4.1" })], NOW);
+    turns.observe([member({ memberId: "attic", version: "1.4.1" })], NOW);
+    expect(journal).toEqual([
+      "[pack] update r-abc: attic new -> waiting (1.4.0)",
+      "[pack] update r-abc: attic waiting -> done (1.4.1)",
+      "[pack] update r-abc: settled, 1 peer(s) done",
+    ]);
+  });
+
+  test("the settling line is written once, however many sweeps follow it", () => {
+    const journal: string[] = [];
+    const turns = new UpdateTurns((line) => journal.push(line));
+    turns.begin(RUN_ID, "1.4.1");
+    turns.observe([member({ memberId: "attic", version: "1.4.1" })], NOW);
+    turns.observe([member({ memberId: "attic", version: "1.4.1" })], NOW);
+    turns.observe([member({ memberId: "attic", version: "1.4.1" })], NOW);
+    expect(journal.filter((l) => l.includes("settled"))).toEqual(["[pack] update r-abc: settled, 1 peer(s) done"]);
+  });
+
+  test("a member still moving holds the run open, and the settling line names each terminal state", () => {
+    const journal: string[] = [];
+    const turns = new UpdateTurns((line) => journal.push(line));
+    turns.begin(RUN_ID, "1.4.1");
+    const moving = member({
+      memberId: "attic",
+      run: { runId: RUN_ID, state: "staging", to: "1.4.1", reason: null, updatedAt: NOW },
+    });
+    turns.observe([moving, member({ memberId: "basement", enrolledAt: 2, version: "1.4.1" })], NOW);
+    // Nothing has settled while `attic` is updating — that is the case the drill could not see.
+    expect(journal.some((l) => l.includes("settled"))).toBe(false);
+    turns.observe(
+      [
+        member({
+          memberId: "attic",
+          run: { runId: RUN_ID, state: "rolled-back", to: "1.4.1", reason: "the health gate failed", updatedAt: NOW },
+        }),
+        member({ memberId: "basement", enrolledAt: 2, version: "1.4.1" }),
+      ],
+      NOW,
+    );
+    expect(journal).toEqual([
+      "[pack] update r-abc: attic new -> updating (1.4.0)",
+      "[pack] update r-abc: basement new -> done (1.4.1)",
+      "[pack] update r-abc: attic updating -> rolled-back (1.4.0)",
+      "[pack] update r-abc: settled, 1 peer(s) done, 1 rolled-back",
+    ]);
   });
 });

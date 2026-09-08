@@ -1,10 +1,11 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join } from "node:path";
 
 import { classifyInstall, probeInstall } from "../cli/install-kind.ts";
 import { realLinkFs } from "../cli/link.ts";
+import { packageCommand } from "../cli/package-command.ts";
 import { realExec, realFiles } from "../cli/sys.ts";
 import { ActivityLedger } from "./activity.ts";
 import { AuditLog, fileAuditAppender } from "./audit.ts";
@@ -14,7 +15,9 @@ import { withAgentHints } from "./beacon/hint.ts";
 import { loadConfig, nonLoopbackBindRefusal, resolveConfigDir, type Config } from "./config.ts";
 import type { PackMode, PackStatusResponse } from "./types.ts";
 import { EventPoker } from "./event-poker.ts";
+import { exePathOf, exeReplaced } from "./exe-replaced.ts";
 import {
+  herdrActionCommand,
   instanceSuffixOf,
   managedHandlerPath,
   realFrontDoorExec,
@@ -127,7 +130,7 @@ import {
   updateDigestBody,
 } from "./update.ts";
 import { SWEEP_INTERVAL_MS, sweepUploads } from "./uploads.ts";
-import { readUpdateRun, updateLockHeld } from "./update-run.ts";
+import { packTurnStart, readUpdateRun, updateLockHeld } from "./update-run.ts";
 import {
   FreshPreflightGate,
   parsePreflightReport,
@@ -138,7 +141,7 @@ import {
   updateCadenceTick,
   updateStartCommand,
 } from "./update-action.ts";
-import { collieVersionBare } from "./version.ts";
+import { collieVersion, collieVersionBare } from "./version.ts";
 
 // How often the registry rescans the filesystem for sessions that appeared/disappeared after boot.
 const SESSION_REFRESH_MS = 15_000;
@@ -227,12 +230,21 @@ let deposed: DeposedState | null = null;
  * warning and the bridge comes up anyway. A peer that failed to unpublish is a routing problem the
  * operator can still fix from a keyboard; a peer that refused to start is not.
  */
+/**
+ * `COLLIE_INSTANCE`, or `null` for the host's first Collie. Read here, once, and passed down.
+ *
+ * It names two things this process must not get wrong: the front door record it owns, and the Herdr
+ * plugin id it prints in a restart command. A named instance that printed the bare id would be
+ * telling the operator to restart its neighbour.
+ */
+const collieInstance = process.env.COLLIE_INSTANCE?.trim() || null;
+
 let frontDoorReleased = false;
 function releaseFrontDoor(mode: PackMode, isDeposed: boolean, why: string): void {
   if (frontDoorReleased) return;
   const handlerFile = managedHandlerPath(
     resolveConfigDir(),
-    instanceSuffixOf(process.env.COLLIE_INSTANCE),
+    instanceSuffixOf(collieInstance),
   );
   // The record — and nothing else — decides whether there is anything of ours to take down. An
   // unrecorded mapping is by definition not ours and is never touched.
@@ -563,13 +575,85 @@ const updateRepo = process.env.COLLIE_UPDATE_REPO?.trim() || "AltanS/collie";
 // startup because the answer cannot change under a running process (an update restarts the service).
 // The banner spells its commands from this: Herdr actions for a Herdr-managed checkout, the `collie`
 // verbs for everything else (M14/01 §5.3).
+// The version this process is RUNNING, captured once, here, beside the kind — for the same reason
+// the kind is captured once: neither can change under a live process. A package manager can still
+// change the FILES, and `collieVersion` re-reads them on every call, so the difference between this
+// string and a fresh read is the restart-needed signal (M17/02). No new state file.
+const bootVersion = collieVersion(rootDir);
+
 const installKind = classifyInstall(
-  probeInstall({ exec: realExec(process.env, homedir()), files: realFiles, link: realLinkFs }, rootDir),
+  probeInstall(
+    { ctx: { home: homedir() }, exec: realExec(process.env, homedir()), files: realFiles, link: realLinkFs },
+    rootDir,
+  ),
 ).kind;
+/**
+ * Has the collie this process is executing been replaced on disk? Linux, and single-file installs.
+ *
+ * The signal the version comparison cannot give. A package manager unlinks `bin/collie` and writes a
+ * new one, restarting nothing: on Arch the service stays active on the deleted inode and keeps
+ * serving, and when the rebuild carries the same version, every file on disk still agrees with
+ * `bootVersion`. `/proc/self/exe` is the one thing that disagrees.
+ *
+ * Scoped twice, and both scopes are the honest shape of the question rather than caution:
+ *  - **Linux only.** `/proc/self/exe` is where the kernel states this, and there is no second place.
+ *  - **`binary` and `packaged` only.** Those two ship one file and no `bridge/` source; on a checkout
+ *    the answer is already `bridgeStale`, whose comparison is over the source the process would
+ *    re-read, and a rebuilt `bin/collie` there would raise both bands for one fact.
+ *
+ * One readlink and two `stat`s, and the monitor throttles it to the snapshot's cadence.
+ */
+function selfExeReplaced(): boolean {
+  if (process.platform !== "linux") return false;
+  if (installKind !== "binary" && installKind !== "packaged") return false;
+  const link = readLinkOrNull(SELF_EXE);
+  const installedPath = exePathOf(link);
+  if (installedPath === null) return false;
+  return exeReplaced({
+    exeLink: link,
+    exeInode: inodeOrNull(SELF_EXE),
+    installedInode: inodeOrNull(installedPath),
+    // Both are Linux-only fallbacks for a host that has no `/proc`, which this branch already has.
+    installedMtimeMs: null,
+    startedAtMs: null,
+  });
+}
+
+/** Where Linux states which executable this process is running. */
+const SELF_EXE = "/proc/self/exe";
+
+function readLinkOrNull(p: string): string | null {
+  try {
+    return readlinkSync(p);
+  } catch {
+    return null;
+  }
+}
+
+function inodeOrNull(p: string): number | null {
+  try {
+    return Number(statSync(p).ino);
+  } catch {
+    return null;
+  }
+}
+
 const updateMonitor = new UpdateMonitor({
   repo: updateRepo,
   current: currentVersion,
   installKind,
+  instance: collieInstance,
+  // Named only where it is true: a packaged install under a prefix we recognise. Every other kind
+  // takes Collie's own updater, and printing a package manager's command there would be a command
+  // that does not apply. Resolved here, at boot, for the reason `installKind` is.
+  packageCommand: installKind === "packaged" ? packageCommand(rootDir) : null,
+  bootVersion,
+  // Read from disk on each (throttled) snapshot: noticing that the files moved under this process is
+  // the whole job, so this one must NOT be cached the way `bootVersion` is.
+  liveVersion: () => collieVersion(rootDir),
+  // The other half of restart-needed: the executable itself, for the package swap that moves no
+  // version string (M17/02, the Arch pkgrel rebuild).
+  exeReplaced: selfExeReplaced,
   startupStamp: bridgeStampSync(bridgeDir, rootDir),
   fetchTags: githubTagsFetcher(updateRepo),
   bridgeStamp: () => bridgeStampSync(bridgeDir, rootDir),
@@ -767,6 +851,7 @@ updateTimer.unref();
 const packFollower =
   pack.mode === "peer" && canRunUpdate
     ? new PackFollower({
+        installKind,
         self: () => ({ version: packVersion, self: trustStore.current()?.self.memberId ?? "" }),
         // Re-read on every decision, never captured: it IS the memory, and the record on disk is
         // what survives this machine's own restart.
@@ -1168,6 +1253,8 @@ const packLead = (() => {
   const client = packPeerClient(data);
   return new PackLead({
     registry: packRegistry,
+    // §13's refuse-before-forward budget: this lead's own cap, not a constant (COLLIE_MAX_UPLOAD_MB).
+    maxUploadBytes: cfg.maxUploadBytes,
     snapshot: (link, freshPreflight, follow) => client.snapshot(link, undefined, freshPreflight, follow),
     // §20's half of the sweep: what this lead may state about itself, and the queue that hands out
     // one turn at a time. Every member of it is read through, never captured — a lead settles
@@ -1325,11 +1412,16 @@ const packStatus =
  */
 let settledRunId: string | null = null;
 function settleUpdateGate(): void {
-  const run = readUpdateRun(cfg.stateDir);
-  if (run === null || run.state !== "done" || run.runId === undefined || run.to === null) return;
-  if (run.runId === settledRunId) return;
-  settledRunId = run.runId;
-  updateTurns.begin(run.runId, run.to);
+  const start = packTurnStart(readUpdateRun(cfg.stateDir));
+  if (start === null) return;
+  if (start.runId === settledRunId) return;
+  settledRunId = start.runId;
+  // The one line an operator can grep for in the BRIDGE's own journal, which is the journal they
+  // are already tailing. The update that wrote this record ran under a transient `--collect` unit
+  // whose name nobody knows and whose journal outlives it by nothing, so a trace left only there is
+  // a trace left nowhere. Once per run id per process, so a poll tick cannot make it a stream.
+  console.log(`[pack] update ${start.runId}: levelling peers to ${start.to}`);
+  updateTurns.begin(start.runId, start.to);
   packLead?.resweep();
 }
 
@@ -1445,7 +1537,7 @@ async function performTakeover(deviceLabel: string): Promise<{ ok: boolean; mess
       `${outcome.repinned.length} peer(s). Exiting ${TAKEOVER_RESTART_EXIT} so the supervisor brings ` +
       "this machine back up in LEAD mode — that status is non-zero on purpose, because `Restart=" +
       "on-failure` does not revive a clean exit. If nothing restarts this process, its supervision is " +
-      "unmanaged: run `herdr plugin action invoke restart --plugin herdr.collie` here.",
+      `unmanaged: run \`${herdrActionCommand("restart", collieInstance)}\` here.`,
   );
   // Long enough for the answer above to reach the phone, short enough that the failover proxy's next
   // health check finds a lead. Not unref'd: this timer is the whole remaining purpose of the process.
@@ -1520,7 +1612,7 @@ const standbyServer =
           if (update !== null) return withStandbyVersion(update, packVersion);
           const answered =
             deposed !== null
-              ? deposedAnswer(deposed, outcomeNow(deposed, leadContact.facts()), url)
+              ? deposedAnswer(deposed, outcomeNow(deposed, leadContact.facts()), url, collieInstance)
               : (frontDoorHealth(pack.mode, url) ?? (standbyDoor === null ? null : await standbyDoor(req, url)));
           // STAMPED HERE, ONCE, so it covers every answer this port can make — including the 404 for
           // a path nobody owns and the deposed page, which are exactly the answers a runner probing a
@@ -1628,7 +1720,7 @@ const server = startServer({
   //
   // A solo instance answers `null` to all three and gains no route at all (§11).
   deposed: (_req, url) => {
-    if (deposed !== null) return deposedAnswer(deposed, outcomeNow(deposed, leadContact.facts()), url);
+    if (deposed !== null) return deposedAnswer(deposed, outcomeNow(deposed, leadContact.facts()), url, collieInstance);
     if (bootTrust === null) return null;
     const health = frontDoorHealth(pack.mode, url);
     if (health !== null) return health;
