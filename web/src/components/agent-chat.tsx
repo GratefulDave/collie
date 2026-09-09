@@ -18,6 +18,7 @@ import { useLaunchers } from "@/lib/launchers";
 import { buzz } from "@/lib/haptics";
 import { mirrorFont, useDisplayPrefs } from "@/hooks/use-display-prefs";
 import { useLatestReply } from "@/hooks/use-latest-reply";
+import { useMirrorImages } from "@/hooks/use-mirror-images";
 import { useStableTerminalDraft } from "@/hooks/use-terminal-draft";
 import { useLocale } from "@/hooks/use-locale";
 import { isConnecting } from "@/lib/connection";
@@ -52,7 +53,7 @@ import { PaneActionsSheet } from "@/components/pane-actions-sheet";
 import { CompactStripLabels, STRIP_TAP_TARGET_SQUARE } from "@/components/ui/labelled-strip";
 import { ReadOnlyBanner } from "@/components/read-only-banner";
 import { HostStaleBanner } from "@/components/host-stale-banner";
-import { useHostHealth } from "@/components/pack-provider";
+import { useHostHealth } from "@/components/crew-provider";
 import { writeRefusal } from "@/lib/host-health";
 import { StatusArea } from "@/components/status-area";
 import { ToastViewport } from "@/components/ui/toast-viewport";
@@ -665,7 +666,7 @@ export function AgentChat({
   // session", which is a per-pane answer an operator can act on by starting an agent; this one says
   // "nothing here will ever name one", which is a property of the multiplexer and needs saying out
   // loud. Hiding it is what leaves someone wondering whether Collie is broken.
-  const sessionLog = useMuxCapability("agentSessionRef");
+  const sessionLog = useMuxCapability("agentSessionRef", scope);
   const historyAvailable = Boolean(agent?.hasSession) && sessionLog.capable;
   // A FOURTH state, and the per-pane sibling of the third (#137). `hasSession` folds two facts into
   // one flag bridge-side — "this pane named a session" AND "this agent has a journal adapter" — so
@@ -685,7 +686,7 @@ export function AgentChat({
   // Scrollback has its own capability, and it is a genuinely different one: a multiplexer can keep
   // screen history while knowing nothing about agents. Hidden rather than explained when absent —
   // "there is nothing older to load" is not a fact anyone comes looking for.
-  const scrollback = useMuxCapability("gridScrollback");
+  const scrollback = useMuxCapability("gridScrollback", scope);
   const moreScrollback =
     scrollback.capable &&
     agent?.readableLines !== undefined &&
@@ -718,6 +719,17 @@ export function AgentChat({
     () => (latestReply ? locateReply(display, latestReply) : null),
     [latestReply, display],
   );
+
+  // Terminal graphics: the mirror tells us how many image placeholders it is showing, and only a
+  // count that GREW costs a journal read. The pane read carries no image field and the bridge does
+  // no journal work on the poll path — see hooks/use-mirror-images.ts for the whole cadence.
+  const [imageClusterCount, setImageClusterCount] = useState(0);
+  const mirrorImages = useMirrorImages({
+    paneId,
+    scope,
+    enabled: historyAvailable && imageClusterCount > 0,
+    clusterCount: imageClusterCount,
+  });
   // Find searches the mirror, so while it is open the mirror is WHOLE and the card stands down —
   // otherwise a hit inside the reply would be unfindable in the one surface find can highlight.
   const clippedReply = placement?.fit === "clipped" && !findOpen ? latestReply : null;
@@ -1744,6 +1756,7 @@ export function AgentChat({
                       agent={agent?.agent}
                       open={replyOpen}
                       onToggle={() => setCollapsedReply(replyOpen ? clippedReply.uuid : null)}
+                      scope={scope}
                     />
                   )}
                   <AnsiOutput
@@ -1761,6 +1774,8 @@ export function AgentChat({
                     onMenuAction={handleMenuAction}
                     promptDisabled={readOnly || gone}
                     hideLeadingLines={hiddenMirrorLines}
+                    images={mirrorImages}
+                    onImageClusterCount={setImageClusterCount}
                   />
                 </>
               ) : (

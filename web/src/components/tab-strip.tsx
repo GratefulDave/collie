@@ -20,7 +20,7 @@ interface TabStripProps {
   workspaceId: string;
   tabs: TabView[];
   agents: AgentView[];
-  /** The machine this space is on — tab ids collide across a pack, so status is counted per host. */
+  /** The machine this space is on — tab ids collide across a crew, so status is counted per host. */
   host?: string;
   /** Selected tab id, or null for "All" (every tab's panes). */
   selected: string | null;
@@ -105,12 +105,13 @@ export function TabStrip({
 }: TabStripProps) {
   useLocale();
   const [sheetTab, setSheetTab] = useState<TabView | null>(null);
-  const newTab = useMuxCapability("createTab");
+  // Asked of the machine these tabs live on (M22/03); absent scope is the lead, as everywhere.
+  const newTab = useMuxCapability("createTab", scope);
   // Actions need both callbacks wired (revalidate on rename, fall back on close); without them the
   // tabs stay plain tap-to-switch — long-press is inert.
   const actionsEnabled = !!onRenamed && !!onClosed;
 
-  // Tab status is computed over THIS machine's panes only: tab ids (`w1:t1`) collide across a pack
+  // Tab status is computed over THIS machine's panes only: tab ids (`w1:t1`) collide across a crew
   // exactly as pane and workspace ids do, so an unfiltered merged list would paint a peer's blocked
   // agent onto the lead's tab. Solo panes are untagged and `host` is undefined — same set as before.
   const here = agents.filter((a) => hostKey(a) === (host ?? ""));
@@ -239,7 +240,7 @@ export function TabStrip({
 // both must stay unmarked: a tab with no agent at all (a bare shell), and a tab running two brands at
 // once — a mark for either would be a claim about the whole tab that only one pane in it supports.
 // Scoped to `here`, the panes on THIS machine, for the same reason the status count is: tab ids
-// collide across a pack.
+// collide across a crew.
 function soleAgent(here: AgentView[], tabId: string): string | undefined {
   const brands = new Set(here.filter((a) => a.tabId === tabId).map((a) => a.agent));
   if (brands.size !== 1) return undefined;

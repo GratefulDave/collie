@@ -96,8 +96,8 @@ export const API_ERROR_CODES = [
   "session.unknown",
   "host.unknown",
 
-  // The pack overview — this collie is not a lead with a pack (solo, or a peer)
-  "pack.not_lead",
+  // The crew overview — this collie is not a lead with a crew (solo, or a peer)
+  "crew.not_lead",
 
   // Starting an update from the phone — POST /api/update (M15/05)
   "update.confirm_required",

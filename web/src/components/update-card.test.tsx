@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { http, HttpResponse } from "msw";
@@ -10,7 +10,7 @@ import { __resetReloadGuard, isReloadHeld } from "@/lib/reload-guard";
 import type {
   PreflightReport,
   UpdateInfo,
-  UpdatePackMember,
+  UpdateCrewMember,
   UpdateRun,
   UpdateRunState,
 } from "@/lib/types";
@@ -106,13 +106,16 @@ const info = (over: Partial<UpdateInfo> = {}): UpdateInfo => ({
   ...over,
 });
 
+// The stamps are RELATIVE TO NOW, and they have to be: the card counts off `startedAt` on the
+// phone's own clock and bounds the restart off `updatedAt` (M20/08), so a fixture pinned to epoch
+// 1970 would render every run as one that has been going for fifty years.
 const runAt = (state: UpdateRunState, over: Partial<UpdateRun> = {}): UpdateRun => ({
   schema: 1,
   state,
   from: "1.3.0",
   to: "1.4.0",
-  startedAt: 1_000,
-  updatedAt: 2_000,
+  startedAt: Date.now() - 20_000,
+  updatedAt: Date.now() - 5_000,
   pid: 4242,
   attempt: 0,
   ...over,
@@ -154,12 +157,12 @@ function renderCard(update: UpdateInfo | undefined, servers: HomeData["servers"]
 }
 
 /** The card's own read, answered with `update` plus whatever preflight the case is about — and,
- *  for the pack cases, the census spec 03 puts on the same response. Absent by default, which is
+ *  for the crew cases, the census spec 03 puts on the same response. Absent by default, which is
  *  the solo answer and the older-bridge answer both. */
-function serveCheck(update: UpdateInfo, preflight: PreflightReport | null, pack?: UpdatePackMember[]) {
+function serveCheck(update: UpdateInfo, preflight: PreflightReport | null, crew?: UpdateCrewMember[]) {
   server.use(
     http.get("/api/update/check", () =>
-      HttpResponse.json(pack === undefined ? { ...update, preflight } : { ...update, preflight, pack }),
+      HttpResponse.json(crew === undefined ? { ...update, preflight } : { ...update, preflight, crew }),
     ),
   );
 }
@@ -459,13 +462,13 @@ describe("rolled back card — the machine is named, the log is there, and there
   });
 });
 
-// ── THE PACK, INSIDE THE CARD (M16/01) ──────────────────────────────────────────────────────────
+// ── THE CREW, INSIDE THE CARD (M16/01) ──────────────────────────────────────────────────────────
 //
-// The line this card used to carry — "Peers are updated from the terminal: collie pack update" —
-// is gone, because it is no longer true. The pack is lines in this card now, and the button above
+// The line this card used to carry — "Peers are updated from the terminal: collie crew update" —
+// is gone, because it is no longer true. The crew is lines in this card now, and the button above
 // them covers it.
 
-const PACK: UpdatePackMember[] = [
+const CREW: UpdateCrewMember[] = [
   { name: "attic", version: "1.3.0", verdict: "red", reasons: ["working tree has tracked changes: bridge/server.ts"], asOf: 1_700_000_000_000 },
   { name: "minibuch", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
   { name: "shed", version: null, verdict: "unknown", reasons: [], asOf: 1_700_000_000_000 },
@@ -478,9 +481,9 @@ const LEAD_ROSTER: HomeData["servers"] = [
 
 describe("peer rows in the card", () => {
   it("grows one line per peer, worst first, with no table beside the card", async () => {
-    serveCheck(info(), GREEN, PACK);
+    serveCheck(info(), GREEN, CREW);
     renderCard(info(), LEAD_ROSTER);
-    const list = await screen.findByRole("list", { name: "Pack members" });
+    const list = await screen.findByRole("list", { name: "Crew members" });
     const names = within(list)
       .getAllByRole("listitem")
       .map((li) => li.textContent ?? "");
@@ -493,9 +496,9 @@ describe("peer rows in the card", () => {
   });
 
   it("peer rows are read-only and carry the reason when red", async () => {
-    serveCheck(info(), GREEN, PACK);
+    serveCheck(info(), GREEN, CREW);
     renderCard(info(), LEAD_ROSTER);
-    const list = await screen.findByRole("list", { name: "Pack members" });
+    const list = await screen.findByRole("list", { name: "Crew members" });
     // No per-peer update, no per-peer retry — the operator's decision was taken once, above.
     expect(within(list).queryAllByRole("button")).toHaveLength(0);
     expect(
@@ -505,22 +508,22 @@ describe("peer rows in the card", () => {
 
   it("peer row asOf dates every line, so an old green and a fresh green differ", async () => {
     vi.setSystemTime(1_700_000_000_000 + 6 * 60 * 60 * 1000);
-    const mixed: UpdatePackMember[] = [
+    const mixed: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
       { name: "shed", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 + 6 * 60 * 60 * 1000 - 4000 },
     ];
     serveCheck(info(), GREEN, mixed);
     renderCard(info(), LEAD_ROSTER);
-    const list = await screen.findByRole("list", { name: "Pack members" });
+    const list = await screen.findByRole("list", { name: "Crew members" });
     const rows = within(list).getAllByRole("listitem");
     expect(rows.find((li) => li.textContent?.includes("minibuch"))?.textContent).toContain("checked 6h");
     expect(rows.find((li) => li.textContent?.includes("shed"))?.textContent).toContain("checked now");
   });
 
   it("unknown is not green — it says unknown and says why", async () => {
-    serveCheck(info(), GREEN, PACK);
+    serveCheck(info(), GREEN, CREW);
     renderCard(info(), LEAD_ROSTER);
-    const list = await screen.findByRole("list", { name: "Pack members" });
+    const list = await screen.findByRole("list", { name: "Crew members" });
     const shed = within(list)
       .getAllByRole("listitem")
       .find((li) => li.textContent?.includes("shed"));
@@ -532,32 +535,32 @@ describe("peer rows in the card", () => {
   it("solo grows no peer rows at all", async () => {
     renderCard(info());
     await screen.findByText(/Running 1\.3\.0/);
-    expect(screen.queryByRole("list", { name: "Pack members" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Crew members" })).not.toBeInTheDocument();
   });
 });
 
 describe("single action button", () => {
-  it("says 'Update pack to X' when this pack has peers", async () => {
-    serveCheck(info(), GREEN, PACK);
+  it("says 'Update crew to X' when this crew has peers", async () => {
+    serveCheck(info(), GREEN, CREW);
     renderCard(info(), LEAD_ROSTER);
-    expect(await screen.findByRole("button", { name: "Update pack to 1.4.0" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Update crew to 1.4.0" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Update to 1.4.0" })).not.toBeInTheDocument();
   });
 
   it("says 'Update to X' on a solo install", async () => {
     renderCard(info());
     expect(await screen.findByRole("button", { name: "Update to 1.4.0" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Update pack/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Update crew/ })).not.toBeInTheDocument();
   });
 
-  it("says 'Retry pack update' once the lead is current and a peer is behind", async () => {
+  it("says 'Retry crew update' once the lead is current and a peer is behind", async () => {
     const current = info({ latest: "1.3.0", releaseAvailable: false, newerVersions: [] });
-    const behind: UpdatePackMember[] = [
+    const behind: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
     ];
     serveCheck(current, GREEN, behind);
     renderCard(current, LEAD_ROSTER);
-    expect(await screen.findByRole("button", { name: "Retry pack update" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Retry crew update" })).toBeInTheDocument();
     // And the card does not claim there is nothing to do three inches above that button.
     expect(screen.queryByText("Up to date. Nothing to do.")).not.toBeInTheDocument();
   });
@@ -579,11 +582,11 @@ async function readStart(request: Request): Promise<StartBody> {
   return (await request.json()) as StartBody;
 }
 
-describe("retry pack update", () => {
+describe("retry crew update", () => {
   it("starts a new run whose only legs are the peers", async () => {
     const user = userEvent.setup();
     const current = info({ latest: "1.3.0", releaseAvailable: false, newerVersions: [] });
-    const behind: UpdatePackMember[] = [
+    const behind: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
     ];
     serveCheck(current, GREEN, behind);
@@ -596,18 +599,18 @@ describe("retry pack update", () => {
     );
     renderCard(current, LEAD_ROSTER);
 
-    await user.click(await screen.findByRole("button", { name: "Retry pack update" }));
+    await user.click(await screen.findByRole("button", { name: "Retry crew update" }));
     // Its own confirm, in its own words: only the peers run, and each gets one more attempt.
-    expect(screen.getByText("Retry the pack update?")).toBeInTheDocument();
+    expect(screen.getByText("Retry the crew update?")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Yes, retry" }));
 
     await waitFor(() => expect(sent).toBeDefined());
     expect(sent).toMatchObject({ confirm: true, peersOnly: true, target: "1.3.0", major: false });
   });
 
-  it("an ordinary pack update is NOT peers-only", async () => {
+  it("an ordinary crew update is NOT peers-only", async () => {
     const user = userEvent.setup();
-    serveCheck(info(), GREEN, PACK);
+    serveCheck(info(), GREEN, CREW);
     let sent: StartBody | undefined;
     server.use(
       http.post("/api/update", async ({ request }) => {
@@ -617,9 +620,9 @@ describe("retry pack update", () => {
     );
     renderCard(info(), LEAD_ROSTER);
 
-    await user.click(await screen.findByRole("button", { name: "Update pack to 1.4.0" }));
-    expect(screen.getByText("Update the pack to 1.4.0?")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Yes, update the pack" }));
+    await user.click(await screen.findByRole("button", { name: "Update crew to 1.4.0" }));
+    expect(screen.getByText("Update the crew to 1.4.0?")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Yes, update the crew" }));
 
     await waitFor(() => expect(sent).toBeDefined());
     expect(sent).not.toHaveProperty("peersOnly");
@@ -635,7 +638,8 @@ describe("restarting gap is not an outage", () => {
       http.get("/api/update/check", () => HttpResponse.error()),
       http.get("/standby/update", () => {
         standbyReads += 1;
-        return HttpResponse.json(runAt("verifying", { updatedAt: 9_000 }));
+        // FRESHER than the record the card mounted with —  picks by stamp.
+        return HttpResponse.json(runAt("verifying", { updatedAt: Date.now() }));
       }),
     );
     renderCard(info({ run: runAt("restarting") }));
@@ -757,13 +761,13 @@ describe("UpdateCard — an install a package manager owns", () => {
   // The lead cannot take the release. Levelling the peers to the build it ALREADY runs is a
   // different act and it works — `bridge/update-action.ts` decides the peers-only start above its
   // own packaged refusal for exactly this reason. What used to happen instead: the release
-  // short-circuit answered "Update pack to 1.4.0", the card disabled it, and the peers were
+  // short-circuit answered "Update crew to 1.4.0", the card disabled it, and the peers were
   // unreachable from the phone with an explanation that talked only about this machine.
 
   it("offers the peers-only run to a packaged lead whose peer is a version behind", async () => {
     const user = userEvent.setup();
     const update = info({ installKind: "packaged" });
-    const behind: UpdatePackMember[] = [
+    const behind: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
     ];
     serveCheck(update, PACKAGED, behind);
@@ -776,18 +780,18 @@ describe("UpdateCard — an install a package manager owns", () => {
     );
     renderCard(update, LEAD_ROSTER);
 
-    const button = await screen.findByRole("button", { name: "Retry pack update" });
+    const button = await screen.findByRole("button", { name: "Retry crew update" });
     expect(button).toBeEnabled();
     // The disabled release button is gone rather than sitting beside it: one action button, and it
     // is the one whose tap can succeed.
-    expect(screen.queryByRole("button", { name: /Update pack to/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Update crew to/ })).not.toBeInTheDocument();
     // The card still says why THIS machine is not moving — that is the question a peers-only
     // button raises while "Newest 1.4.0" is on screen above it.
     expect(screen.getByText(/package manager updates this install/i)).toBeInTheDocument();
 
     await user.click(button);
     // Not "This machine is already current": it is not, and the confirm may not say it is.
-    expect(screen.getByText("Retry the pack update?")).toBeInTheDocument();
+    expect(screen.getByText("Retry the crew update?")).toBeInTheDocument();
     expect(screen.queryByText(/already current/i)).not.toBeInTheDocument();
     expect(screen.getAllByText(/package manager updates this install/i).length).toBeGreaterThan(0);
 
@@ -802,34 +806,34 @@ describe("UpdateCard — an install a package manager owns", () => {
   // stays as the card's only way to say a release exists and this machine is not taking it.
   it("names the command and no button at all when no peer needs levelling", async () => {
     const update = info({ installKind: "packaged" });
-    const level: UpdatePackMember[] = [
+    const level: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
     ];
     serveCheck(update, PACKAGED, level);
     renderCard(update, LEAD_ROSTER);
     expect(await screen.findByText("sudo pacman -Syu collie-bin")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Update pack to 1.4.0" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Retry pack update" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Update crew to 1.4.0" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry crew update" })).not.toBeInTheDocument();
     expect(screen.getByText(/package manager updates this install/i)).toBeInTheDocument();
   });
 
-  // The second control: an ORDINARY lead in the identical pack shape still leads with its own
+  // The second control: an ORDINARY lead in the identical crew shape still leads with its own
   // update. Revert `leadCanTake` and this keeps passing while the two above stop — which is what
   // makes them a statement about the install kind rather than about being behind.
-  // An ORDINARY lead can land in `retry-pack` too — already current on releases, itself blocked by
+  // An ORDINARY lead can land in `retry-crew` too — already current on releases, itself blocked by
   // a genuinely red check, with a peer behind. The reason line is shown here on purpose: it answers
-  // exactly the question a "Retry pack update" button raises while this machine is not moving, and
+  // exactly the question a "Retry crew update" button raises while this machine is not moving, and
   // suppressing it (the pre-fix shape) is what let a packaged lead's OWN reason go unsaid. This is
   // the case the review asked to see covered, not a boundary the card is trying to avoid.
-  it("an ordinary lead's own red reason shows under retry-pack too, not only a packaged lead's", async () => {
+  it("an ordinary lead's own red reason shows under retry-crew too, not only a packaged lead's", async () => {
     const update = info({ installKind: "detached-checkout", releaseAvailable: false });
-    const behind: UpdatePackMember[] = [
+    const behind: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
     ];
     serveCheck(update, RED, behind);
     renderCard(update, LEAD_ROSTER);
-    const button = await screen.findByRole("button", { name: "Retry pack update" });
-    // NOT disabled: retry-pack is exempt from `blocked` (a peers-only run works even while this
+    const button = await screen.findByRole("button", { name: "Retry crew update" });
+    // NOT disabled: retry-crew is exempt from `blocked` (a peers-only run works even while this
     // machine's own preflight is red — the two are unrelated moves). The point of this test is the
     // REASON line, which is now shown alongside it rather than swallowed.
     await waitFor(() => expect(button).toBeEnabled());
@@ -839,14 +843,14 @@ describe("UpdateCard — an install a package manager owns", () => {
 
   it("control: an ordinary lead with a peer behind still takes the release itself", async () => {
     const update = info({ installKind: "detached-checkout" });
-    const behind: UpdatePackMember[] = [
+    const behind: UpdateCrewMember[] = [
       { name: "minibuch", version: "1.2.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
     ];
     serveCheck(update, GREEN_SIX, behind);
     renderCard(update, LEAD_ROSTER);
-    const button = await screen.findByRole("button", { name: "Update pack to 1.4.0" });
+    const button = await screen.findByRole("button", { name: "Update crew to 1.4.0" });
     await waitFor(() => expect(button).toBeEnabled());
-    expect(screen.queryByRole("button", { name: "Retry pack update" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry crew update" })).not.toBeInTheDocument();
   });
 
   // A REAL fault must never hide behind the package-manager sentence. Before this, `packageManaged`
@@ -934,5 +938,332 @@ describe("the action row while an update is being asked for and driven", () => {
     // one (DESIGN.md §7, hard rule 1); a bare mount is what moved the row.
     const check = await screen.findByText("4.2 GB free");
     expect(check.closest("[data-slot='collapse']")).not.toBeNull();
+  });
+});
+
+// ── The action button never moves (M20/07) ──────────────────────────────────
+//
+// Measured on the live dev instance at 390 x 844 on 2026-09-08: with the action row last, the peer
+// census (57 px) and the auto-opened Details (311 px) arrived together at about 1.16 s and pushed
+// the button 368 px down the screen. The confirm's own Cancel then rendered at y = 854 against an
+// 844 px viewport. These pin the two things that fixed it.
+
+describe("the action button never moves", () => {
+  /** Does `a` come before `b` in the document? The order IS the fix, so the order is the assertion. */
+  function precedes(a: Element, b: Element): boolean {
+    return (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+  }
+
+  it("the action row precedes the peer list and the preflight list", async () => {
+    const one: UpdateCrewMember[] = [
+      { name: "minibuch", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
+    ];
+    serveCheck(info(), GREEN_SIX, one);
+    renderCard(info(), LEAD_ROSTER);
+
+    const button = await screen.findByRole("button", { name: /Update/ });
+    // Both late arrivals are on screen, and both are BELOW the control they used to displace.
+    const peers = await screen.findByRole("list", { name: "Crew members" });
+    const details = await screen.findByText("Details");
+    expect(precedes(button, peers)).toBe(true);
+    expect(precedes(button, details)).toBe(true);
+  });
+
+  it("the button is disabled until the preflight read has answered, and says why", async () => {
+    // The measured hole: `blocked` reads `checked`, and `checked` is false until the read returns,
+    // so for that whole window the button reported `disabled: false` with nothing checked at all.
+    let answer: (() => void) | undefined;
+    const held = new Promise<void>((resolve) => {
+      answer = resolve;
+    });
+    server.use(
+      http.get("/api/update/check", async () => {
+        await held;
+        return HttpResponse.json({ ...info(), preflight: GREEN });
+      }),
+    );
+    renderCard(info());
+
+    const pending = await screen.findByRole("button", { name: /Checking this machine/ });
+    expect(pending).toBeDisabled();
+
+    answer?.();
+    const ready = await screen.findByRole("button", { name: /Update to 1\.4\.0/ });
+    expect(ready).toBeEnabled();
+  });
+
+  it("the row carries the deciding fact beside the button, so the detail can live below it", async () => {
+    const one: UpdateCrewMember[] = [
+      { name: "minibuch", version: "1.3.0", verdict: "green", reasons: [], asOf: 1_700_000_000_000 },
+    ];
+    serveCheck(info(), GREEN_WITH_ONE_AMBER, one);
+    renderCard(info(), LEAD_ROSTER);
+    expect(await screen.findByText("1 amber · 1 peer")).toBeInTheDocument();
+  });
+});
+
+// ── A peers-only run is still a run (M20/09) ─────────────────────────────────
+//
+// Reported symptom: after the crew is levelled, the version on this page does not change until the
+// app is pulled to refresh. The census is fresh on the server on every ask; the client stopped
+// asking. The refetch keyed on THIS machine's run record, and a peers-only run never writes one.
+
+describe("a peers-only run is still a run", () => {
+  const MOVING: UpdateInfo["peers"] = [{ name: "minibuch", state: "updating", version: "1.3.0" }];
+  const DONE: UpdateInfo["peers"] = [{ name: "minibuch", state: "done", version: "1.4.0" }];
+
+  /** Like `renderCard`, but the loader re-reads a box the test can change, and can be revalidated. */
+  function renderLive(box: { value: UpdateInfo | undefined }, servers: HomeData["servers"] = []) {
+    const router = createMemoryRouter(
+      [{ id: ROOT_ROUTE_ID, path: "/", loader: () => homeData(box.value, servers), element: <UpdateCard /> }],
+      { initialEntries: ["/"] },
+    );
+    render(<RouterProvider router={router} />);
+    return router;
+  }
+
+  /** Count the card's own reads. The count IS the assertion: the bug was that it stayed at one. */
+  function countingCheck(): () => number {
+    let calls = 0;
+    server.use(
+      http.get("/api/update/check", () => {
+        calls += 1;
+        return HttpResponse.json({ ...info(), preflight: GREEN, crew: [] });
+      }),
+    );
+    return () => calls;
+  }
+
+  it("renders a peer row off legs alone, with no run record on this machine", async () => {
+    // Nothing was written to `update.json`, because nothing ran here. The legs ride the status.
+    const box = { value: info({ peers: MOVING }) };
+    renderLive(box, LEAD_ROSTER);
+    const list = await screen.findByRole("list", { name: "Crew members" });
+    expect(within(list).getByText("minibuch")).toBeInTheDocument();
+  });
+
+  it("keeps re-reading while a peer leg moves, and stops once the run has settled", async () => {
+    const calls = countingCheck();
+    const box = { value: info({ peers: MOVING }) };
+    const router = renderLive(box, LEAD_ROSTER);
+    await waitFor(() => expect(calls()).toBe(1));
+
+    // A snapshot poll lands with the leg still moving. `settled` is false either side of it, so the
+    // effect must NOT re-fire — the card asks on a transition, not on every poll.
+    await act(async () => {
+      await router.revalidate();
+    });
+    expect(calls()).toBe(1);
+
+    // The lead stamps the run settled. That is the transition, and it is the one the card missed
+    // entirely before this spec: `running` reads the local record, which stayed null throughout.
+    box.value = info({ peers: DONE, settledAt: 1_700_000_000_100 });
+    await act(async () => {
+      await router.revalidate();
+    });
+    await waitFor(() => expect(calls()).toBe(2));
+
+    // And it stops. A settled run keeps no poller alive.
+    await act(async () => {
+      await router.revalidate();
+    });
+    expect(calls()).toBe(2);
+  });
+});
+
+// ── One clock, on the card (M20/04) ─────────────────────────────────────────
+
+describe("the card reads the same clock the band does", () => {
+  const stamp = (ago: number) => Date.now() - ago;
+
+  it("a moving peer row counts up, it does not report a check", async () => {
+    const value = info({ peers: [{ name: "minibuch", state: "restarting", updatedAt: stamp(3 * 60_000) }] });
+    serveCheck(value, GREEN, []);
+    renderCard(value, LEAD_ROSTER);
+    const list = await screen.findByRole("list", { name: "Crew members" });
+    expect(within(list).getByText(/for 3 min/)).toBeInTheDocument();
+    expect(within(list).queryByText(/checked/)).not.toBeInTheDocument();
+  });
+
+  it("past the patience window it says waiting is the whole job — the band has no room for it", async () => {
+    const value = info({ peers: [{ name: "minibuch", state: "restarting", updatedAt: stamp(4 * 60_000) }] });
+    serveCheck(value, GREEN, []);
+    renderCard(value, LEAD_ROSTER);
+    expect(await screen.findByText("No action needed, this finishes on its own.")).toBeInTheDocument();
+  });
+
+  it("says nothing of the sort before the window", async () => {
+    const value = info({ peers: [{ name: "minibuch", state: "restarting", updatedAt: stamp(30_000) }] });
+    serveCheck(value, GREEN, []);
+    renderCard(value, LEAD_ROSTER);
+    await screen.findByRole("list", { name: "Crew members" });
+    expect(screen.queryByText("No action needed, this finishes on its own.")).not.toBeInTheDocument();
+  });
+
+  it("a failed leg carries the BAND's sentence and a retry, in the band's own words", async () => {
+    // An operator who arrived from the band must find what the band said. A page that rephrased it
+    // would read as a second, different fact about the same machine.
+    const value = info({
+      peers: [{ name: "minibuch", state: "rolled-back", reason: "health gate timed out" }],
+    });
+    serveCheck(value, GREEN, []);
+    renderCard(value, LEAD_ROSTER);
+    expect(
+      await screen.findByText("Could not update minibuch: health gate timed out."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry now" })).toBeInTheDocument();
+  });
+
+  it("a peers-only run's legs beat the previous run this card is still holding", async () => {
+    // M20/14, measured on the VM crew. A peers-only retry writes no record on the lead, so the status
+    // carries the PREVIOUS run with its legs stripped off it (M20/09) and this run's legs at the top
+    // level. This card was ALSO holding its own copy of that previous run, fetched from
+    // `GET /api/update/check` a moment before the retry, still carrying that run's failed legs — a
+    // copy nothing about a timestamp could call stale. Read from it, the card showed last run's
+    // failures for the whole of this run: band "Updating 1 peer: member2", card both members
+    // unreachable, at every sample.
+    const previous = { schema: 1 as const, state: "done" as const, from: "1.4.1", to: "1.5.0", startedAt: stamp(5 * 60_000), updatedAt: stamp(4 * 60_000), settledAt: stamp(60_000), pid: 99, attempt: 0 };
+    // The live status: the previous run with no legs on it, and THIS run's legs at the top level.
+    const live = info({
+      run: previous,
+      peers: [{ name: "minibuch", state: "restarting", updatedAt: stamp(2_000) }],
+    });
+    // The card's own earlier fetch: the same previous run, still carrying its failed legs.
+    const held = info({
+      run: { ...previous, peers: [{ name: "minibuch", state: "rolled-back", reason: "health gate timed out", updatedAt: stamp(60_000) }] },
+    });
+    serveCheck(held, GREEN, []);
+    renderCard(live, LEAD_ROSTER);
+    await screen.findByText("Details");
+    const list = screen.getByRole("list", { name: "Crew members" });
+    expect(within(list).getByText(/restarting/)).toBeInTheDocument();
+    expect(screen.queryByText("Could not update minibuch: health gate timed out.")).not.toBeInTheDocument();
+  });
+
+  it("Retry now opens the peers-only confirm and dials nothing from the browser", async () => {
+    const user = userEvent.setup();
+    const value = info({
+      peers: [{ name: "minibuch", state: "rolled-back", reason: "health gate timed out" }],
+    });
+    serveCheck(value, GREEN, []);
+    renderCard(value, LEAD_ROSTER);
+    await user.click(await screen.findByRole("button", { name: "Retry now" }));
+    // The SAME confirm the crew-wide retry opens. It begins a run, and spec 01's urgency rule is
+    // what marks the member due — this browser clears no backoff and reaches no machine.
+    expect(screen.getByText("Retry the crew update?")).toBeInTheDocument();
+  });
+
+  it("a settled run leaves no moving row and no patience line, at the same input", async () => {
+    const legs: UpdateInfo["peers"] = [{ name: "minibuch", state: "done", version: "1.4.0" }];
+    const value = info({ peers: legs, settledAt: Date.now() - 1_000 });
+    serveCheck(value, GREEN, []);
+    renderCard(value, LEAD_ROSTER);
+    const list = await screen.findByRole("list", { name: "Crew members" });
+    expect(within(list).queryByText(/for /)).not.toBeInTheDocument();
+    expect(screen.queryByText("No action needed, this finishes on its own.")).not.toBeInTheDocument();
+  });
+});
+
+// ── A running update proves it is running (M20/08) ──────────────────────────
+
+describe("a running update proves it is running", () => {
+  it("shows the step, the count and a clock that starts from the RUN's own age", async () => {
+    // Four sentences over several minutes said what was happening and never where in the run the
+    // operator was, or for how long.
+    renderCard(info({ run: runAt("staging", { startedAt: Date.now() - 95_000, updatedAt: Date.now() }) }));
+    expect(await screen.findByText(/Step 2 of 4/)).toBeInTheDocument();
+    // 95 s, off the host's own start stamp — a phone opened mid-run joins the count where the run is.
+    expect(screen.getByText(/1:35/)).toBeInTheDocument();
+  });
+
+  it("marks the phase for each of the four in-flight states", async () => {
+    for (const [state, step] of [
+      ["preflight", 1],
+      ["staging", 2],
+      ["restarting", 3],
+      ["verifying", 4],
+    ] as const) {
+      const { unmount } = renderCard(info({ run: runAt(state) }));
+      expect(await screen.findByText(new RegExp(`Step ${step} of 4`))).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it("THE COUNTER KEEPS ADVANCING while every poll fails — it runs on the phone's own clock", async () => {
+    // The restart minute, and the whole point of the counter. The bridge is genuinely gone, every
+    // read fails, and a number derived from the last successful poll would freeze at exactly the
+    // moment the operator most needs proof that something is alive.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    server.use(
+      http.get("/api/update/check", () => HttpResponse.error()),
+      http.get("/standby/update", () => HttpResponse.error()),
+    );
+    renderCard(info({ run: runAt("restarting", { startedAt: Date.now() - 10_000, updatedAt: Date.now() }) }));
+    expect(await screen.findByText(/0:10/)).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(screen.getByText(/0:15/)).toBeInTheDocument();
+    // …and nothing on screen has become an error.
+    expect(screen.queryByText(/Rolled back/)).not.toBeInTheDocument();
+  });
+
+  it("past the bound the restart line stops claiming this is not an outage", async () => {
+    // A sentence the operator can see is wrong costs more than the silence it replaced.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    server.use(
+      http.get("/api/update/check", () => HttpResponse.error()),
+      http.get("/standby/update", () => HttpResponse.error()),
+    );
+    renderCard(info({ run: runAt("restarting", { updatedAt: Date.now() }) }));
+    expect(await screen.findByText("Restarting. This is not an outage.")).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(95_000);
+    });
+    expect(screen.queryByText(/not an outage/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("This restart is taking longer than expected. Check the service on that machine."),
+    ).toBeInTheDocument();
+  });
+
+  it("the restart's patience is timed from the restart, not from a slow build before it", async () => {
+    // `updatedAt` is the stamp of the CURRENT state. A four-minute build must not spend the
+    // restart's ninety seconds before the restart has begun.
+    renderCard(
+      info({ run: runAt("restarting", { startedAt: Date.now() - 4 * 60_000, updatedAt: Date.now() }) }),
+    );
+    expect(await screen.findByText("Restarting. This is not an outage.")).toBeInTheDocument();
+  });
+});
+
+// ── THE SENTENCE ABOUT THE CREW LINK (M27/06) ───────────────────────────────────────────────────
+//
+// A release that moves the crew wire is one the operator must take in an order: the lead first, the
+// members after. The card says so before the confirm, and says nothing at all when the reading
+// carries no link change.
+
+describe("update card — the crew link sentence", () => {
+  const LINE = "Changes the crew link. Update the lead first, members follow.";
+
+  it("stands above the action, and stays above the confirm once it is open", async () => {
+    const user = userEvent.setup();
+    const changed = info({ linkChange: { from: 1, to: 2 } });
+    serveCheck(changed, GREEN);
+    renderCard(changed);
+    expect(await screen.findByText(LINE)).toBeInTheDocument();
+    // The button's wording is untouched: what the tap does has not changed.
+    const button = await screen.findByRole("button", { name: "Update to 1.4.0" });
+    await user.click(button);
+    expect(screen.getByText("Update to 1.4.0?")).toBeInTheDocument();
+    expect(screen.getByText(LINE)).toBeInTheDocument();
+    // The confirm's own button keeps its wording too — the sentence sits above it, not in it.
+    expect(screen.getByRole("button", { name: "Yes, update" })).toBeInTheDocument();
+  });
+
+  it("says nothing when the reading carries no link change", async () => {
+    renderCard(info());
+    expect(await screen.findByRole("button", { name: "Update to 1.4.0" })).toBeInTheDocument();
+    expect(screen.queryByText(LINE)).not.toBeInTheDocument();
+    expect(screen.queryByText(/crew link/)).not.toBeInTheDocument();
   });
 });

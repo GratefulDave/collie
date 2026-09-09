@@ -17,9 +17,10 @@ import {
   type SeededFiles,
 } from "./fakes.ts";
 import type { Net } from "./sys.ts";
-import { packTurnStart, parseUpdateRun, STALE_AFTER_MS, UPDATE_RUN_SCHEMA } from "../bridge/update-run.ts";
+import { crewTurnStart, parseUpdateRun, STALE_AFTER_MS, UPDATE_RUN_SCHEMA } from "../bridge/update-run.ts";
 import {
   boundTail,
+  HANDOFF_CONFIRM_MS,
   healthTimeoutMs,
   idleRun,
   launchPlan,
@@ -30,6 +31,7 @@ import {
   scrubSecrets,
 } from "./update-run.ts";
 import { EXIT } from "./io.ts";
+import { stagingLogPath, tailOf } from "../bridge/staging-log.ts";
 import type { JsonObject } from "../bridge/json.ts";
 import { latestUpdateInMajor } from "../bridge/update.ts";
 import {
@@ -761,10 +763,10 @@ describe("update", () => {
     );
   });
 
-  test("records the run it just finished, so a restarted lead can find its pack turns", async () => {
+  test("records the run it just finished, so a restarted lead can find its crew turns", async () => {
     // The bug this pins: the in-place path wrote nothing, so `settleUpdateGate` in bridge/index.ts
     // re-read a file that was not there, `updateTurns.begin` never ran, and no peer was ever handed
-    // its turn. The lead updated itself and the pack sat still until the operator retried by hand.
+    // its turn. The lead updated itself and the crew sat still until the operator retried by hand.
     const h = harness({
       installed: "0.31.1",
       answers: [
@@ -789,7 +791,8 @@ describe("update", () => {
     // found nothing to start turns from. So the record this CLI just wrote goes through the BRIDGE's
     // own parser and the BRIDGE's own predicate, and the pair it hands the turn queue is asserted
     // here. Either side moving alone fails this test, which is what the old arrangement could not do.
-    expect(packTurnStart(parseUpdateRun(written))).toEqual({ runId: "r-99", to: STAGED_TARGET });
+    // `at` is the record's own `updatedAt`, which is what ages the run on a restart (M20/01).
+    expect(crewTurnStart(parseUpdateRun(written))).toEqual({ runId: "r-99", to: STAGED_TARGET, at: run.updatedAt });
   });
 
   test("a run started from a terminal is recorded with no id, never a blank one", async () => {
@@ -807,8 +810,8 @@ describe("update", () => {
     const run = JSON.parse(written ?? "{}");
     expect(run.state).toBe("done");
     expect(run.runId ?? null).toBeNull();
-    // And the gate correctly starts NOTHING from it: a run with no id was nobody's pack confirm.
-    expect(packTurnStart(parseUpdateRun(written))).toBeNull();
+    // And the gate correctly starts NOTHING from it: a run with no id was nobody's crew confirm.
+    expect(crewTurnStart(parseUpdateRun(written))).toBeNull();
   });
 
   test("a build that fails records nothing — the lead did not move, so no peer may", async () => {
@@ -1122,6 +1125,8 @@ interface BinaryOptions {
   health?: readonly HealthReply[];
   /** Extra scripted answers, appended after the fixture's own — e.g. a failing systemd bus probe. */
   answers?: Scripted["answers"];
+  /** What the handoff's synchronous client answers — the user manager accepting, refusing or wedged. */
+  logged?: Scripted["logged"];
 }
 
 /** One `/api/health` answer for the fake net: down, deposed, or up as some version. */
@@ -1162,7 +1167,6 @@ function binaryHarness(over: BinaryOptions = {}): Harness {
     version("1.0.0"),
     [`${INST}/current/bin/collie hooks status --check`, over.hooksCheck ?? { code: EXIT.OK }],
   ];
-  const exec = fakeExec({ answers: [...answers, ...(over.answers ?? [])] });
   const seed: SeededFiles = {
     [`${BROOT}/herdr-plugin.toml`]: 'id = "herdr.collie"\nversion = "1.0.0"\n',
     [`${BROOT}/bin/collie`]: "OLD BINARY",
@@ -1170,6 +1174,12 @@ function binaryHarness(over: BinaryOptions = {}): Harness {
   };
   for (const v of over.others ?? []) seed[`${INST}/versions/${v}/bin/collie`] = "OLDER BINARY";
   const files = fakeFiles(seed);
+  const exec = fakeExec({
+    answers: [...answers, ...(over.answers ?? [])],
+    logged: over.logged,
+    // The client's own output goes where the runner's would have — the file `--status` points at.
+    logSink: (at, text) => files.write(at, (files.read(at) ?? "") + text),
+  });
   const link = fakeLinkFs({ [`${INST}/current`]: { kind: "symlink", target: BROOT } });
   const health = healthNet(over.health, NEW);
   const net: Net = {
@@ -1262,7 +1272,7 @@ describe("collie update on a binary install", () => {
     expect(h.exec.calls.join("\n")).not.toContain("bun ");
     // The state file says `staging`, so a bridge that comes up now reports a run in flight.
     expect(JSON.parse(h.files.read(`${STATE}/update.json`) ?? "{}").state).toBe("staging");
-    expect(h.exec.spawned[0]?.command[0]).toBe("systemd-run");
+    expect(h.exec.ran[0]?.command[0]).toBe("systemd-run");
   });
 
   test("a systemd-run binary with no reachable user bus falls back to setsid, not a doomed handoff", async () => {
@@ -1967,12 +1977,16 @@ describe("the detached updater's launch seam", () => {
     expect(plan.kind).toBe("systemd-run");
     expect(plan.command.slice(0, 5)).toEqual(["systemd-run", "--user", "--collect", "--unit", "collie-update-abc"]);
     expect(plan.command.slice(5)).toEqual([base.binary, ...base.args]);
+    // This tier has a manager to ask, so the handoff waits for its answer.
+    expect(plan.confirms).toBe("manager");
   });
 
   test("macOS launches a setsid double-forked child instead — there is no systemd-run there", () => {
     const plan = launchPlan({ ...base, platform: "darwin", hasSystemdRun: false, hasSetsid: true });
     expect(plan.kind).toBe("setsid");
     expect(plan.command).toEqual(["setsid", base.binary, ...base.args]);
+    // There is no manager to ask, and the child is the runner itself rather than a client of one.
+    expect(plan.confirms).toBe("none");
   });
 
   test("linux with no systemd-run falls back to the same setsid child and says so", () => {
@@ -1982,18 +1996,102 @@ describe("the detached updater's launch seam", () => {
     expect(bare.kind).toBe("fork");
     expect(bare.command).toEqual([base.binary, ...base.args]);
     expect(bare.note).toContain("neither systemd-run nor setsid");
+    expect(plan.confirms).toBe("none");
+    expect(bare.confirms).toBe("none");
   });
 
   test("the handoff spawns the runner detached and never flips anything itself", async () => {
     const h = binaryHarness();
     await cmdUpdate(h.deps);
-    const spawned = h.exec.spawned.at(-1);
-    expect(spawned?.command[0]).toBe("systemd-run");
-    expect(spawned?.command).toContain("_apply-update");
+    const client = h.exec.ran.at(-1);
+    expect(client?.command[0]).toBe("systemd-run");
+    expect(client?.command).toContain("_apply-update");
     // The binary THIS process is executing, not a path derived from the root.
-    expect(spawned?.command).toContain(BINARY);
+    expect(client?.command).toContain(BINARY);
     // A narrow, named environment: no credential ever reaches a `--setenv` or a `ps` line.
-    expect(Object.keys(spawned?.env ?? {})).not.toContain("COLLIE_VAPID_PRIVATE");
+    expect(Object.keys(client?.env ?? {})).not.toContain("COLLIE_VAPID_PRIVATE");
+  });
+});
+
+describe("the handoff waits for the manager that will own the runner", () => {
+  // The defect this closes (M20/15): `systemd-run` was fired and forgotten from inside a `.service`,
+  // whose cgroup was torn down 4.8 ms later with the client still a member of it. The transient unit
+  // was never created, the record sat at `staging` for the full ten minute staleness window, and the
+  // runner log stayed 0 bytes. The fix is to read the client's exit code, which is the manager's own
+  // answer to "does the runner exist" (ADR 0037).
+  const ACCEPTED = "Running as unit: collie-update-mtsnsbxp.service; invocation ID: 9f2\n";
+  const REFUSED = "Failed to start transient service unit: Unit collie-update-abc.service already exists.\n";
+  /** The second tier, reached the way a container reaches it: the bus probe says no. */
+  const NO_BUS: Scripted["answers"] = [["systemctl --user show-environment", { code: 1 }]];
+
+  test("a manager that accepts the job leaves the record at staging and its own line in the log", async () => {
+    const h = binaryHarness({ others: ["0.9.0"], logged: [["systemd-run", { stdout: ACCEPTED }]] });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    const client = h.exec.ran[0];
+    expect(client?.command[0]).toBe("systemd-run");
+    // Bounded — the difference between a handoff that waits and a staging process that never exits.
+    expect(client?.timeoutMs).toBe(HANDOFF_CONFIRM_MS);
+    // The client's output goes where the runner's would have, so `--status` has something to show.
+    expect(h.files.read(client?.logPath ?? "")).toContain("Running as unit");
+    expect(parseUpdateRun(h.files.read(RUN_FILE))?.state).toBe("staging");
+    // Nothing was fired and forgotten: on this tier the client IS the launch.
+    expect(h.exec.spawned).toEqual([]);
+    expect(h.io.stdout.join("\n")).toContain("Watch it with: collie update --status");
+  });
+
+  test("a refused handoff aborts the run, releases the lock and quotes what the manager said", async () => {
+    const h = binaryHarness({ others: ["0.9.0"], logged: [["systemd-run", { code: 1, stderr: REFUSED }]] });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
+    const run = parseUpdateRun(h.files.read(RUN_FILE));
+    // Not `staging`: the phone reads the abort within one poll instead of a live-looking run.
+    expect(run?.state).toBe("idle");
+    expect(run?.reason).toContain("systemd-run");
+    expect(run?.reason).toContain("exit 1");
+    // `exit 1` alone tells an operator nothing; the manager said why.
+    expect(run?.reason).toContain("already exists");
+    // The lock is gone, so the retry is on offer at once rather than in ten minutes.
+    expect(h.files.read(LOCK_FILE)).toBeNull();
+    expect(h.io.stderr.join("\n")).toContain("Apply it by hand");
+    expect(h.link.ops).toEqual([]);
+  });
+
+  test("a manager's stderr line past 160 characters is capped, not quoted whole", async () => {
+    const long = "x".repeat(400);
+    const h = binaryHarness({ others: ["0.9.0"], logged: [["systemd-run", { code: 1, stderr: long }]] });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
+    const run = parseUpdateRun(h.files.read(RUN_FILE));
+    const complaint = run?.reason?.split(": ").at(-1) ?? "";
+    expect(complaint.length).toBeLessThanOrEqual(161);
+    expect(complaint.endsWith("…")).toBe(true);
+  });
+
+  test("a wedged manager is a timeout, not a wait without end", async () => {
+    const h = binaryHarness({ others: ["0.9.0"], logged: [["systemd-run", { hang: true }]] });
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
+    expect(parseUpdateRun(h.files.read(RUN_FILE))?.reason).toContain("timeout");
+    expect(h.files.read(LOCK_FILE)).toBeNull();
+    expect(h.exec.ran[0]?.timeoutMs).toBe(HANDOFF_CONFIRM_MS);
+  });
+
+  test("a tier that cannot confirm refuses to launch from inside a service", async () => {
+    const h = binaryHarness({ others: ["0.9.0"], answers: NO_BUS });
+    h.files.write("/proc/self/cgroup", "0::/user.slice/user-1000.slice/user@1000.service/app.slice/collie.service\n");
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.FAIL);
+    const run = parseUpdateRun(h.files.read(RUN_FILE));
+    expect(run?.reason).toContain("collie.service");
+    expect(run?.reason).toContain("needs the user manager");
+    // The child on this tier is the whole runner, so launching it here would kill it mid-swap.
+    expect(h.exec.spawned).toEqual([]);
+    expect(h.files.read(LOCK_FILE)).toBeNull();
+  });
+
+  test("the same tier in a session scope detaches exactly as before", async () => {
+    const h = binaryHarness({ others: ["0.9.0"], answers: NO_BUS });
+    // An ssh shell. A scope has no main process, so nothing in it exiting tears the cgroup down.
+    h.files.write("/proc/self/cgroup", "0::/user.slice/user-1000.slice/session-3.scope\n");
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    expect(h.exec.spawned[0]?.command[0]).toBe("setsid");
+    expect(parseUpdateRun(h.files.read(RUN_FILE))?.state).toBe("staging");
   });
 });
 
@@ -2209,5 +2307,149 @@ describe("cmdUpdate — a folder a package manager owns", () => {
     const deps = { ...h.deps, ctx: { ...h.deps.ctx, root: inHome } };
     expect(await cmdUpdate(deps)).toBe(EXIT.FAIL);
     expect(h.io.stderr.join("\n")).toContain("cannot tell how this Collie was installed");
+  });
+});
+
+// ── Staging reports itself while it builds (M20/10) ─────────────────────────
+//
+// The fetch and the build are the longest window of an update and were the one window with nothing
+// on the wire: `handOff` wrote the first record AFTER they finished, so the phone showed "Starting…"
+// and then "Still starting. The host has not reported the run yet." over the part that takes the
+// time.
+
+describe("staging reports itself while it builds", () => {
+  const RUN = "r-staging";
+
+  test("a run record and a progress line exist BEFORE the build ends, on the binary path", async () => {
+    const h = binaryHarness({});
+    expect(await cmdUpdate(h.deps, ["--run-id", RUN])).toBe(EXIT.OK);
+
+    // The record is written at the top of the window, not at the bottom. It is the SAME `staging`
+    // state the wire already carries, so no reader needs a new word — it simply arrives earlier.
+    const ops = h.files.ops.join("\n");
+    expect(ops).toContain(`${STATE}/update.json`);
+
+    const log = h.files.read(stagingLogPath(STATE, RUN));
+    expect(log).not.toBeNull();
+    // Whole lines, and the steps in the order they happened.
+    expect(log!.endsWith("\n")).toBe(true);
+    const lines = log!.trimEnd().split("\n");
+    expect(lines[0]).toContain("fetching");
+    expect(lines.some((l) => l.includes("unpacking"))).toBe(true);
+    expect(lines.some((l) => l.includes("runs here"))).toBe(true);
+
+    // And the bridge's own reader gets whole lines out of what the CLI just wrote. Both sides of the
+    // seam, in one assertion: a writer that changed shape would fail here rather than in production.
+    expect(tailOf(log!)).toBe(lines.join("\n"));
+  });
+
+  test("the progress file is written BEFORE any launcher runs, so no tier can miss it", async () => {
+    // The three-tier ladder — `systemd-run --user --collect`, then `setsid`, then a bare spawn —
+    // launches the RUNNER, after staging is over. Only the first tier has a journal, its unit name
+    // carries a stamp recorded nowhere, and `--collect` takes the unit away when it exits.
+    //
+    // So the progress file is not a launcher concern at all. It is written by the staging process
+    // itself, and this asserts the ordering that makes all three tiers one case: every write is on
+    // disk before anything is spawned. A test per tier would assert the same fact three times and
+    // still not say why.
+    const h = binaryHarness({ others: ["0.9.0"] });
+    expect(await cmdUpdate(h.deps, ["--run-id", RUN])).toBe(EXIT.OK);
+    expect(h.files.read(stagingLogPath(STATE, RUN))).not.toBeNull();
+    // The path itself names no unit and no stamp — the two things a journal lookup would need and
+    // the two things this install cannot recover.
+    expect(stagingLogPath(STATE, RUN)).not.toContain("collie-api-update");
+
+    // The second tier, reached the way a container reaches it, writes the same file.
+    const noBus = binaryHarness({ answers: [["systemctl --user show-environment", { code: 1 }]] });
+    expect(await cmdUpdate(noBus.deps, ["--run-id", RUN])).toBe(EXIT.OK);
+    expect(noBus.exec.spawned[0]?.command[0]).toBe("setsid");
+    expect(noBus.files.read(stagingLogPath(STATE, RUN))).not.toBeNull();
+  });
+
+  test("a staging that gives up puts the record back to idle instead of leaving a live-looking run", async () => {
+    // The window opens at the FETCH, and the fetch is also the first thing that can fail. Every
+    // failure below that line returns an exit code and writes nothing more, so without an explicit
+    // close the record sits at `staging` until the staleness rule reports `interrupted` ten minutes
+    // later — about a process that exited cleanly with the real diagnosis already on the terminal.
+    // The phone reads that record as a live run and disables the button, so the retry is not on
+    // offer either. `abort` is the state machine's own word for it.
+    const h = binaryHarness({ manifest: null });
+    expect(await cmdUpdate(h.deps, ["--run-id", RUN])).toBe(EXIT.FAIL);
+    const run = parseUpdateRun(h.files.read(RUN_FILE));
+    expect(run?.state).toBe("idle");
+    // `to` survives the abort, which is the proof the `staging` record was written before the fetch
+    // rather than never written at all.
+    expect(run?.to).toBe(NEW);
+    expect(run?.reason).toContain("staging");
+    // Nothing was launched, so nothing is coming later to correct the record.
+    expect(h.exec.spawned).toEqual([]);
+  });
+
+  test("a second update beside a live one writes nothing: `update.json` keeps one writer", async () => {
+    // `handOff` refuses a concurrent update, but it refuses at the END of staging — and this record
+    // is written at the START of it. Two processes writing one file is the rule the whole update
+    // wire rests on, so the lock is read before the window opens, not minutes after.
+    const h = binaryHarness({});
+    const at = 1_700_000_000_000;
+    const live = {
+      schema: UPDATE_RUN_SCHEMA,
+      state: "restarting",
+      from: "1.0.0",
+      to: NEW,
+      startedAt: at,
+      updatedAt: at,
+      pid: 999,
+      attempt: 0,
+    } as const;
+    h.files.write(RUN_FILE, JSON.stringify(live));
+    h.files.write(LOCK_FILE, JSON.stringify({ pid: 999, at }));
+    h.deps.exec.processCommand = (pid) => (pid === 999 ? "collie _apply-update" : null);
+
+    expect(await cmdUpdate(h.deps, ["--run-id", RUN])).toBe(EXIT.FAIL);
+    // The live run's record is exactly as its own updater left it.
+    expect(parseUpdateRun(h.files.read(RUN_FILE))).toEqual(live);
+    // And no progress file was written beside it, nor the live run's own file removed under it.
+    expect(h.files.ops.join("\n")).not.toContain("update-staging-");
+  });
+
+  test("a live run with no lock yet is still not written over: the lock alone does not cover the window", async () => {
+    // The lock is TAKEN at `handOff`, i.e. at the end of staging. So two updates started inside one
+    // staging window both read an unheld lock, and the lock check above lets both through. The
+    // record on disk is the other half of the same question: an in-flight state another live process
+    // wrote is that process's record, and `readUpdateRun` has already applied the staleness rule to
+    // it, so a crashed updater does not block a retry for ever.
+    //
+    // This narrows the window rather than closing it. Whichever process reaches `handOff` first takes
+    // the lock and the other is refused there, which is the pre-existing design and is unchanged.
+    const h = binaryHarness({});
+    const at = 1_700_000_000_000;
+    const live = {
+      schema: UPDATE_RUN_SCHEMA,
+      state: "staging",
+      from: "1.0.0",
+      to: NEW,
+      startedAt: at,
+      updatedAt: at,
+      pid: 999,
+      attempt: 0,
+    } as const;
+    h.files.write(RUN_FILE, JSON.stringify(live));
+    h.files.write(stagingLogPath(STATE, "r-live"), "fetching 1.2.3\n");
+    h.deps.exec.processCommand = (pid) => (pid === 999 ? "collie _apply-update" : null);
+    // No lock file at all — that is the whole point of this case.
+
+    await cmdUpdate(h.deps, ["--run-id", RUN]);
+    // This run opened no window: no progress file of its own, and the live run's file still there.
+    expect(h.files.read(stagingLogPath(STATE, RUN))).toBeNull();
+    expect(h.files.read(stagingLogPath(STATE, "r-live"))).not.toBeNull();
+  });
+
+  test("a run with no id writes no progress file, and stages exactly as before", async () => {
+    // An operator running `collie update` in a terminal has no run id, so there is no name to key a
+    // file to and nobody polling it. The record is still written early.
+    const h = binaryHarness({});
+    expect(await cmdUpdate(h.deps)).toBe(EXIT.OK);
+    expect(h.files.ops.join("\n")).not.toContain("update-staging-");
+    expect(JSON.parse(h.files.read(`${STATE}/update.json`) ?? "{}").state).toBe("staging");
   });
 });

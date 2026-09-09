@@ -520,6 +520,21 @@ export const en = {
   "connection.host.ariaSends": "Sends to host: {name}{unreachable}",
   "connection.host.ariaHost": "Host: {name}{unreachable}",
   "connection.host.ariaUnreachableSuffix": " (unreachable)",
+  // The parenthesis form is the LOCALE's, not this file's: a Chinese bundle writes full-width
+  // brackets and no leading space. So the punctuation is one key and the word inside it is the same
+  // word the eye reads, rather than a second translation of it that could drift.
+  "connection.host.ariaSuffix": " ({word})",
+  // ── §10.2's PRESENTATION SPLIT, IN WORDS (M22/05) ─────────────────────────
+  // Two situations used to share the word above. "reconnecting" is the lead still trying, inside its
+  // budget, and it asks nothing of the operator; "needs attention" is the lead unable to fix it by
+  // trying again. The pair only earns its keep if the two never read as the same thing, so the
+  // action sentences say the difference out loud rather than leaving it to a colour.
+  "connection.host.reconnecting": "reconnecting",
+  "connection.host.attention": "needs attention",
+  "connection.host.reconnectingSuffix": "reconnecting · {label}",
+  "connection.host.attentionSuffix": "needs attention · {label}",
+  "connection.host.reconnectingAction": "The lead is still trying. Nothing to do.",
+  "connection.host.attentionAction": "Trying again will not fix this. Check this machine.",
   "connection.stale.incompatible": "{name} is running an incompatible Collie",
   "connection.stale.unreachable": "{name} is unreachable · {label}",
   "connection.stale.nothingCached": "Nothing cached for this machine yet.",
@@ -538,46 +553,46 @@ export const en = {
   "connection.server.title": "Machines",
   "connection.server.aria": "Host: {name}. Switch host",
 
-  // --- pack (the read-only /pack census; role names stay English, ADR 0030) ---
-  "pack.title": "Pack",
-  "pack.nav.back": "Back",
-  "pack.entry.title": "Pack overview",
-  "pack.entry.description": "How every machine in the pack is doing.",
-  "pack.footer.label": "Pack · {machines} · {reachable}",
-  "pack.footer.aria": "Open the pack overview",
-  "pack.summary.counts": "{machines} · {reachable}",
-  "pack.summary.machines.one": "{count} machine",
-  "pack.summary.machines.other": "{count} machines",
-  "pack.summary.reachable": "{count} reachable",
-  "pack.summary.deputy": "Deputy",
-  "pack.summary.noDeputy": "no deputy named",
-  "pack.summary.warrant": "warrant {generation}",
-  "pack.summary.secret": "Secret",
-  "pack.summary.secretValue": "generation {generation} · rotated {time}",
-  "pack.member.health": "State",
-  "pack.member.reason": "Reason",
-  "pack.member.conflict": "Conflict",
-  "pack.member.conflictValue": "{lead} also leads · warrant {generation}",
-  "pack.member.conflictNoWarrant": "{lead} also leads · no warrant",
-  "pack.member.version": "Version",
-  "pack.member.versionDiffers": "differs from lead",
-  "pack.member.address": "Address",
-  "pack.member.enrolled": "Enrolled",
-  "pack.member.secretBehind": "Has not picked up the current secret.",
-  "pack.member.provisional": "Enrolled but never reached.",
-  "pack.health.reachable": "reachable",
-  "pack.health.unreachable": "unreachable",
-  "pack.health.incompatible": "incompatible",
-  "pack.health.conflicted": "conflicted",
-  "pack.role.deputy": "deputy",
-  "pack.sheet.goTo": "Go to this machine",
-  "pack.formation.aria": "Pack formation: {machines}",
-  "pack.node.aria": "{name}, {role}, {health}",
-  "pack.node.ariaPlain": "{name}, {health}",
-  "pack.solo.title": "This collie is not leading a pack",
-  "pack.solo.description": "A pack is created and changed from the command line.",
-  "pack.error.title": "Could not load pack status",
-  "pack.error.description": "The bridge did not answer. Collie tries again on the next poll.",
+  // --- crew (the read-only /crew census; role names stay English, ADR 0030) ---
+  "crew.title": "Crew",
+  "crew.nav.back": "Back",
+  "crew.entry.title": "Crew overview",
+  "crew.entry.description": "How every machine in the crew is doing.",
+  "crew.footer.label": "Crew · {machines} · {reachable}",
+  "crew.footer.aria": "Open the crew overview",
+  "crew.summary.counts": "{machines} · {reachable}",
+  "crew.summary.machines.one": "{count} machine",
+  "crew.summary.machines.other": "{count} machines",
+  "crew.summary.reachable": "{count} reachable",
+  "crew.summary.deputy": "Deputy",
+  "crew.summary.noDeputy": "no deputy named",
+  "crew.summary.warrant": "warrant {generation}",
+  "crew.summary.secret": "Secret",
+  "crew.summary.secretValue": "generation {generation} · rotated {time}",
+  "crew.member.health": "State",
+  "crew.member.reason": "Reason",
+  "crew.member.conflict": "Conflict",
+  "crew.member.conflictValue": "{lead} also leads · warrant {generation}",
+  "crew.member.conflictNoWarrant": "{lead} also leads · no warrant",
+  "crew.member.version": "Version",
+  "crew.member.versionDiffers": "differs from lead",
+  "crew.member.address": "Address",
+  "crew.member.enrolled": "Enrolled",
+  "crew.member.secretBehind": "Has not picked up the current secret.",
+  "crew.member.provisional": "Enrolled but never reached.",
+  "crew.health.reachable": "reachable",
+  "crew.health.unreachable": "unreachable",
+  "crew.health.incompatible": "incompatible",
+  "crew.health.conflicted": "conflicted",
+  "crew.role.deputy": "deputy",
+  "crew.sheet.goTo": "Go to this machine",
+  "crew.formation.aria": "Crew formation: {machines}",
+  "crew.node.aria": "{name}, {role}, {health}",
+  "crew.node.ariaPlain": "{name}, {health}",
+  "crew.solo.title": "This collie is not leading a crew",
+  "crew.solo.description": "A crew is created and changed from the command line.",
+  "crew.error.title": "Could not load crew status",
+  "crew.error.description": "The bridge did not answer. Collie tries again on the next poll.",
 
   // --- error (boot splash, route-level error recovery) ---
   "error.boot.connecting": "Connecting to the herd…",
@@ -623,6 +638,13 @@ export const en = {
   "transcript.agentFallback": "agent",
   "transcript.outputTruncated": "… output truncated",
   "transcript.truncated": "… truncated",
+  "transcript.toolImageAlt": "Tool output",
+  "transcript.attachmentAlt": "Attachment",
+
+  // --- mirror (terminal graphics in the pane mirror) ---
+  "mirror.imageAlt": "Terminal graphics",
+  "mirror.imageBadge": "[Image]",
+  "mirror.imageMatchedByOrder": "matched by order, open History to check",
 
   // --- time (relative/clock formatting) ---
   "time.justNow": "just now",
@@ -759,8 +781,9 @@ export const en = {
   "apiError.pairing.duplicate_label": "A device is already using that name.",
   "apiError.device.unknown": "No paired device has that name.",
   "apiError.session.unknown": "There is no session called {session} on this collie.",
-  "apiError.host.unknown": "There is no collie called {host} in this pack.",
-  "apiError.pack.not_lead": "This collie doesn't lead a pack, so there is no pack to show.",
+  "apiError.host.unknown": "There is no collie called {host} in this crew.",
+  // The key mirrors the wire code `crew.not_lead` (`bridge/error-codes.ts`). Both say crew from 1.8.0.
+  "apiError.crew.not_lead": "This collie doesn't lead a crew, so there is no crew to show.",
   // --- worktrees (ADR 0032) ---
   "apiError.worktree.list_failed": "The worktrees couldn't be listed: {reason}",
   "apiError.worktree.create_failed": "The worktree couldn't be created: {reason}",
@@ -810,6 +833,7 @@ export const en = {
   "settings.updateCard.majorNote": "{version} is a new major.",
   "settings.updateCard.dismiss": "Remind me next digest",
   "settings.updateCard.dismissed": "Dismissed until the next digest.",
+  "settings.updateCard.checking": "Checking this machine…",
   "settings.updateCard.details": "Details",
   "settings.updateCard.summary.checks.one": "{count} check",
   "settings.updateCard.summary.checks.other": "{count} checks",
@@ -817,11 +841,22 @@ export const en = {
   "settings.updateCard.summary.red.other": "{count} red",
   "settings.updateCard.summary.amber.one": "{count} amber",
   "settings.updateCard.summary.amber.other": "{count} amber",
+  "settings.updateCard.summary.peers.one": "{count} peer",
+  "settings.updateCard.summary.peers.other": "{count} peers",
   "settings.updateCard.preflightUnavailable": "The preflight couldn't be run on this machine.",
   "settings.updateCard.packageManaged": "Your package manager updates this install. Collie won't take it from here.",
   "settings.updateCard.remedy": "Fix: {command}",
   "settings.updateCard.confirmTitle": "Update to {version}?",
   "settings.updateCard.confirmBody": "Your terminal session stays alive. The phone view drops for up to 30 seconds.",
+  // THE SENTENCE ABOUT THE CREW LINK (M27/06), whole. It lives in the CARD's namespace because the
+  // card is where it is read: above the confirm, with room for both halves of it — what changes,
+  // and what to do about it. The band prints `updateRibbon.linkChangeShort` instead, held to the
+  // row's forty characters like every other band string. The digest push carries this same English
+  // from `LINK_CHANGE_SENTENCE` in `bridge/update.ts`, which has no locale to read.
+  //
+  // Generic on purpose: it is printed off a wire-version DIFFERENCE, never off a release name, so
+  // the release after the next one carries it with no string edited.
+  "settings.updateCard.linkChange": "Changes the crew link. Update the lead first, members follow.",
   "settings.updateCard.confirmAction": "Yes, update",
   "settings.updateCard.majorConfirmTitle": "Cross the major to {version}?",
   "settings.updateCard.majorConfirmBody": "{version} is a new major, so it is consented to on its own and never folded into a routine update. Read its release notes first. Your terminal session stays alive. The phone view drops for up to 30 seconds.",
@@ -832,6 +867,8 @@ export const en = {
   "settings.updateCard.state.preflight": "Checking this machine…",
   "settings.updateCard.state.staging": "Staging {version}…",
   "settings.updateCard.state.restarting": "Restarting. This is not an outage.",
+  "settings.updateCard.phaseOf": "Step {step} of {total}",
+  "settings.updateCard.state.restartingSlow": "This restart is taking longer than expected. Check the service on that machine.",
   "settings.updateCard.state.verifying": "Verifying the new build…",
   "settings.updateCard.state.done": "Updated to {version}.",
   "settings.updateCard.state.rolledBack": "Rolled back. This machine is still on {version}.",
@@ -842,19 +879,22 @@ export const en = {
   "settings.updateCard.logTail": "Log tail",
   "settings.updateCard.versionUnknown": "an unknown version",
 
-  // --- settings.updateCard, the pack half (M16/01) ---
-  "settings.updateCard.actionPack": "Update pack to {version}",
-  "settings.updateCard.retryPack": "Retry pack update",
-  "settings.updateCard.packConfirmTitle": "Update the pack to {version}?",
-  "settings.updateCard.packConfirmBody": "This machine goes first. Each peer then levels itself to the same release, checks its own health and rolls back on its own if it fails.",
-  "settings.updateCard.packConfirmAction": "Yes, update the pack",
-  "settings.updateCard.retryConfirmTitle": "Retry the pack update?",
+  // --- settings.updateCard, the crew half (M16/01) ---
+  "settings.updateCard.actionCrew": "Update crew to {version}",
+  "settings.updateCard.retryCrew": "Retry crew update",
+  "settings.updateCard.retryNow": "Retry now",
+  "settings.updateCard.crewConfirmTitle": "Update the crew to {version}?",
+  "settings.updateCard.crewConfirmBody": "This machine goes first. Each member then levels itself to the same release, checks its own health and rolls back on its own if it fails.",
+  "settings.updateCard.crewConfirmAction": "Yes, update the crew",
+  "settings.updateCard.retryConfirmTitle": "Retry the crew update?",
   "settings.updateCard.retryConfirmBody": "This machine is already current, so only the peers run. Each one gets one more attempt.",
   "settings.updateCard.retryConfirmAction": "Yes, retry",
-  "settings.updateCard.peers.label": "Pack members",
+  "settings.updateCard.peers.label": "Crew members",
+  "settings.updateCard.crewPatience": "No action needed, this finishes on its own.",
   "settings.updateCard.peer.versionUnknown": "version unknown",
   "settings.updateCard.peer.unknownReason": "we could not check this machine",
   "settings.updateCard.peer.asOf": "checked {ago}",
+  "settings.updateCard.peer.movingFor": "for {elapsed}",
   "settings.updateCard.peer.verdict.green": "ready",
   "settings.updateCard.peer.verdict.amber": "warnings",
   "settings.updateCard.peer.verdict.red": "red",
@@ -877,7 +917,7 @@ export const en = {
   "updates.title": "Updates",
   "updates.nav.back": "Back",
   "updates.entry.title": "Updates",
-  "updates.entry.description": "Update Collie, and the pack with it.",
+  "updates.entry.description": "Update Collie, and the crew with it.",
   "updates.entry.status.updating": "Updating…",
   "updates.entry.status.peersBehind.one": "{count} peer behind",
   "updates.entry.status.peersBehind.other": "{count} peers behind",
@@ -898,10 +938,19 @@ export const en = {
   "updateRibbon.updated": "Updated to {version}. Tap to reload.",
   "updateRibbon.peers.one": "Updating {count} peer: {names}",
   "updateRibbon.peers.other": "Updating {count} peers: {names}",
+  "updateRibbon.peersSlow.one": "Updating {count} peer: {names}, {elapsed}",
+  "updateRibbon.peersSlow.other": "Updating {count} peers: {names}, {elapsed}",
+  "updateRibbon.underAMinute": "less than a minute",
+  "updateRibbon.minutes.one": "{count} min",
+  "updateRibbon.minutes.other": "{count} min",
   "updateRibbon.packageManaged.one": "{names} waits for its package manager",
   "updateRibbon.packageManaged.other": "{names} wait for their package manager",
-  "updateRibbon.peerRolledBack": "{name} rolled back: {reason}.",
+  "updateRibbon.peerFailed": "Could not update {name}: {reason}.",
   "updateRibbon.seeUpdates": "See Updates.",
+  // THE BAND'S OWN CUT OF IT. One truncating row is about forty characters wide, which the whole
+  // sentence is not, so the band states WHAT changes and the tap lands on the card, where the rest
+  // of it sits above the confirm. Held to the budget like every other band string.
+  "updateRibbon.linkChangeShort": "Changes the crew link.",
   "updateRibbon.available": "Collie {version} available. Tap to update.",
   // A packaged host cannot take the tap — its updates come from its package manager (ADR 0035) — so
   // the band STATES the fact and names the manager. It does not instruct: the phone cannot run
@@ -911,7 +960,7 @@ export const en = {
   // states the version and points at the page that carries the boundary sentence.
   "updateRibbon.availablePackagedUnnamed": "Collie {version} available.",
   "updateRibbon.dismiss": "Dismiss this version",
-  // The close on the two QUIET pack states. Not "dismiss this version": what is put down there is a
+  // The close on the two QUIET crew states. Not "dismiss this version": what is put down there is a
   // notice about another machine, and this host's own offer is untouched by it.
   "updateRibbon.hideNotice": "Hide this notice",
 } as const;

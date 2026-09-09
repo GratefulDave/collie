@@ -28,6 +28,7 @@ const KEYS = [
   "COLLIE_PI_ROOT",
   "COLLIE_OPENCODE_ROOT",
   "COLLIE_GROK_ROOT",
+  "COLLIE_HERMES_ROOT",
   // Each harness's own home var participates in journal-root resolution, so the suite must own them
   // too — otherwise a developer with CODEX_HOME set gets different results than CI.
   "CODEX_HOME",
@@ -92,6 +93,7 @@ describe("loadConfig", () => {
     // OpenCode keeps ONE sqlite database at the top of its XDG data dir — no per-session files.
     expect(cfg.journalRoots.opencode).toEqual([join(homedir(), ".local", "share", "opencode")]);
     expect(cfg.journalRoots.grok).toEqual([join(homedir(), ".grok", "sessions")]);
+    expect(cfg.journalRoots.hermes).toEqual([join(homedir(), ".hermes")]);
     expect(cfg.submitKeys).toEqual(["Enter"]);
     expect(cfg.trustedUser).toBe("");
     expect(cfg.trustedUserOptional).toBe(false);
@@ -220,6 +222,11 @@ describe("loadConfig", () => {
     expect(loadConfig().journalRoots.codex).toEqual(["/elsewhere/rollouts"]);
   });
 
+  test("COLLIE_HERMES_ROOT relocates Hermes state.db", () => {
+    process.env.COLLIE_HERMES_ROOT = "/srv/hermes";
+    expect(loadConfig().journalRoots.hermes).toEqual(["/srv/hermes"]);
+  });
+
   // The operator's rows sit beside their .env, and the launcher hands us that dir precisely so the
   // bridge and scripts/collie-ctl.sh never disagree about which one it is.
   test("commands.toml is resolved in the plugin config dir the launcher passed", () => {
@@ -324,7 +331,7 @@ describe("loadConfig", () => {
 
   test("carries a non-loopback bind and its escape hatch without deciding either", () => {
     process.env.COLLIE_HOST = "0.0.0.0";
-    // loadConfig REPORTS the bind; it does not refuse it. The refusal needs the pack mode, which is
+    // loadConfig REPORTS the bind; it does not refuse it. The refusal needs the crew mode, which is
     // resolved after this runs (bridge/index.ts) — see nonLoopbackBindRefusal below.
     expect(loadConfig().host).toBe("0.0.0.0");
     expect(loadConfig().allowNonLoopbackBind).toBe(false);
@@ -430,7 +437,7 @@ describe("resolveBridgeHost", () => {
   });
 });
 
-// Exported so mode-scoped config (bridge/pack/config.ts) parses its env in this exact style instead
+// Exported so mode-scoped config (bridge/crew/config.ts) parses its env in this exact style instead
 // of growing a second reader. The env source is injectable, which is the only new thing here — the
 // truth table below is the one loadConfig has always used.
 describe("envBool", () => {

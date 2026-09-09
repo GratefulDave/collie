@@ -9,7 +9,7 @@
 # page screenshot, then crop by the element's own bounding box.
 #
 # Two cards on the playground carry every state this script captures:
-#   - "settings — lead of a pack, three devices paired" → the Updates row in Settings.
+#   - "settings — lead of a crew, three devices paired" → the Updates row in Settings.
 #   - "updates — the page the Settings row opens" → the Updates page itself. It reads
 #     GET/POST /api/update/check, so the up-to-date / pack-available / peer-rolled-back
 #     states are reached by stubbing that route with `agent-browser network route`
@@ -102,7 +102,7 @@ EOF
 }
 
 echo "== settings-updates-row.png"
-tag_phone_frame "settings — lead of a pack, three devices paired" settings-row
+tag_phone_frame "settings — lead of a crew, three devices paired" settings-row
 AB scrollintoview "[data-shot=settings-row]"
 # Scroll the phone's own inner scroller down to the Updates row.
 cat <<'EOF' | AB eval --stdin
@@ -138,15 +138,16 @@ NOW="$(date +%s%3N)"
 
 echo "== updates-page-up-to-date.png"
 capture_updates_page "$(cat <<EOF
-{"current":"0.32.1","latest":"0.32.1","latestUrl":null,"releaseAvailable":false,"majorAvailable":null,"majorUrl":null,"bridgeStale":false,"checkedAt":$NOW,"newerVersions":[],"preflight":{"schema":1,"verdict":"green","checks":[]},"pack":[]}
+{"current":"0.32.1","latest":"0.32.1","latestUrl":null,"releaseAvailable":false,"majorAvailable":null,"majorUrl":null,"bridgeStale":false,"checkedAt":$NOW,"newerVersions":[],"preflight":{"schema":1,"verdict":"green","checks":[]},"crew":[]}
 EOF
 )" updates-page-up-to-date.png
 
+# M27: stays until spec 04 (docs) — docs/images/updates/ still holds the old file name.
 echo "== updates-page-pack-available.png"
 ASOF1=$((NOW - 5000))
 ASOF2=$((NOW - 600000))
 capture_updates_page "$(cat <<EOF
-{"current":"0.31.0","latest":"0.32.1","latestUrl":"https://github.com/AltanS/collie/releases/tag/v0.32.1","releaseAvailable":true,"majorAvailable":null,"majorUrl":null,"bridgeStale":false,"checkedAt":$NOW,"newerVersions":["0.32.1"],"preflight":{"schema":1,"verdict":"green","checks":[{"id":"git-clean","verdict":"green","reason":"working tree clean"}]},"pack":[{"name":"workshop","version":"0.31.0","verdict":"green","reasons":[],"asOf":$ASOF1},{"name":"attic","version":"0.30.2","verdict":"amber","reasons":["disk space low on /var"],"asOf":$ASOF2}]}
+{"current":"0.31.0","latest":"0.32.1","latestUrl":"https://github.com/AltanS/collie/releases/tag/v0.32.1","releaseAvailable":true,"majorAvailable":null,"majorUrl":null,"bridgeStale":false,"checkedAt":$NOW,"newerVersions":["0.32.1"],"preflight":{"schema":1,"verdict":"green","checks":[{"id":"git-clean","verdict":"green","reason":"working tree clean"}]},"crew":[{"name":"workshop","version":"0.31.0","verdict":"green","reasons":[],"asOf":$ASOF1},{"name":"attic","version":"0.30.2","verdict":"amber","reasons":["disk space low on /var"],"asOf":$ASOF2}]}
 EOF
 )" updates-page-pack-available.png
 
@@ -154,7 +155,7 @@ echo "== updates-page-peer-rolled-back.png"
 STARTED=$((NOW - 40000))
 UPDATED=$((NOW - 2000))
 capture_updates_page "$(cat <<EOF
-{"current":"0.32.1","latest":"0.32.1","latestUrl":null,"releaseAvailable":false,"majorAvailable":null,"majorUrl":null,"bridgeStale":false,"checkedAt":$NOW,"newerVersions":[],"preflight":{"schema":1,"verdict":"green","checks":[{"id":"git-clean","verdict":"green","reason":"working tree clean"}]},"pack":[],"run":{"schema":1,"state":"done","from":"0.31.0","to":"0.32.1","startedAt":$STARTED,"updatedAt":$UPDATED,"pid":4242,"attempt":1,"peers":[{"name":"minibuch","state":"rolled-back","version":"0.31.0","reason":"health gate timed out after three attempts on the standby door"}]}}
+{"current":"0.32.1","latest":"0.32.1","latestUrl":null,"releaseAvailable":false,"majorAvailable":null,"majorUrl":null,"bridgeStale":false,"checkedAt":$NOW,"newerVersions":[],"preflight":{"schema":1,"verdict":"green","checks":[{"id":"git-clean","verdict":"green","reason":"working tree clean"}]},"crew":[],"run":{"schema":1,"state":"done","from":"0.31.0","to":"0.32.1","startedAt":$STARTED,"updatedAt":$UPDATED,"pid":4242,"attempt":1,"peers":[{"name":"minibuch","state":"rolled-back","version":"0.31.0","reason":"health gate timed out after three attempts on the standby door"}]}}
 EOF
 )" updates-page-peer-rolled-back.png
 

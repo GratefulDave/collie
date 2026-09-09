@@ -26,7 +26,8 @@ function asMux(fake: Partial<HerdrClient>): MuxAdapter {
   // listTabs, plus readPane for a claude pane's session-name scrape (whose failure the engine
   // already treats as "keep the cached name"). Nothing these tests drive reaches any other member,
   // so the missing ones are unobservable.
-  return new HerdrMux(fake as HerdrClient);
+  // A poll never asks for the session list, so an empty one is unobservable here.
+  return new HerdrMux(fake as HerdrClient, () => []);
 }
 
 // The state engine polls the multiplexer, shapes the snapshot, and fires status transitions (which
@@ -670,7 +671,7 @@ describe("StateEngine — poke / cadence / onUpdate", () => {
   });
 });
 
-// onTick backs the pack's peer sweep (PACK_PROTOCOL.md §10.1: "the peer sweep is a part of the
+// onTick backs the crew's peer sweep (CREW_PROTOCOL.md §10.1: "the peer sweep is a part of the
 // existing poll, not a second timer"). Unlike onUpdate it must fire on BOTH outcomes — a lead whose
 // own Herdr socket is down must still sweep its peers, so a local outage can never mask a peer's.
 describe("StateEngine — onTick", () => {

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 
 import { server } from "@/test/setup";
-import { fixturePackSnapshot, fixtureSnapshot } from "@/test/handlers";
+import { fixtureCrewSnapshot, fixtureSnapshot } from "@/test/handlers";
 import { __resetConnectionHealth, isLostLatched, lastHealthyAt } from "./connection-health";
 import { isConnecting } from "./connection";
 import {
@@ -11,6 +11,7 @@ import {
   fetchPane,
   fetchSnapshot,
   getNotifyPrefs,
+  imageSrc,
   refreshNow,
   sendKeys,
   sendReply,
@@ -358,7 +359,7 @@ describe("api client — scope on the wire", () => {
   });
 
   // The bridge-wide endpoints are the lead's own: push config, quiet hours and the update banner
-  // belong to the collie this phone is talking to, and a per-host copy would be pack administration.
+  // belong to the collie this phone is talking to, and a per-host copy would be crew administration.
   it("never scopes the bridge-wide endpoints", async () => {
     const urls = captureUrls();
     await fetchConfig();
@@ -375,6 +376,43 @@ describe("api client — scope on the wire", () => {
 // The fetch layer is where liveness is stamped onto the shared lib/connection-health anchor (the same
 // interception point that captures X-Collie-Build). A live snapshot/pane stamps; a 200 that reports
 // the herd link down must NOT — otherwise the "Herdr is down" escalation could never fire.
+// A journal is an AGENT's own output, so an image reference in it is untrusted content. Two shapes
+// are loadable and nothing else — the bridge refuses the rest too, and this is the check on the side
+// that would do the fetching.
+describe("api client — which image references this phone will load", () => {
+  const hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+  it("takes a blob path, and carries the host the pane belongs to", () => {
+    expect(imageSrc(`/api/blobs/${hash}`)).toBe(`/api/blobs/${hash}`);
+    expect(imageSrc(`/api/blobs/${hash}`, { host: "badger" })).toBe(
+      `/api/blobs/${hash}?host=badger`,
+    );
+    expect(imageSrc(`/api/blobs/${hash}`, { host: "badger", session: "demo" })).toBe(
+      `/api/blobs/${hash}?host=badger&session=demo`,
+    );
+  });
+
+  it("takes an inline data image, unscoped — it IS the bytes", () => {
+    expect(imageSrc("data:image/png;base64,AAAA", { host: "badger" })).toBe(
+      "data:image/png;base64,AAAA",
+    );
+  });
+
+  it("refuses a remote URL, a non-image data URL, and a path that is not a blob", () => {
+    for (const ref of [
+      "https://evil.example/x.png",
+      "http://evil.example/x.png",
+      "//evil.example/x.png",
+      "data:text/html;base64,PHNjcmlwdD4=",
+      "/api/blobs/../snapshot",
+      `/api/blobs/${hash}x`,
+      "/api/blobs/1234",
+    ]) {
+      expect(imageSrc(ref)).toBeNull();
+    }
+  });
+});
+
 describe("api client — connection-health stamping", () => {
   it("stamps a live moment on a healthy snapshot (bridge connected)", async () => {
     __resetConnectionHealth(1); // pin the anchor far in the past
@@ -402,10 +440,10 @@ describe("api client — connection-health stamping", () => {
   // ── TIER 2 IS PAYLOAD, NOT TRANSPORT ───────────────────────────────────────
   // A peer being down is a FACT the lead reports inside a 200, so the poll that carried it was live
   // in every sense tier 1 cares about. If it suppressed the stamp instead, one quiet machine in a
-  // pack would escalate the whole phone to "not connected", pause polling, and take the dashboard
+  // crew would escalate the whole phone to "not connected", pause polling, and take the dashboard
   // offline — the exact conflation lib/host-health.ts exists to prevent.
   it("stamps a live moment even when the snapshot reports unreachable peers", async () => {
-    server.use(http.get("/api/snapshot", () => HttpResponse.json(fixturePackSnapshot)));
+    server.use(http.get("/api/snapshot", () => HttpResponse.json(fixtureCrewSnapshot)));
     __resetConnectionHealth(1);
     const snap = await fetchSnapshot();
     expect(snap.servers?.some((s) => !s.reachable)).toBe(true); // the fixture's `attic` is down
@@ -508,7 +546,7 @@ describe("refreshNow", () => {
     expect(seen).toBe("?session=laptop");
   });
 
-  it("sends NOTHING for a peer — the route is not on the pack link's forwarding table", async () => {
+  it("sends NOTHING for a peer — the route is not on the crew link's forwarding table", async () => {
     let calls = 0;
     server.use(
       http.post("/api/refresh", () => {

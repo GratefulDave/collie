@@ -26,7 +26,7 @@ import { __resetOperatorCommands } from "@/lib/operator-config";
 import { submitPromptOption } from "@/lib/prompt-action";
 import { submitWizardKeys } from "@/lib/wizard-action";
 import { fixtureAgents, fixtureShellPanes, fixtureTabs } from "@/test/handlers";
-import { PackProvider } from "./pack-provider";
+import { CrewProvider } from "./crew-provider";
 import type { AgentStatus, AgentView, ServerSummary, TabView } from "@/lib/types";
 import { withHeaderHost } from "@/test/header-host";
 import { COLLAPSE_MS } from "./ui/collapse";
@@ -250,7 +250,7 @@ describe("AgentChat — the pane header's identity block", () => {
     // Scoped by data-slot, never by a bare role query: `ui/strip-host.tsx` mounts two permanent
     // sr-only live regions, so `getByRole("status")` is ambiguous in any tree with a host in it and
     // would fail as "missing" rather than "duplicated".
-    const { container } = renderPackChat("workshop"); // a REAL pack — HostChip hides on a solo one
+    const { container } = renderCrewChat("workshop"); // a REAL crew — HostChip hides on a solo one
     expect(slot(container, "caption")).toBeNull();
     const block = identity(container);
     expect(block?.textContent).not.toMatch(/workshop/i);
@@ -1015,6 +1015,21 @@ describe("AgentChat \u2014 the pane menu in the header", () => {
     expect(document.activeElement).toBe(field);
   });
 
+  // FIND HIGHLIGHTS THE MIRROR, and that only works because the query reaches AnsiOutput. The bar
+  // owns the field, the match count and prev/next, so every one of those can look right while the
+  // one thing find is for — seeing the hit in the output — is off. That is exactly what happened
+  // when the `query` prop was dropped from the mirror: the bar counted matches it never marked.
+  it("passes the find query down to the mirror, so a hit is highlighted", async () => {
+    const user = userEvent.setup();
+    const { container } = renderChat({ text: "alpha needle omega" });
+    expect(container.querySelector("[data-find-match]")).toBeNull();
+    await openFind(user);
+    await user.type(screen.getByRole("textbox", { name: /find in output/i }), "needle");
+    const hit = container.querySelector("[data-find-match]");
+    expect(hit).not.toBeNull();
+    expect(hit!.textContent).toBe("needle");
+  });
+
   // The takeover happens INSIDE the one hoisted shell (app-header.tsx): the header element itself is
   // mounted above the outlet and is not the route's to replace. Opening and closing find therefore
   // swaps the row's CONTENTS and nothing else — the same <header>, the same prerelease strip, the
@@ -1132,7 +1147,7 @@ describe("AgentChat — no session reported", () => {
   });
 
   it("says nothing for an agent with no journal adapter — there is no transcript to promise", () => {
-    const agent = { ...fixtureAgents[0]!, agent: "omp" }; // block grammars, no journal
+    const agent = { ...fixtureAgents[0]!, agent: "unknown-agent" }; // block grammars, no journal
     renderChat({ agent, agents: [agent] });
     expect(noSessionNote()).not.toBeInTheDocument();
   });
@@ -1162,7 +1177,7 @@ describe("AgentChat — statusline strip scroll containment", () => {
 // app-wide connection surfaces (banner, header dog, polling) belong to tier 1 and stay out of it.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const packRoster: ServerSummary[] = [
+const crewRoster: ServerSummary[] = [
   { id: "bluefin", name: "bluefin", isLead: true, reachable: true, protocol: "ok", lastSeenAt: 5_000 },
   // Reachable-but-long-unseen would be equally stale; unreachable is the case the operator meets.
   { id: "workshop", name: "workshop", isLead: false, reachable: false, protocol: "ok", lastSeenAt: 1_000 },
@@ -1172,13 +1187,13 @@ const packRoster: ServerSummary[] = [
     isLead: false,
     reachable: false,
     protocol: "incompatible",
-    protocolDetail: "pack protocol 2 (this collie speaks 1)",
+    protocolDetail: "crew protocol 2 (this collie speaks 1)",
     lastSeenAt: 0,
   },
 ];
 
-/** As above, but inside a pack whose lead assembled the snapshot at `ts` (the lead's own clock). */
-function renderPackChat(host: string, overrides: Partial<ComponentProps<typeof AgentChat>> = {}) {
+/** As above, but inside a crew whose lead assembled the snapshot at `ts` (the lead's own clock). */
+function renderCrewChat(host: string, overrides: Partial<ComponentProps<typeof AgentChat>> = {}) {
   const agent = { ...fixtureAgents[0]!, host };
   const props: ComponentProps<typeof AgentChat> = {
     paneId: agent.paneId,
@@ -1196,9 +1211,9 @@ function renderPackChat(host: string, overrides: Partial<ComponentProps<typeof A
     {
       path: "/",
       element: withHeaderHost(
-        <PackProvider servers={packRoster} ts={20_000} pollMs={1500}>
+        <CrewProvider servers={crewRoster} ts={20_000} pollMs={1500}>
           <AgentChat {...props} />
-        </PackProvider>,
+        </CrewProvider>,
       ),
     },
   ]);
@@ -1208,7 +1223,7 @@ function renderPackChat(host: string, overrides: Partial<ComponentProps<typeof A
 
 describe("AgentChat — a pane on a host the lead can't reach", () => {
   it("keeps showing the last known mirror, attributed to the machine by name", () => {
-    renderPackChat("workshop");
+    renderCrewChat("workshop");
     // Never blank, never a spinner: the content is real, it is just not current.
     expect(screen.getByText(/output from before it went quiet/)).toBeInTheDocument();
     const notice = screen.getByRole("status");
@@ -1217,7 +1232,7 @@ describe("AgentChat — a pane on a host the lead can't reach", () => {
   });
 
   it("says a write will be refused — before the user taps Send to find out", () => {
-    renderPackChat("workshop");
+    renderCrewChat("workshop");
     expect(screen.getByRole("status")).toHaveTextContent(/refused/i);
     // The composer names the machine rather than the generic read-only reason.
     expect(screen.getByPlaceholderText(/workshop is unreachable/i)).toBeDisabled();
@@ -1232,7 +1247,7 @@ describe("AgentChat — a pane on a host the lead can't reach", () => {
         return HttpResponse.json({ ok: true });
       }),
     );
-    renderPackChat("workshop");
+    renderCrewChat("workshop");
     const box = screen.getByPlaceholderText(/workshop is unreachable/i);
     // Disabled, so the user can't even get text in — and Send is off with it. The point of asserting
     // the network too is that nothing routes around the disabled state.
@@ -1243,17 +1258,17 @@ describe("AgentChat — a pane on a host the lead can't reach", () => {
   });
 
   it("gives an incompatible member its own reason, verbatim", () => {
-    renderPackChat("attic");
+    renderCrewChat("attic");
     const notice = screen.getByRole("status");
     expect(notice).toHaveTextContent(/attic is running an incompatible Collie/i);
-    expect(notice).toHaveTextContent(/pack protocol 2 \(this collie speaks 1\)/);
+    expect(notice).toHaveTextContent(/crew protocol 2 \(this collie speaks 1\)/);
     // Never seen at all → there is no last-good screen under the banner, and it says so rather than
     // implying the empty mirror is the machine's real state.
     expect(notice).toHaveTextContent(/nothing cached/i);
   });
 
-  it("a live host in the same pack is completely untouched", () => {
-    renderPackChat("bluefin");
+  it("a live host in the same crew is completely untouched", () => {
+    renderCrewChat("bluefin");
     expect(screen.queryByRole("status")).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText(/type a reply/i)).not.toBeDisabled();
   });
@@ -2236,7 +2251,7 @@ describe("AgentChat — folding the tab and pane rows", () => {
 // The pane header's rocket is gone; the switcher sheet is one of its two remaining homes (the other
 // is the dashboard's own LaunchStrip, covered by launch-strip.test.tsx). Same launchers.toml rows,
 // declared here through GET /api/launchers — a session-scoped route (server.ts), never a field on
-// /api/config, so rows come from the host that runs them (PACK_PROTOCOL.md §5).
+// /api/config, so rows come from the host that runs them (CREW_PROTOCOL.md §5).
 /** What `api.launch`'s POST body carries — mirrors lib/api.ts's `LaunchRequestBody`. */
 interface LaunchPostedBody {
   command?: string;
