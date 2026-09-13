@@ -363,7 +363,6 @@ export const en = {
   "paneActions.status.closeFailed": "Close failed",
 
   // --- keys (the inline Keys tray + its staging strip) ---
-  "keys.tab.keys": "Keys",
   "keys.presets.label": "Presets",
   "keys.fkeys.label": "F keys",
   "keys.confirm.label": "Confirm?",
@@ -614,6 +613,9 @@ export const en = {
 
   // --- pwa (self-update banner) ---
   "pwa.updateAvailable": "New version — tap to update",
+  // The band while a new bundle is downloading into the precache (2026-09-12). The other six
+  // dictionaries carry this English sentence until it is translated.
+  "pwa.updateInstalling": "Downloading the new version…",
 
   // --- history (pane transcript route) ---
   "history.unavailable.disabled": "Transcript history is switched off on this bridge (COLLIE_TRANSCRIPT).",
@@ -951,7 +953,7 @@ export const en = {
   // sentence is not, so the band states WHAT changes and the tap lands on the card, where the rest
   // of it sits above the confirm. Held to the budget like every other band string.
   "updateRibbon.linkChangeShort": "Changes the crew link.",
-  "updateRibbon.available": "Collie {version} available. Tap to update.",
+  "updateRibbon.available": "Collie {version} available.",
   // A packaged host cannot take the tap — its updates come from its package manager (ADR 0035) — so
   // the band STATES the fact and names the manager. It does not instruct: the phone cannot run
   // pacman, and a line that told the operator to would be telling them to go somewhere else.
@@ -959,6 +961,10 @@ export const en = {
   // The same host under a prefix Collie does not recognise: there is no manager to name, so the band
   // states the version and points at the page that carries the boundary sentence.
   "updateRibbon.availablePackagedUnnamed": "Collie {version} available.",
+  // The band's own control in the states that can also be PUT DOWN. `ui/notice.tsx` forbids a
+  // whole-row tap beside a dismiss X (a button may not hold a button), so those states name the
+  // tap instead of being one. It opens /settings/updates, where the confirm lives; it starts nothing.
+  "updateRibbon.view": "View",
   "updateRibbon.dismiss": "Dismiss this version",
   // The close on the two QUIET crew states. Not "dismiss this version": what is put down there is a
   // notice about another machine, and this host's own offer is untouched by it.

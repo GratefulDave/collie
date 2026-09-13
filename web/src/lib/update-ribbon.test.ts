@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import {
   clearUpdateStarted,
+  dismissesLocally,
   dismissTarget,
   DONE_WINDOW_MS,
   getUpdateStarted,
@@ -56,6 +57,7 @@ const read = (over: Partial<RibbonInput> = {}) =>
     update: info(),
     startedAt: null,
     bundleStale: false,
+    bundleInstalling: false,
     dismissedVersion: null,
     dismissedCrewVersion: null,
     now: NOW,
@@ -317,7 +319,7 @@ describe("a packaged host reads its own line", () => {
   it("leaves every other install kind on the ordinary offer", () => {
     const view = read({ update: info({ installKind: "binary", packageCommand: undefined }) });
     expect(view).toEqual({ kind: "available", version: "1.5.0" });
-    expect(ribbonText(view)).toBe("Collie 1.5.0 available. Tap to update.");
+    expect(ribbonText(view)).toBe("Collie 1.5.0 available.");
   });
 });
 
@@ -413,6 +415,23 @@ describe("dismissing the quiet crew states", () => {
     });
     // With nothing to key it to, it stays: a dismissal no newer version can raise again is a mute.
     expect(dismissTarget({ kind: "peer-failed", name: "minibuch", reason: "gate", target: null })).toBeNull();
+  });
+
+  it("the DOWNLOAD row closes in this document and posts nothing (2026-09-12)", () => {
+    // It is closable for the reason the others are not: the wait has no end of its own. A worker
+    // stuck in `installing` on a dead link is waited on with no timer and no forced reload, so the
+    // close is the operator's only way back to the app they already have.
+    expect(dismissesLocally({ kind: "bundle-installing" })).toBe(true);
+    // And it is NOT a dismissal: nothing was declined, so no version goes to the bridge.
+    expect(dismissTarget({ kind: "bundle-installing" })).toBeNull();
+  });
+
+  it("every other state is put down on the bridge or not at all", () => {
+    expect(dismissesLocally({ kind: "bundle" })).toBe(false);
+    expect(dismissesLocally({ kind: "updated", version: "1.5.0" })).toBe(false);
+    expect(dismissesLocally({ kind: "available", version: "1.5.0" })).toBe(false);
+    expect(dismissesLocally({ kind: "starting" })).toBe(false);
+    expect(dismissesLocally({ kind: "silent" })).toBe(false);
   });
 });
 
@@ -545,14 +564,14 @@ describe("the crew link sentence", () => {
   it("appends the SHORT form to the offer — the band is one budgeted row", () => {
     const view = read({ update: info({ linkChange: { from: 1, to: 2 } }) });
     expect(view).toEqual({ kind: "available", version: "1.5.0" });
-    expect(ribbonText(view, { from: 1, to: 2 })).toBe(`Collie 1.5.0 available. Tap to update. ${SHORT}`);
+    expect(ribbonText(view, { from: 1, to: 2 })).toBe(`Collie 1.5.0 available. ${SHORT}`);
     // Never the whole sentence: that one belongs above the confirm, where there is room for it.
     expect(ribbonText(view, { from: 1, to: 2 })).not.toContain("members follow");
   });
 
   it("is absent when the reading carries no link change", () => {
     const view = read();
-    expect(ribbonText(view)).toBe("Collie 1.5.0 available. Tap to update.");
+    expect(ribbonText(view)).toBe("Collie 1.5.0 available.");
     expect(ribbonText(view, null)).not.toContain("crew link");
     expect(linkChangeBandNote(null)).toBeNull();
     expect(linkChangeBandNote(undefined)).toBeNull();

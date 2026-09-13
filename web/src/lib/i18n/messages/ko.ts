@@ -342,7 +342,6 @@ export const ko: Dictionary = {
   "paneActions.status.closeFailed": "닫기 실패",
 
   // --- keys (the inline Keys tray + its staging strip) ---
-  "keys.tab.keys": "키",
   "keys.presets.label": "프리셋",
   "keys.fkeys.label": "기능 키",
   "keys.confirm.label": "확인",
@@ -583,6 +582,7 @@ export const ko: Dictionary = {
 
   // --- pwa (self-update banner) ---
   "pwa.updateAvailable": "새 버전 업데이트 가능. 탭하여 적용하십시오.",
+  "pwa.updateInstalling": "Downloading the new version…",
 
   // --- history (pane transcript route) ---
   "history.unavailable.disabled": "현재 브리지에서 트랜스크립트 기록이 비활성화되어 있습니다 (COLLIE_TRANSCRIPT).",
@@ -889,9 +889,10 @@ export const ko: Dictionary = {
   "updateRibbon.peerFailed": "{name} 업데이트 실패: {reason}.",
   "updateRibbon.seeUpdates": "업데이트 화면 보기.",
   "updateRibbon.linkChangeShort": "크루 연결 방식이 바뀝니다.",
-  "updateRibbon.available": "Collie {version} 사용 가능. 탭하여 업데이트.",
+  "updateRibbon.available": "Collie {version} 사용 가능.",
   "updateRibbon.availablePackaged": "Collie {version} ({manager}) 이용 가능.",
   "updateRibbon.availablePackagedUnnamed": "Collie {version} 이용 가능.",
+  "updateRibbon.view": "보기",
   "updateRibbon.dismiss": "이 버전 숨기기",
   "updateRibbon.hideNotice": "이 알림 숨기기",
 };

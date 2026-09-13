@@ -331,7 +331,6 @@ export const zh: Dictionary = {
   "paneActions.status.closeFailed": "关闭失败",
 
   // --- keys (the inline Keys tray + its staging strip) ---
-  "keys.tab.keys": "按键",
   "keys.presets.label": "预设配置",
   "keys.fkeys.label": "功能键",
   "keys.confirm.label": "确认操作？",
@@ -572,6 +571,7 @@ export const zh: Dictionary = {
 
   // --- pwa (self-update banner) ---
   "pwa.updateAvailable": "发现新版本，点击以应用更新",
+  "pwa.updateInstalling": "Downloading the new version…",
 
   // --- history (pane transcript route) ---
   "history.unavailable.disabled": "当前网桥已禁用会话记录（COLLIE_TRANSCRIPT）。",
@@ -875,9 +875,10 @@ export const zh: Dictionary = {
   "updateRibbon.peerFailed": "{name} 更新失败：{reason}。",
   "updateRibbon.seeUpdates": "查看更新。",
   "updateRibbon.linkChangeShort": "机组连接方式会变更。",
-  "updateRibbon.available": "Collie {version} 可用。点击更新。",
+  "updateRibbon.available": "Collie {version} 可用。",
   "updateRibbon.availablePackaged": "Collie {version} 可通过 {manager} 获取。",
   "updateRibbon.availablePackagedUnnamed": "Collie {version} 可用。",
+  "updateRibbon.view": "查看",
   "updateRibbon.dismiss": "忽略此版本",
   "updateRibbon.hideNotice": "隐藏此通知",
 };

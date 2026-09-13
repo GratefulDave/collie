@@ -344,7 +344,6 @@ export const ja: Dictionary = {
   "paneActions.status.closeFailed": "終了処理に失敗しました",
 
   // --- keys (the inline Keys tray + its staging strip) ---
-  "keys.tab.keys": "キー",
   "keys.presets.label": "プリセット",
   "keys.fkeys.label": "ファンクションキー",
   "keys.confirm.label": "確認",
@@ -585,6 +584,7 @@ export const ja: Dictionary = {
 
   // --- pwa (self-update banner) ---
   "pwa.updateAvailable": "新しいバージョンがあります。タップして更新してください。",
+  "pwa.updateInstalling": "Downloading the new version…",
 
   // --- history (pane transcript route) ---
   "history.unavailable.disabled": "このブリッジでは会話履歴が無効化されています (COLLIE_TRANSCRIPT)。",
@@ -897,9 +897,10 @@ export const ja: Dictionary = {
   "updateRibbon.peerFailed": "{name}を更新不可: {reason}。",
   "updateRibbon.seeUpdates": "更新画面を確認。",
   "updateRibbon.linkChangeShort": "クルーの接続方式が変わります。",
-  "updateRibbon.available": "Collie {version} を利用可能。タップして更新。",
+  "updateRibbon.available": "Collie {version} が利用可能です。",
   "updateRibbon.availablePackaged": "Collie {version}（{manager}）が利用可能。",
   "updateRibbon.availablePackagedUnnamed": "Collie {version} が利用可能。",
+  "updateRibbon.view": "表示",
   "updateRibbon.dismiss": "このバージョンを非表示",
   "updateRibbon.hideNotice": "この通知を非表示",
 };

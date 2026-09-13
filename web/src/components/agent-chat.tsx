@@ -34,7 +34,7 @@ import { Collapse, CollapseSwap } from "@/components/ui/collapse";
 import { RouteHeader } from "@/components/app-header";
 import { HeaderStatus } from "@/components/header-status";
 import { AnsiOutput } from "@/components/ansi-output";
-import { MIRROR_SPACE, MIRROR_INVERT, styleFor } from "@/components/mirror-space";
+import { MIRROR_SPACE, MIRROR_INVERT, segmentStyle } from "@/components/mirror-space";
 import { cn } from "@/lib/utils";
 import { paneTag } from "@/lib/pane-tag";
 import { parseAnsi } from "@/lib/ansi";
@@ -1413,9 +1413,11 @@ export function AgentChat({
             "relative flex min-h-0 min-w-0 flex-1 flex-col",
             // The composer carried the bottom inset, and in zen the composer is gone — so this
             // region takes it over, or the mirror's last row runs under the home indicator. The TOP
-            // inset is deliberately NOT taken: the header element stays mounted with its own
-            // `env(safe-area-inset-top)` even while its row is collapsed away, so claiming it here
-            // would pay for the notch twice.
+            // inset is deliberately NOT taken: the header element stays mounted above this region
+            // even while its row is collapsed away, and the notch is reserved exactly once up there
+            // — by the strip band while it is showing something, by the header itself while it is
+            // not (`app-header.tsx`). Claiming it here would pay for it twice, whichever of the two
+            // currently holds it.
             zen && "[padding-bottom:env(safe-area-inset-bottom)]",
           )}
         >
@@ -1869,7 +1871,11 @@ export function AgentChat({
                       {row.segments.map((s, si) => (
                         // Text nodes only — colour and weight come from the ANSI parse, never markup.
                         // Same XSS boundary as the mirror.
-                        <span key={si} style={styleFor(s)}>
+                        <span
+                          key={si}
+                          style={segmentStyle(s)}
+                          className={s.mobileTransparentBg ? "terminal-mobile-transparent-bg" : undefined}
+                        >
                           {s.text}
                         </span>
                       ))}

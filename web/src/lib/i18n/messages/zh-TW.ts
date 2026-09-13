@@ -327,7 +327,6 @@ export const zhTW: Dictionary = {
   "paneActions.status.closeFailed": "關閉失敗",
 
   // --- keys (the inline Keys tray + its staging strip) ---
-  "keys.tab.keys": "按鍵",
   "keys.presets.label": "預設設定",
   "keys.fkeys.label": "功能鍵",
   "keys.confirm.label": "確認操作？",
@@ -568,6 +567,7 @@ export const zhTW: Dictionary = {
 
   // --- pwa (self-update banner) ---
   "pwa.updateAvailable": "發現新版本，點擊以套用更新",
+  "pwa.updateInstalling": "Downloading the new version…",
 
   // --- history (pane transcript route) ---
   "history.unavailable.disabled": "目前 Bridge 已停用工作階段記錄（COLLIE_TRANSCRIPT）。",
@@ -869,9 +869,10 @@ export const zhTW: Dictionary = {
   "updateRibbon.peerFailed": "{name} 更新失敗：{reason}。",
   "updateRibbon.seeUpdates": "查看更新。",
   "updateRibbon.linkChangeShort": "機組連線方式會變更。",
-  "updateRibbon.available": "Collie {version} 可用。點擊更新。",
+  "updateRibbon.available": "已推出 Collie {version}。",
   "updateRibbon.availablePackaged": "Collie {version} 可透過 {manager} 取得。",
   "updateRibbon.availablePackagedUnnamed": "Collie {version} 可用。",
+  "updateRibbon.view": "查看",
   "updateRibbon.dismiss": "略過此版本",
   "updateRibbon.hideNotice": "隱藏此通知",
 };
