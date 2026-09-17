@@ -33,6 +33,23 @@ describe("ThreadSidebar", () => {
     expect(screen.getByText("Recent")).toBeInTheDocument();
   });
 
+  it("keeps an unread idle completion above Working even when Recent is folded", () => {
+    const finished = { ...idleAgent, lastActiveAt: 200, lastSeenAt: 100 };
+    const props = { currentPaneId: "", onSelect: vi.fn(), recentOpen: false, onRecentOpenChange: vi.fn() };
+    const { rerender } = render(<ThreadSidebar {...props} agents={[...fixtureAgents, finished]} />);
+    expect(screen.getAllByRole("heading").map((h) => h.textContent)).toEqual([
+      expect.stringContaining("Needs you"),
+      expect.stringContaining("Ready · unseen"),
+      expect.stringContaining("Working"),
+    ]);
+    expect(screen.getByRole("button", { name: /sandbox/ })).toBeInTheDocument();
+
+    rerender(<ThreadSidebar {...props} agents={[...fixtureAgents, { ...finished, lastSeenAt: 300 }]} />);
+    expect(screen.queryByText("Ready · unseen")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /sandbox/ })).not.toBeInTheDocument();
+    expect(screen.getByText("Recent")).toBeInTheDocument();
+  });
+
   it("omits groups that have no members", () => {
     // Only a blocked agent → no Working / Recent headers.
     render(<ThreadSidebar agents={[fixtureAgents[0]!]} currentPaneId="" onSelect={vi.fn()} />);
@@ -44,10 +61,10 @@ describe("ThreadSidebar", () => {
   it("marks the current pane with aria-current='page'", () => {
     render(<ThreadSidebar agents={fixtureAgents} currentPaneId="w2:p1" onSelect={vi.fn()} />);
     const current = screen.getByRole("button", { current: "page" });
-    // w2:p1 lives in the "collie" workspace. The row is titled by where the work IS, not by which
-    // agent is doing it — "codex" is carried by the avatar (see paneTitle).
+    // w2:p1 lives in the "collie" workspace and has no name of its own, so line 1 is its agent word
+    // and line 2 is its place. Same way round as every other list in the app (lib/pane-name.ts).
     expect(current).toHaveTextContent("collie");
-    expect(current).not.toHaveTextContent("codex");
+    expect(current).toHaveTextContent("codex");
   });
 
   it("does not mark any pane current when the id matches nothing", () => {

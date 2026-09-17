@@ -22,11 +22,17 @@ import {
   isLoopbackPeer,
   isReservedAuthPath,
   keysPane,
+  cacheRulesRoute,
   launchersRoute,
   normalizeTabLabel,
+  hasSplitUrl,
   paneReadResponse,
+  readPane,
   parsePairRequest,
   parseSnoozeRequest,
+  parseCacheWatchRequest,
+  parseCacheWatchForget,
+  cacheWatchable,
   replyPane,
   requestBodyCap,
   requestDevice,
@@ -78,8 +84,10 @@ import {
   MUX_LOGO_PATH,
   type AgentView,
   type Launcher,
+  type CacheRulesResponse,
   type LaunchersResponse,
   type MuxConfig,
+  type PaneReadResponse,
   type SnapshotResponse,
 } from "./types.ts";
 import type { StateEngine } from "./state-engine.ts";
@@ -123,6 +131,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     pollMs: 1500,
     pollIdleMs: 12_000,
     notifyDelayMs: 30_000,
+    cacheWarnSeconds: 300,
     readLines: 200,
     transcript: true,
     journalRoots: {
@@ -140,6 +149,7 @@ function cfg(overrides: Partial<Config> = {}): Config {
     themeFile: "/nope/theme.toml",
     fontsDir: "/nope/fonts",
     launchersFile: "/nope/launchers.toml",
+    cacheRulesFile: "/nope/cache-rules.toml",
     trustedUser: "",
     trustedUserOptional: false,
     auditContent: "preview",
@@ -1134,6 +1144,41 @@ describe("parsePairRequest — the bootstrap body", () => {
   });
 });
 
+describe("the cache-watch request parsers and the watchable gate", () => {
+  test("only a boolean `on` is accepted", () => {
+    expect(parseCacheWatchRequest({ on: true })).toEqual({ on: true });
+    expect(parseCacheWatchRequest({ on: false })).toEqual({ on: false });
+    expect(parseCacheWatchRequest({})).toBeNull();
+    expect(parseCacheWatchRequest({ on: "yes" })).toBeNull();
+    expect(parseCacheWatchRequest(null)).toBeNull();
+    expect(parseCacheWatchRequest([true])).toBeNull();
+  });
+
+  test("only a non-empty string `id` is accepted", () => {
+    expect(parseCacheWatchForget({ id: "b7f1c2a9" })).toBe("b7f1c2a9");
+    expect(parseCacheWatchForget({ id: "" })).toBeNull();
+    expect(parseCacheWatchForget({ id: 7 })).toBeNull();
+    expect(parseCacheWatchForget({})).toBeNull();
+    expect(parseCacheWatchForget("b7f1c2a9")).toBeNull();
+  });
+
+  test("a pane is watchable only once it has a reading that is not `unknown`", () => {
+    const base = { key: "k", ref: "id:a", paneId: "w1:p1", label: "one" };
+    const cache = {
+      state: "warm" as const,
+      expiresAt: 1,
+      ttlSeconds: 600,
+      ruleId: "r",
+      confidence: "documented" as const,
+    };
+    expect(cacheWatchable({ ...base, cache })).toBe(true);
+    expect(cacheWatchable({ ...base, cache: { ...cache, state: "cold" } })).toBe(true);
+    // Nothing measured means nothing to warn about: the switch is disabled and says why.
+    expect(cacheWatchable({ ...base, cache: { ...cache, state: "unknown" } })).toBe(false);
+    expect(cacheWatchable(base)).toBe(false);
+  });
+});
+
 describe("parseSnoozeRequest — absence is not null", () => {
   test("an explicit null clears the snooze", () => {
     expect(parseSnoozeRequest({ snoozedUntil: null })).toEqual({ ok: true, until: null });
@@ -1936,7 +1981,7 @@ describe("the host gate — `?host=` selects among enrolled members and nothing 
     // rows, one journal blob, tab action, the pane family, "look now", the worktree listing and the
     // worktree actions) reach their runtime through the caller's resolver and nothing else.
     expect([...src.matchAll(/await caller\.resolve\(\);/g)]).toHaveLength(10);
-    // Exactly six `registry.get(` calls remain, and each is a sanctioned one, named here rather
+    // Exactly seven `registry.get(` calls remain, and each is a sanctioned one, named here rather
     // than exempted: assembling THIS collie's own snapshot body; `localRuntime`, the single
     // "(session) → runtime, or 404" helper both callers share; `/api/config`, which reports THIS
     // collie's own multiplexer (M10/06) and is not session-scoped at all; `/api/mux/logo.svg`,
@@ -1945,8 +1990,13 @@ describe("the host gate — `?host=` selects among enrolled members and nothing 
     // THIS collie's own engine on a route that is already local-body-then-merge and has no `?h=`
     // branch to fall through; and the crew surface's own `mux` source, which answers an admitted
     // LEAD with this machine's block on `hello` and is the same local read `/api/config` makes
-    // (M22/03). A seventh would be a route reaching past the gate.
-    expect([...src.matchAll(/registry\.get\(/g)]).toHaveLength(6);
+    // (M22/03); and the cache-watch resolver, which turns `(host, session, paneId)` into the watch key
+    // a PREFERENCE is stored under — deliberately NOT through the gate, because that preference belongs
+    // on the collie the phone is talking to and a forward would store it on the machine that holds no
+    // push subscription (ADR 0042, CREW_PROTOCOL.md §5). It reads a peer's pane out of the lead's own
+    // swept body instead, exactly as `bridge/crew/notify.ts` does, and writes to no terminal at all.
+    // An EIGHTH would be a route reaching past the gate.
+    expect([...src.matchAll(/registry\.get\(/g)]).toHaveLength(7);
     // The mux read is a read of the LOCAL primary — never `?host=`, because a peer's capabilities
     // are its own business and reach the lead over the crew API, never out of this registry.
     expect(src).toContain("const activeMux = registry.get();");
@@ -2196,13 +2246,11 @@ describe("the update write gate — POST api/update rides the pane path's own ga
     // One call, and the monitor is what decides whether the digest is snoozed with it. If the route
     // ever spells that itself, the rule can be edited apart from the record it belongs to.
     expect(handler).toContain('await updateMonitor.dismiss(version, scope ?? "offer")');
-    // REMOVE_IN_1_9_0: 1.7.0's `"pack"` scope is accepted and folded into `"crew"` at the door, so
-    // nothing past this line ever sees the old name.
-    expect(handler).toContain('const scope = asked === "pack" ? "crew" : asked');
     expect(handler).not.toContain("snoozeDigest");
     // WHICH band, because they are two decisions. An absent scope reads as the offer, which is what
-    // every client before the crew states could close.
-    expect(handler).toContain('asked !== "offer" && asked !== "crew"');
+    // every client before the crew states could close. 1.7.0's `"pack"` scope is no longer one of
+    // them: an unknown scope is a 400, which is what an unknown scope has always been.
+    expect(handler).toContain('scope !== "offer" && scope !== "crew"');
     expect(handler).toContain('text("bad scope", 400)');
     // A version, checked before anything is written: the band is keyed by version, so an empty one
     // would dismiss nothing and pin the store to a fact that is not one.
@@ -2667,6 +2715,78 @@ describe("GET /api/launchers — this host's own rows, home included", () => {
   });
 });
 
+describe("GET /api/cache-rules — the catalog behind every cache chip", () => {
+  test("answers every shipped rule with its source and its date", async () => {
+    const res = await cacheRulesRoute(() => Promise.resolve([]), null, null);
+    expect(res.status).toBe(200);
+    // SAFETY: `cacheRulesRoute` is the only writer of this body (this test calls it directly, two
+    // lines up), so the shape it satisfies itself with (`CacheRulesResponse`) is what comes back.
+    const body = (await res.json()) as CacheRulesResponse;
+    expect(body.rules.map((r) => r.id)).toContain("claude.subscription");
+    const claude = body.rules.find((r) => r.id === "claude.subscription");
+    expect(claude?.ttlSeconds).toBe(3600);
+    expect(claude?.confidence).toBe("documented");
+    expect(claude?.retrievedAt).toBe("2026-08-24");
+    expect(claude?.sourceUrl).toBe("https://code.claude.com/docs/en/prompt-caching");
+    expect(claude?.overridden).toBeUndefined();
+    // No shipped rule may reach the sheet without a page and a date behind it (ADR 0041).
+    for (const rule of body.rules) {
+      expect(rule.sourceUrl).not.toBe("");
+      expect(rule.retrievedAt).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    }
+  });
+
+  test("marks an overridden rule with the OPERATOR's own url and date, not the vendor's", async () => {
+    const res = await cacheRulesRoute(
+      () =>
+        Promise.resolve([
+          {
+            ruleId: "claude.api",
+            ttlSeconds: 3600,
+            sourceUrl: "https://our.gateway.invalid/notes",
+            retrieved: "2026-09-12",
+            note: "our gateway sends ttl 1h",
+          },
+        ]),
+      null,
+      null,
+    );
+    // SAFETY: as above — this test is the only caller, so the body is the one this route composed.
+    const body = (await res.json()) as CacheRulesResponse;
+    const row = body.rules.find((r) => r.id === "claude.api");
+    expect(row?.ttlSeconds).toBe(300);
+    expect(row?.overridden).toEqual({
+      ttlSeconds: 3600,
+      sourceUrl: "https://our.gateway.invalid/notes",
+      retrieved: "2026-09-12",
+      note: "our gateway sends ttl 1h",
+    });
+  });
+
+  test("answers 304 with the ETag and no body when the phone already has it", async () => {
+    const first = await cacheRulesRoute(() => Promise.resolve([]), null, null);
+    const etag = first.headers.get("etag");
+    expect(etag).not.toBeNull();
+    const again = await cacheRulesRoute(() => Promise.resolve([]), null, etag);
+    expect(again.status).toBe(304);
+    expect(again.headers.get("etag")).toBe(etag);
+    expect(await again.text()).toBe("");
+  });
+
+  test("the ETag moves when an override moves a number", async () => {
+    const plain = await cacheRulesRoute(() => Promise.resolve([]), null, null);
+    const moved = await cacheRulesRoute(
+      () =>
+        Promise.resolve([
+          { ruleId: "codex.api", ttlSeconds: 1800, sourceUrl: "https://x.invalid", retrieved: "2026-09-13" },
+        ]),
+      null,
+      null,
+    );
+    expect(moved.headers.get("etag")).not.toBe(plain.headers.get("etag"));
+  });
+});
+
 // ── GET /api/blobs/<hash> ────────────────────────────────────────────────────
 // The route in full, against a real blob store on disk: every branch a phone can reach. It takes
 // its roots as an argument for exactly this reason — `Bun.serve` cannot be stood up under
@@ -2895,5 +3015,86 @@ describe("update status peers — the legs of a crew-wide run", () => {
     // A peers-only run starts no updater on this machine.
     const peersBranch = handler.slice(handler.indexOf('if (verdict.kind === "peers")'));
     expect(peersBranch.slice(0, peersBranch.indexOf("return json"))).not.toContain("action.start");
+  });
+});
+
+describe("hasSplitUrl — is a URL cut by the pane's column edge?", () => {
+  test("a URL running to the end of a row is a split", () => {
+    expect(
+      hasSplitUrl("$ gcloud auth login --no-launch-browser\n    https://accounts.google.com/o/oauth2/auth?client_id=1&scope=x\n&response_type=code"),
+    ).toBe(true);
+  });
+
+  test("Herdr's CR row terminator does not hide the split", () => {
+    // A row that ends `…&s\r` is the shape a real read hands over; without the CR the gate would
+    // never fire on the pane this exists for.
+    expect(hasSplitUrl("\u001b[36mhttps://a.dev/x?y=1\u001b[0m\r\nnext")).toBe(true);
+  });
+
+  test("styling does not hide the split", () => {
+    expect(hasSplitUrl("\u001b[34mhttps://a.dev/x?y=1\u001b[0m\n\u001b[34m&z=2\u001b[0m")).toBe(true);
+  });
+
+  test("a URL with nothing that could continue it is not worth the read", () => {
+    // The last row, a blank row, an indented row, a padded URL row: the client repairs none of them,
+    // so the gate must not pay for a read on them either.
+    expect(hasSplitUrl("done\nhttps://a.dev/x?y=1")).toBe(false);
+    expect(hasSplitUrl("https://a.dev/x?y=1\n\nnext")).toBe(false);
+    expect(hasSplitUrl("https://a.dev/x?y=1\r\n  indented")).toBe(false);
+    expect(hasSplitUrl("https://a.dev/x?y=1   \nnext")).toBe(false);
+  });
+
+  test("a URL that ends with prose after it is not a split", () => {
+    expect(hasSplitUrl("open https://a.dev/x then")).toBe(false);
+    expect(hasSplitUrl("https://a.dev/x, and more")).toBe(false);
+  });
+
+  test("no URL at all is not a split", () => {
+    expect(hasSplitUrl("$ echo hello\nworld")).toBe(false);
+  });
+});
+
+describe("readPane — the logical read is asked for only when it can repair something", () => {
+  /** A pane read that answers with `grid`, and remembers whether the logical read was reached. */
+  function paneStub(grid: string, logical: string) {
+    let logicalReads = 0;
+    const stub: Partial<MuxAdapter> = {
+      mux: "herdr",
+      readGrid: (paneId: string) => Promise.resolve(muxOk({ paneId, text: grid, truncated: false, revision: 7 })),
+      readLogicalText: () => {
+        logicalReads += 1;
+        return Promise.resolve(muxOk(logical));
+      },
+    };
+    // SAFETY: `readPane` reaches `mux` for its error text and these two reads, all present above.
+    const adapter = stub as MuxAdapter;
+    return { adapter, reads: () => logicalReads };
+  }
+
+  const get = (paneId: string) =>
+    new Request(`http://x/api/pane/${encodeURIComponent(paneId)}`);
+  const url = new URL("http://x/api/pane/w1:p1");
+
+  test("a grid with no split URL is served from the grid alone", async () => {
+    const { adapter, reads } = paneStub("$ echo hi\nhi", "unused");
+    const res = await readPane(adapter, cfg(), "w1:p1", url, get("w1:p1"));
+    // SAFETY: the bridge's own JSON, served by the call above.
+    const body = (await res.json()) as PaneReadResponse;
+    expect(reads()).toBe(0);
+    expect(body.logicalText).toBeUndefined();
+    expect(body.text).toBe("$ echo hi\nhi");
+  });
+
+  test("a split URL brings the logical text in, with its styling stripped", async () => {
+    const grid = "run:\n\u001b[36mhttps://a.dev/auth?client=1&s\u001b[0m\ntate=y then";
+    const logical = "\u001b[36mrun:\nhttps://a.dev/auth?client=1&state=y then\u001b[0m";
+    const { adapter, reads } = paneStub(grid, logical);
+    const res = await readPane(adapter, cfg(), "w1:p1", url, get("w1:p1"));
+    // SAFETY: the bridge's own JSON, served by the call above.
+    const body = (await res.json()) as PaneReadResponse;
+    expect(reads()).toBe(1);
+    expect(body.logicalText).toBe("run:\nhttps://a.dev/auth?client=1&state=y then");
+    // The mirror keeps its own rows, styling and all — only the hrefs are repaired downstream.
+    expect(body.text).toBe(grid);
   });
 });

@@ -9,6 +9,7 @@ import {
   loadConfig,
   nonLoopbackBindRefusal,
   resolveBridgeHost,
+  resolveStateDir,
 } from "./config.ts";
 import { DEFAULT_MAX_UPLOAD_BYTES } from "./uploads.ts";
 
@@ -21,6 +22,7 @@ const KEYS = [
   "COLLIE_POLL_MS",
   "COLLIE_POLL_IDLE_MS",
   "COLLIE_NOTIFY_DELAY_MS",
+  "COLLIE_CACHE_WARN_SECONDS",
   "COLLIE_READ_LINES",
   "COLLIE_TRANSCRIPT",
   "COLLIE_TRANSCRIPT_ROOT",
@@ -283,6 +285,21 @@ describe("loadConfig", () => {
     expect(loadConfig().notifyDelayMs).toBe(0);
   });
 
+  test("COLLIE_CACHE_WARN_SECONDS defaults to 300 and is bounded at 30 and 3600", () => {
+    // The push window for a watched pane (ADR 0042), and NOT the quarter-of-the-TTL threshold that
+    // turns the countdown chip amber. Two numbers with two jobs, so this one has its own bounds: a
+    // window shorter than one idle poll is noise, and an hour is past the longest TTL any rule claims.
+    expect(loadConfig().cacheWarnSeconds).toBe(300);
+    process.env.COLLIE_CACHE_WARN_SECONDS = "600";
+    expect(loadConfig().cacheWarnSeconds).toBe(600);
+    process.env.COLLIE_CACHE_WARN_SECONDS = "29";
+    expect(loadConfig().cacheWarnSeconds).toBe(300);
+    process.env.COLLIE_CACHE_WARN_SECONDS = "3601";
+    expect(loadConfig().cacheWarnSeconds).toBe(300);
+    process.env.COLLIE_CACHE_WARN_SECONDS = "five minutes";
+    expect(loadConfig().cacheWarnSeconds).toBe(300);
+  });
+
   test("uses the default upload cap when unset, and resolves COLLIE_MAX_UPLOAD_MB to bytes", () => {
     expect(loadConfig().maxUploadBytes).toBe(DEFAULT_MAX_UPLOAD_BYTES);
     process.env.COLLIE_MAX_UPLOAD_MB = "5";
@@ -418,6 +435,21 @@ describe("defaultSocketPath", () => {
     expect(defaultSocketPath("win32", {}, "C:\\Users\\u")).toBe(
       join("C:\\Users\\u", "AppData", "Roaming", "herdr", "herdr.sock"),
     );
+  });
+});
+
+// #226: a Herdr plugin action carries HERDR_PLUGIN_STATE_DIR and the service does not, so honouring it
+// sent `push-test` (and every other state-reading action) to a directory the bridge never uses.
+describe("resolveStateDir", () => {
+  test("ignores the state dir Herdr injects into a plugin action", () => {
+    expect(resolveStateDir({ HERDR_PLUGIN_STATE_DIR: "/h/.local/state/herdr/plugins/herdr.collie" }, "/h")).toBe(
+      join("/h", ".local", "state", "collie"),
+    );
+  });
+
+  test("COLLIE_STATE_DIR still moves it, with or without Herdr's variable beside it", () => {
+    expect(resolveStateDir({ COLLIE_STATE_DIR: "/s" }, "/h")).toBe("/s");
+    expect(resolveStateDir({ COLLIE_STATE_DIR: "/s", HERDR_PLUGIN_STATE_DIR: "/p" }, "/h")).toBe("/s");
   });
 });
 

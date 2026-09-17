@@ -1,4 +1,5 @@
 import { groupPanesByTab } from "@/lib/spaces";
+import { tabTitle } from "@/lib/pane-name";
 import type { AgentView, TabView, WorkspaceView } from "@/lib/types";
 import { AgentCard } from "./agent-card";
 import { t, tn } from "@/lib/i18n";
@@ -40,8 +41,28 @@ export function SpaceView({ workspace, tabs, agents, shellPanes, selectedTab, on
       {groups.map((g) => (
         <section key={g.tabId} className="flex flex-col gap-2">
           {selectedTab === null && (
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              {g.label}
+            <h3 className="flex items-center text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              {/* A positional label is not a name (lib/pane-name.ts § tabTitle): a tab the
+                  multiplexer only numbered heads its group with `tab 2`, the same words and the
+                  same lighter ink every other surface gives it, instead of with the multiplexer's
+                  raw number. Only an empty label falls to the dot the tab strip gives it. The label
+                  stays the heading's spoken text either way. */}
+              {(() => {
+                const title = tabTitle(g.label);
+                if (title === null) {
+                  return (
+                    <>
+                      <span aria-hidden="true" className="size-1 rounded-full bg-current opacity-50" />
+                      <span className="sr-only">{g.label}</span>
+                    </>
+                  );
+                }
+                return title.positional ? (
+                  <span className="text-muted-foreground/70">{title.text}</span>
+                ) : (
+                  g.label
+                );
+              })()}
             </h3>
           )}
           {g.panes.length === 0 ? (

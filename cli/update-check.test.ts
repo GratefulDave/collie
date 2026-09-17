@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
+import { CREW_PROTOCOL_VERSION } from "../bridge/crew/enrollment.ts";
 import { leadStore, member, peerStore } from "../bridge/crew/fixtures.ts";
 import type { OpsRecord } from "../bridge/crew/ops-store.ts";
 import type { TrustStoreData } from "../bridge/crew/trust-store.ts";
@@ -32,6 +34,7 @@ import {
   parseReport,
   preflight,
   PREFLIGHT_SCHEMA,
+  PROTOCOL_FLOOR_VERSION,
   type PreflightCheck,
   type PreflightReport,
   skewCheck,
@@ -330,13 +333,21 @@ describe("preflight — the bun check", () => {
     expect(bunCheck(h.deps).reason).toContain(bun);
   });
 
-  test("`bun is not installed` keeps today's red, sentence for sentence", () => {
+  test("a missing Bun is red before a managed checkout could advance", () => {
     const check = bunCheck(harness({ absent: ["bun"] }).deps);
     expect(check.verdict).toBe("red");
     expect(check.reason).toBe(
-      "bun is not installed, and this install rebuilds from source — the update would stop after the fetch",
+      "bun is not installed, and this install rebuilds from source — the update will not advance the checkout",
     );
     expect(check.remedy).toBe("install Bun from https://bun.sh, then re-run this check");
+  });
+
+  test("a resolved Bun that cannot answer is red, not an advisory version warning", () => {
+    const check = bunCheck(harness({ answers: [["/fake/bun --version", { code: 124 }]] }).deps);
+    expect(check.verdict).toBe("red");
+    expect(check.reason).toContain("/fake/bun");
+    expect(check.reason).toContain("not runnable");
+    expect(check.remedy).toContain("repair or reinstall Bun");
   });
 
   test("a binary install is never asked about bun", async () => {
@@ -686,6 +697,50 @@ describe("preflight crew — the members of a lead", () => {
     expect(skewCheck("", "1.0.0").verdict).toBe("amber");
   });
 
+  // ADR 0045. The one exception to §7.1, and it is not a build-version opinion: a member below the
+  // floor cannot speak the only protocol a 1.9.0 lead has left, so the roll cannot finish.
+  test("a member below the protocol floor is red under a 1.9.0 lead, and names the remedy", () => {
+    expect(PROTOCOL_FLOOR_VERSION).toBe("1.8.0");
+    const old = skewCheck("1.7.0", "1.9.0");
+    expect(old.verdict).toBe("red");
+    expect(old.reason).toContain("1.7.0");
+    expect(old.reason).toContain("1.9.0");
+    expect(old.reason).toContain(PROTOCOL_FLOOR_VERSION);
+    expect(old.reason).toContain(String(CREW_PROTOCOL_VERSION));
+    expect(old.remedy).toContain("collie update");
+    expect(old.remedy).toContain("own machine");
+    // Still red on a lead newer than 1.9.0, and on a member older than 1.7.0.
+    expect(skewCheck("1.7.0", "2.0.0").verdict).toBe("red");
+    expect(skewCheck("1.0.0", "1.9.0").verdict).toBe("red");
+  });
+
+  test("the floor is not enforced by a lead below 1.9.0, and a member at the floor is fine", () => {
+    expect(skewCheck("1.7.0", "1.8.2").verdict).toBe("amber");
+    expect(skewCheck("1.8.0", "1.9.0").verdict).toBe("amber");
+    expect(skewCheck("1.8.2", "1.9.0").verdict).toBe("amber");
+    expect(skewCheck("1.9.0", "1.9.0").verdict).toBe("green");
+  });
+
+  // A version this lead cannot read is not a known-old one. Reddening on a suffix would block an
+  // update on a string, and a prerelease of the floor is a build the operator chose.
+  test("an unreadable or prerelease version stays amber, never red", () => {
+    for (const theirs of ["", "unknown", "1.8.2-rc1", "1.9.0-dev", "1.7.0-beta.3", "v1.7.0", "1.7"]) {
+      expect(skewCheck(theirs, "1.9.0").verdict).toBe("amber");
+    }
+    // And the same on the lead's own side: a lead whose version does not parse reds nobody.
+    expect(skewCheck("1.7.0", "1.9.0-dev").verdict).toBe("amber");
+  });
+
+  // The floor and the protocol number are ONE fact: the floor is the release in which the current
+  // `CREW_PROTOCOL_VERSION` first shipped. Moving the number without moving the floor is red here.
+  test("the protocol floor is 1.8.0, the release in which the current protocol version shipped", () => {
+    const enrollment = readFileSync(new URL("../bridge/crew/enrollment.ts", import.meta.url), "utf8");
+    expect(enrollment).toContain(`export const CREW_PROTOCOL_VERSION = ${CREW_PROTOCOL_VERSION};`);
+    expect(enrollment).toContain(`**${CREW_PROTOCOL_VERSION} since ${PROTOCOL_FLOOR_VERSION}.**`);
+    const changelog = readFileSync(new URL("../CHANGELOG.md", import.meta.url), "utf8");
+    expect(changelog).toContain(`## [${PROTOCOL_FLOOR_VERSION}] - `);
+  });
+
   test("a peer runs no crew checks — it leads nobody", async () => {
     const report = await preflight(harness({ store: peerStore() }).deps);
     expect(report.crew).toBeUndefined();
@@ -753,21 +808,15 @@ describe("the JSON contract", () => {
     expect(parseReport('{"schema":1,"checks":[]}')).toBeNull();
   });
 
-  // REMOVE_IN_1_9_0: this document is printed by a MEMBER, over ssh, and during the roll that member
-  // may still be on 1.7.0 — which spells the crew rows `pack`. Read under both names, written under
-  // `crew` alone.
-  test("a member still on 1.7.0 spells the rows `pack`, and they are read as `crew`", () => {
+  // The member's rows are read under `crew` and nothing else since 1.9.0. A document naming 1.7.0's
+  // `pack` reads as a document with no crew rows, which is the closed reading.
+  test("the crew rows are read under `crew` alone", () => {
     const rows = [{ memberId: "nas", host: "nas.local", verdict: "red", checks: [] }];
-    const old = parseReport(JSON.stringify({ schema: 1, verdict: "red", checks: [], pack: rows }))!;
-    expect(old.crew).toHaveLength(1);
-    expect(old.crew![0]!.memberId).toBe("nas");
-    // The new spelling reads the same, and a document carrying both takes `crew`.
     const fresh = parseReport(JSON.stringify({ schema: 1, verdict: "red", checks: [], crew: rows }))!;
     expect(fresh.crew).toHaveLength(1);
-    const both = parseReport(
-      JSON.stringify({ schema: 1, verdict: "red", checks: [], crew: rows, pack: [] }),
-    )!;
-    expect(both.crew).toHaveLength(1);
+    expect(fresh.crew![0]!.memberId).toBe("nas");
+    const old = parseReport(JSON.stringify({ schema: 1, verdict: "red", checks: [], pack: rows }))!;
+    expect(old.crew).toBeUndefined();
   });
 
   test("exit code — 0 with no red, 1 with one", async () => {

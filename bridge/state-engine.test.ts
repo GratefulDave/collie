@@ -1,4 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ActivityLedger } from "./activity.ts";
+import { trackActivity } from "./activity-tracking.ts";
 
 import {
   ATTENTION_WINDOW_MS,
@@ -9,7 +14,7 @@ import {
 import { HerdrMux } from "./mux/herdr/adapter.ts";
 import type { HerdrClient, PaneRead } from "./mux/herdr/client.ts";
 import { muxOk } from "./mux/types.ts";
-import type { MuxAdapter, MuxPane } from "./mux/types.ts";
+import type { MuxAdapter, MuxPane, MuxTab } from "./mux/types.ts";
 import { toPaneWire } from "./types.ts";
 import type { AgentStatus } from "./types.ts";
 
@@ -183,6 +188,100 @@ describe("StateEngine — transition detection", () => {
   });
 });
 
+describe("StateEngine — activity ledger binding", () => {
+  test("seeds idle agents, tracks completions, and resets unread activity on agent exit", async () => {
+    const { herdr, engine, poll } = makeEngine();
+    const dir = mkdtempSync(join(tmpdir(), "collie-activity-lifecycle-"));
+    let now = 100;
+    const activity = new ActivityLedger({ stateDir: dir }, () => now);
+    trackActivity(engine, activity, "default");
+    try {
+      herdr.panes = [pane("w1:p1", "w1", "idle", "pi")];
+      await poll();
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 100, seenAt: 100 });
+      now = 200;
+      herdr.panes = [pane("w1:p1", "w1", "working", "pi")];
+      await poll();
+      now = 300;
+      herdr.panes = [pane("w1:p1", "w1", "idle", "pi")];
+      await poll();
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 300, seenAt: 100 });
+      now = 400;
+      activity.noteSeen("default", "w1:p1");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 300, seenAt: 400 });
+
+      now = 500;
+      herdr.panes = [pane("w1:p1", "w1", "working", "pi")];
+      await poll();
+      now = 600;
+      herdr.panes = [pane("w1:p1", "w1", "unknown", null)];
+      await poll();
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 600, seenAt: 600 });
+      now = 700;
+      herdr.panes = [pane("w1:p1", "w1", "idle", "pi")];
+      await poll();
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 600, seenAt: 600 });
+
+      herdr.panes = [];
+      await poll();
+      expect(activity.get("default", "w1:p1")).toBeUndefined();
+    } finally {
+      activity.stop();
+      engine.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // A settled pane is only "new work" when a turn ended. Herdr's own TUI moves a pane from `done`
+  // to `idle` when the operator acknowledges it there, and flicker gives `unknown → idle`; neither
+  // may re-mark a pane Collie already showed as seen.
+  test("only a turn that ends bumps activity for a settled pane", async () => {
+    const { herdr, engine, poll } = makeEngine();
+    const dir = mkdtempSync(join(tmpdir(), "collie-activity-settled-"));
+    let now = 100;
+    const activity = new ActivityLedger({ stateDir: dir }, () => now);
+    trackActivity(engine, activity, "default");
+    const step = async (at: number, status: AgentStatus) => {
+      now = at;
+      herdr.panes = [pane("w1:p1", "w1", status, "pi")];
+      await poll();
+    };
+    try {
+      // (a) working → done bumps; the operator reads it; done → idle must not bump it back.
+      await step(100, "working");
+      await step(200, "done");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 200, seenAt: 100 });
+      now = 300;
+      activity.noteSeen("default", "w1:p1");
+      await step(400, "idle");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 200, seenAt: 300 });
+
+      // idle → idle is not a transition at all, so nothing moves.
+      await step(450, "idle");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 200, seenAt: 300 });
+
+      // (b) idle → unknown bumps (a Working-side change), unknown → idle does not.
+      await step(500, "unknown");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 500, seenAt: 300 });
+      await step(600, "idle");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 500, seenAt: 300 });
+
+      // (c) working → idle is a turn ending, so it still bumps.
+      await step(700, "working");
+      await step(800, "idle");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 800, seenAt: 300 });
+
+      // (d) idle → blocked still bumps: the row's "since" counts from this clock.
+      await step(900, "blocked");
+      expect(activity.get("default", "w1:p1")).toEqual({ activeAt: 900, seenAt: 300 });
+    } finally {
+      activity.stop();
+      engine.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("StateEngine — removal events", () => {
   test("fires onRemove when a previously-seen agent pane vanishes", async () => {
     const { herdr, removed, poll } = makeEngine();
@@ -313,6 +412,100 @@ describe("StateEngine — snapshot shaping", () => {
     herdr.sessionSnapshot = () => Promise.reject(new Error("socket down"));
     await poll();
     expect(engine.current().bridge).toBe("disconnected");
+  });
+});
+
+// ── ONE STABLE ORDER, AND IT IS THE MULTIPLEXER'S ────────────────────────────
+// Space, then tab, then the pane's own position in that tab — each read off the arrangement the mux
+// reported. Nothing sorts by pane id any more: an id is opaque (identity rule 1), so alphabetical
+// order over ids put `%10` before `%2` and `pN` before `pC`, and two panes side by side on the desk
+// reached the phone in an order the desk never showed.
+describe("StateEngine — the order panes arrive in", () => {
+  function muxPane(fields: Partial<MuxPane> & { paneId: string }): MuxPane {
+    return {
+      spaceId: "w1",
+      spaceLabel: "collie",
+      spaceNumber: 1,
+      tabId: "w1:t1",
+      cwd: "/home/dev/collie",
+      focused: false,
+      alive: true,
+      agent: "claude",
+      status: "idle",
+      ...fields,
+    };
+  }
+  const muxTab = (tabId: string): MuxTab => ({
+    tabId,
+    spaceId: "w1",
+    number: 1,
+    label: "1",
+    focused: false,
+    paneCount: 2,
+  });
+
+  function engineOf(panes: readonly MuxPane[], tabs: readonly MuxTab[]): StateEngine {
+    // SAFETY: a poll over this herd reaches `snapshot()` and the session-name scrape's guard, and
+    // nothing else — every pane here is idle, so no read is issued. The members left off are
+    // unobservable in this test.
+    const stub: Partial<MuxAdapter> = {
+      reachable: () => Promise.resolve(true),
+      snapshot: () => Promise.resolve({ panes, spaces: [], tabs }),
+    };
+    // SAFETY: see above — every member this poll can reach is present on `stub`.
+    return new StateEngine(stub as MuxAdapter, 1500);
+  }
+
+  test("keeps each tab's panes in the mux's own order, not in pane-id order", async () => {
+    // `pN` sorts before `pC` alphabetically and after it positionally. The mux's array is the truth.
+    const engine = engineOf(
+      [muxPane({ paneId: "pC" }), muxPane({ paneId: "pN" }), muxPane({ paneId: "pA" })],
+      [muxTab("w1:t1")],
+    );
+    await engine["poll"]();
+    expect(engine.current().agents.map((a) => a.paneId)).toEqual(["pC", "pN", "pA"]);
+  });
+
+  test("orders tabs by their place in the mux's tab array, whatever their ids read like", async () => {
+    const engine = engineOf(
+      [
+        muxPane({ paneId: "p1", tabId: "w1:t9" }),
+        muxPane({ paneId: "p2", tabId: "w1:t2" }),
+      ],
+      [muxTab("w1:t9"), muxTab("w1:t2")],
+    );
+    await engine["poll"]();
+    expect(engine.current().agents.map((a) => a.paneId)).toEqual(["p1", "p2"]);
+  });
+
+  test("urgency still comes first — a blocked pane leads, wherever it sits", async () => {
+    const engine = engineOf(
+      [muxPane({ paneId: "p1" }), muxPane({ paneId: "p2", status: "blocked" })],
+      [muxTab("w1:t1")],
+    );
+    await engine["poll"]();
+    expect(engine.current().agents.map((a) => a.paneId)).toEqual(["p2", "p1"]);
+  });
+
+  test("a pane whose tab the listing does not hold sorts LAST, never ahead of a placed one", async () => {
+    const engine = engineOf(
+      [muxPane({ paneId: "fresh", tabId: "w1:t-new" }), muxPane({ paneId: "placed" })],
+      [muxTab("w1:t1")],
+    );
+    await engine["poll"]();
+    expect(engine.current().agents.map((a) => a.paneId)).toEqual(["placed", "fresh"]);
+  });
+
+  test("bare shells take the same order", async () => {
+    const engine = engineOf(
+      [
+        muxPane({ paneId: "pC", agent: "shell", status: "unknown" }),
+        muxPane({ paneId: "pA", agent: "shell", status: "unknown" }),
+      ],
+      [muxTab("w1:t1")],
+    );
+    await engine["poll"]();
+    expect(engine.current().shellPanes.map((a) => a.paneId)).toEqual(["pC", "pA"]);
   });
 });
 
@@ -1011,5 +1204,33 @@ describe("StateEngine — an expired agent's pane", () => {
     expect(Object.hasOwn(wire, "agentSession")).toBe(false);
     expect(Object.hasOwn(wire, "sessionAgent")).toBe(false);
     expect(wire.hasSession).toBeUndefined();
+  });
+});
+
+// A one-pane tab the operator NAMED gives the pane its name (pane-name.ts § soleTabName); the bridge
+// decides, because only the adapter knows a chosen label (`MuxPane.tabNamed`) from a positional one.
+describe("soleTabName and tabPosition", () => {
+  test("a named tab holding one pane names it; a positional or shared tab does not", async () => {
+    const { herdr, engine, poll } = makeEngine();
+    herdr.panes = [
+      { ...pane("p1", "w1", "idle", "claude"), tab_id: "w1:t1" },
+      { ...pane("p2", "w1", "idle", "claude"), tab_id: "w1:t2" },
+      { ...pane("p3", "w1", "idle", "claude"), tab_id: "w1:t2" },
+      { ...pane("p4", "w1", "idle", "claude"), tab_id: "w1:t3" },
+    ];
+    herdr.tabs = [
+      { tab_id: "w1:t1", workspace_id: "w1", number: 1, label: "Ui fixes", focused: false, pane_count: 1, agent_status: "idle" },
+      { tab_id: "w1:t2", workspace_id: "w1", number: 2, label: "work", focused: false, pane_count: 2, agent_status: "idle" },
+      { tab_id: "w1:t3", workspace_id: "w1", number: 3, label: "3", focused: false, pane_count: 1, agent_status: "idle" },
+    ];
+    await poll();
+    const byId = new Map(engine.current().agents.map((a) => [a.paneId, a]));
+    expect(byId.get("p1")?.soleTabName).toBe("Ui fixes");
+    expect(byId.get("p2")?.soleTabName).toBeUndefined();
+    expect(byId.get("p4")?.soleTabName).toBeUndefined();
+    // Position inside the tab follows the listing, not the id.
+    expect(byId.get("p2")?.tabPosition).toBe(0);
+    expect(byId.get("p3")?.tabPosition).toBe(1);
+    expect(byId.get("p1")?.tabPosition).toBe(0);
   });
 });

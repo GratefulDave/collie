@@ -23,7 +23,7 @@ export interface AgentView {
   /**
    * Claude's OWN session name (set in-agent via `/rename`), derived bridge-side from the pane text.
    * Claude-only; absent for unnamed sessions and non-claude panes. Shown below an explicit `paneLabel`
-   * — see {@link paneDisplayName}. Render as text only (never markup) — same XSS boundary as paneLabel.
+   * — see `paneName` in lib/pane-name.ts. Render as text only (never markup) — same XSS boundary as paneLabel.
    */
   sessionName?: string;
   /**
@@ -47,11 +47,26 @@ export interface AgentView {
   readableLines?: number;
   /**
    * The pane's tab label, denormalised bridge-side alongside `workspaceLabel`. Absent when it says
-   * nothing: Herdr names an unlabelled tab positionally ("1"), which in a single-tab space would
-   * render as `project · 1` (see `meaningfulTabLabel` in bridge/activity.ts). Render as text only,
-   * never markup — same XSS boundary as `paneLabel`.
+   * nothing: Herdr names an unlabelled tab positionally ("1"), which would render as `project › 1`
+   * (see `meaningfulTabLabel` in bridge/activity.ts, and `isUnnamedTab` in lib/pane-name.ts, which
+   * is the same rule applied to the RAW label). Render as text only, never markup — same XSS
+   * boundary as `paneLabel`.
    */
   tabLabel?: string;
+  /**
+   * The tab's name, when the operator named that tab and this pane is alone in it. The bridge decides
+   * (bridge/state-engine.ts) because only the multiplexer adapter knows whether a label was chosen
+   * (`MuxPane.tabNamed`: tmux's automatic window name is not). The name rule reads it: a one-pane tab
+   * is how most operators name a pane, and that name outranks the title Claude rewrites every turn.
+   * Absent from an older peer, which keeps the title.
+   */
+  soleTabName?: string;
+  /**
+   * The pane's 0-based position inside its tab, in the multiplexer's own order. The dashboard's fixed
+   * order reads it, since a pane id's alphabetical order is not the order on screen. Absent from an
+   * older peer.
+   */
+  tabPosition?: number;
   /**
    * What the pane's process says it is doing — its OSC title, glyph-stripped and dropped when
    * uninformative bridge-side (see `meaningfulTerminalTitle` in bridge/activity.ts). Unlike
@@ -65,7 +80,8 @@ export interface AgentView {
    * finished agent's sentence for hours. Derived bridge-side; absent on an older bridge, which reads
    * as "not known to be stale" and renders exactly as it always did.
    *
-   * It demotes, it never hides: a stale title is not the pane's NAME (see {@link paneDisplayName}),
+   * It demotes, it never hides: a stale title is not the pane's NAME (see `paneName` in
+   * lib/pane-name.ts),
    * but it still shows on the muted line, because it is the only trace of what ran here.
    */
   terminalTitleStale?: boolean;
@@ -87,7 +103,7 @@ export interface AgentView {
   /**
    * Epoch ms you last opened or drove this pane through Collie. Absent as above.
    *
-   * There is no "seen" flag anywhere: a `done` agent is unseen precisely when
+   * There is no "seen" flag anywhere: a settled (`idle` or `done`) agent is unseen precisely when
    * `lastActiveAt > lastSeenAt`, so opening the pane clears it by construction.
    */
   lastSeenAt?: number;
@@ -117,25 +133,66 @@ export interface AgentView {
    * rather than with the ambient one.
    */
   session?: string;
+  /**
+   * How long this pane's prompt cache stays warm. Mirrors `PaneWire.cache` in bridge/types.ts.
+   *
+   * **Absent, never a placeholder.** The number is computed on the machine the pane lives on, with that
+   * machine's own rules, so a peer's chip is true where it is rendered. A pane whose harness has no
+   * journal adapter, that named no session, or whose agent has not taken a turn yet carries no key at
+   * all, and a 1.8.x peer simply omits it — every one of those renders as nothing.
+   */
+  cache?: PaneCache;
 }
 
 /**
- * The name to show for a pane, in priority order: an explicit user label (herdr `pane.rename`) wins,
- * then Claude's own `/rename` session name, then the pane's terminal title, then the agent name (or
- * "shell"). The two hand-set names outrank the title because a name you chose should not be
- * overwritten by one the process is rewriting every turn; the title outranks the agent name because
- * "claude" tells you nothing when four rows say it. All three are rendered only as React text nodes
- * by callers — never markup — so they stay within the pane-output XSS boundary.
+ * One rule as the pane sheet reads it. Mirrors `CacheRuleWire` in bridge/types.ts.
  *
- * A STALE title names nothing: the program that wrote it has exited, so it is a fact about the past,
- * and a past task standing in as a live pane's name is the bug this rule exists to stop. Such a pane
- * falls back to what it would be called with no title at all.
+ * `label`, `sourceTitle` and the publisher are another vendor's words about their own product, so they
+ * are NOT translated — the same carve-out ADR 0030 makes for slash-command descriptions.
  */
-export function paneDisplayName(pane: AgentView): string {
-  if (pane.paneLabel) return pane.paneLabel;
-  if (pane.sessionName) return pane.sessionName;
-  if (pane.terminalTitle && !pane.terminalTitleStale) return pane.terminalTitle;
-  return pane.kind === "shell" ? "shell" : pane.agent;
+export interface CacheRuleWire {
+  id: string;
+  label: string;
+  ttlSeconds: number;
+  confidence: CacheConfidence;
+  sourceTitle: string;
+  sourceUrl: string;
+  retrievedAt: string;
+  slidingWindow: boolean;
+  automatic: boolean;
+  note?: string;
+  overridden?: { ttlSeconds: number; sourceUrl: string; retrieved: string; note?: string };
+}
+
+/** GET /api/cache-rules — this host's own catalog. Mirrors `CacheRulesResponse` in bridge/types.ts. */
+export interface CacheRulesResponse {
+  rules: CacheRuleWire[];
+}
+
+/** What the cache chip can say. Mirrors `CacheStateName` in bridge/cache/engine.ts. */
+export type CacheStateName = "warm" | "expiring" | "cold" | "unknown";
+
+/** How sure the number is. Mirrors `Confidence` in bridge/cache/claims.ts. */
+export type CacheConfidence = "documented" | "reported" | "inferred" | "observed";
+
+/**
+ * One pane's prompt-cache reading. Mirrors `PaneCache` in bridge/cache/engine.ts.
+ *
+ * Seven small fields, because the source title and the retrieved date do not ride every pane: the
+ * sheet fetches the rule catalog once from `GET /api/cache-rules`.
+ */
+export interface PaneCache {
+  state: CacheStateName;
+  /** Epoch ms the cache dies. The chip counts down to this against one page clock. */
+  expiresAt?: number;
+  ttlSeconds: number;
+  ruleId: string;
+  confidence: CacheConfidence;
+  lastRequestAt?: number;
+  /** When the evidence was read. Shown in the sheet as "last read 4m"; never used to decide a state. */
+  measuredAt?: number;
+  /** Present, and always `true`, when the number came from the operator's `cache-rules.toml`. */
+  overridden?: true;
 }
 
 /** A Herdr workspace ("space") — a project-scoped container of tabs. */
@@ -401,6 +458,18 @@ export interface UpdateLinkChange {
   to: number;
 }
 
+/**
+ * A release in the delta that asked to reach operators today (mirrors `UpdateUrgent` in
+ * `bridge/types.ts`, ADR 0046).
+ *
+ * `reason` is that release's own sentence, in the release's English. It is a quotation and is never
+ * translated; only the label beside it is.
+ */
+export interface UpdateUrgent {
+  version: string;
+  reason: string;
+}
+
 export interface UpdateInfo {
   /** The version this bridge is running, e.g. "0.11.0". */
   current: string;
@@ -448,6 +517,11 @@ export interface UpdateInfo {
    * that failed). The three read the same way on screen: no sentence.
    */
   linkChange?: UpdateLinkChange | null;
+  /**
+   * The newest release in the delta that called itself urgent, and why — absent when none did
+   * (ADR 0046). Absent on an older bridge too, which reads the same way: no label, no sentence.
+   */
+  urgent?: UpdateUrgent;
   /** The running bridge PROCESS is behind the on-disk code — a `systemctl restart` picks it up. */
   bridgeStale: boolean;
   /**
@@ -461,7 +535,8 @@ export interface UpdateInfo {
   /** When the upstream check last ran (epoch ms), or null if it hasn't. */
   checkedAt: number | null;
   /** Every release newer than `current`, oldest first — what one update folds in. Absent on an
-   *  older bridge, which the card reads as "nothing to list". */
+   *  older bridge, which the card reads as "nothing to list". The phone never fetches release notes:
+   *  the host reads each release's small sidecar, and this is the whole of what it sends on. */
   newerVersions?: string[];
   /** The detached updater's run record. Absent when this install has never run one. */
   run?: UpdateRun;
@@ -687,6 +762,12 @@ export interface PaneReadResponse {
   truncated: boolean;
   /** Herdr's monotonic pane revision — the prompt-select race guard checks a tapped menu against it. */
   revision: number;
+  /**
+   * The same rows with soft wraps undone, sent only when {@link text} shows a URL the pane's column
+   * edge cut in two. `lib/links.ts` uses it to give every fragment of that URL the href of the whole
+   * URL; absent for every other pane.
+   */
+  logicalText?: string;
   /** Set to true by the client when the server returns 304 Not Modified. Never sent over the wire. */
   notModified?: boolean;
 }
@@ -796,6 +877,15 @@ export interface OperatorCommand {
   argHint: string;
   /** The operator marking their own row dangerous. Optional so an older bridge stays readable. */
   confirm?: boolean;
+  /**
+   * The operator putting this row on the harness bar above the key rail. Resolved by `barFor()` in
+   * lib/harness-bar.ts, which replaces-or-falls-back over the `bar = true` rows ALONE — so a bar row
+   * never blanks the Agent palette for that pane (ADR 0043). Optional, like `confirm`, so an older
+   * bridge stays readable.
+   */
+  bar?: boolean;
+  /** The bar button's text, already shortened to 12 characters. Absent = the command without its slash. */
+  barLabel?: string;
 }
 
 /**
@@ -1049,6 +1139,40 @@ export interface NotifyPrefs {
   done: boolean;
   /** Push when a new Collie version is available (a restart or upgrade is waiting). Default on. */
   updates: boolean;
+  /** Push before an agent pane's prompt cache expires. Default off, and it covers EVERY pane — the
+   *  panes watched one by one from their own settings sheet keep warning either way (ADR 0042). */
+  cache: boolean;
+}
+
+/**
+ * GET/POST /api/notifications/cache-watch — one pane's place in the cache watch list.
+ *
+ * `global` is `prefs.cache`, so the sheet can say Settings already covers this pane rather than show a
+ * switch that looks off while warnings are going out. `watchable` is false when the pane names no
+ * harness session, carries no cache reading at all, or reads `unknown` — the switch is then disabled
+ * and the reason is named. `warnSeconds` comes from the bridge so the copy quotes its number.
+ */
+export interface CacheWatchState {
+  on: boolean;
+  global: boolean;
+  watchable: boolean;
+  warnSeconds: number;
+}
+
+/** One row of the watched-pane list under the Settings switch. `id` is an opaque handle, never a ref. */
+export interface CacheWatchListEntry {
+  id: string;
+  label: string;
+  /** The crew member this pane lives on. Absent for a local pane, never null. */
+  host?: string;
+  session?: string;
+  /** Absent when the entry's pane is not in the current snapshot. Such a row lists, and still removes. */
+  paneId?: string;
+}
+
+/** GET /api/notifications/cache-watch/list — the whole bridge's list, not one pane's. */
+export interface CacheWatchListResponse {
+  entries: CacheWatchListEntry[];
 }
 
 /** Lower sorts first — "needs you" at the top. Mirrors STATUS_RANK on the server. */

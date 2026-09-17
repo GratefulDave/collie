@@ -15,9 +15,11 @@ import { ThemeControl } from "@/components/theme-control";
 import { HapticsControl } from "@/components/haptics-control";
 import { HandsFreeControl } from "@/components/hands-free-control";
 import { ZenControl } from "@/components/zen-control";
+import { TourControl } from "@/components/tour-control";
 import { InstallControl } from "@/components/install-control";
 import { LanguageControl } from "@/components/language-control";
 import { FontSettingsControl } from "@/components/font-settings";
+import { HarnessBarControl } from "@/components/harness-bar-control";
 import { TypefaceControl } from "@/components/typeface-control";
 import { UpdatesSettingsCard } from "@/components/updates-settings-card";
 import { Switch } from "@/components/ui/switch";
@@ -28,7 +30,7 @@ import { t } from "@/lib/i18n";
 import { type DevicesData } from "@/lib/loaders";
 import { homePath } from "@/lib/nav";
 import { useScope } from "@/lib/session";
-import type { PushAvailability } from "@/lib/push";
+import { availabilityNote, reasonText } from "@/lib/push-copy";
 import { describeThrownError } from "@/lib/api-error-message";
 import { useOptionalRootData } from "@/lib/route-data";
 
@@ -144,6 +146,11 @@ export function SettingsRoute() {
         <TypefaceControl />
         <FontSettingsControl />
 
+        {/* A standing per-device choice, with appearance and under the fonts — ON by default,
+            because this row is new and is the point of the feature rather than a re-draw of
+            something that already existed (lib/harness-bar-pref.ts says why). */}
+        <HarnessBarControl />
+
         {/* Device behaviour sits with appearance — both are "how this phone treats you", as opposed
             to the herd/notification settings below. Renders nothing where vibrate is unsupported. */}
         <HapticsControl />
@@ -159,6 +166,11 @@ export function SettingsRoute() {
             not a rendering pref (those live in the pane's own Display dock). Off by default, because
             zen takes away every way back except one floating button. */}
         <ZenControl />
+
+        {/* Last of the "how this phone treats you" block, and the ONLY way back to a tour that was
+            interrupted — the tour is marked seen the moment it opens. An action, so the row ends in
+            a button rather than a Switch. */}
+        <TourControl />
 
         <Card className="gap-0 py-0">
           <div className="flex items-center justify-between gap-4 p-4">
@@ -237,38 +249,4 @@ export function SettingsRoute() {
       </main>
     </div>
   );
-}
-
-function reasonText(reason: PushAvailability | undefined): string {
-  switch (reason) {
-    case "insecure":
-      return t("settings.push.reason.insecure");
-    case "server-off":
-      return t("settings.push.reason.serverOff");
-    case "unavailable":
-      return t("settings.push.availability.unavailable");
-    case "denied":
-      return t("settings.push.reason.denied");
-    case "unsupported":
-      return t("settings.push.reason.unsupported");
-    default:
-      return t("settings.push.reason.default");
-  }
-}
-
-function availabilityNote(a: PushAvailability): string {
-  switch (a) {
-    case "insecure":
-      return t("settings.push.availability.insecure");
-    case "server-off":
-      return t("settings.push.availability.serverOff");
-    case "unavailable":
-      return t("settings.push.availability.unavailable");
-    case "denied":
-      return t("settings.push.availability.denied");
-    case "unsupported":
-      return t("settings.push.availability.unsupported");
-    case "ready":
-      return "";
-  }
 }

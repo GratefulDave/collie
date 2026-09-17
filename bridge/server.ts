@@ -8,6 +8,11 @@ import { isLoopbackBindHost, type Config } from "./config.ts";
 import { apiError, type ApiErrorBody, type ApiErrorDetail, type ErrorCode } from "./error-codes.ts";
 import { MUX_CAPABILITIES, type MuxCapability, type MuxCapabilityDeclaration } from "./mux/capabilities.ts";
 import type { MuxAdapter, MuxAck, MuxGrid } from "./mux/types.ts";
+import { allCacheRules } from "./cache/rules/index.ts";
+import type { CacheOverride } from "./cache/engine.ts";
+import { localWatchPane, peerWatchPane, type CacheWarnPane } from "./cache/watch-key.ts";
+import { watchKeyOf, type CacheWatchSurface } from "./cache/watch.ts";
+import { createCacheRulesReader } from "./operator-cache-rules.ts";
 import { computeEtag, gzipJsonResponse, notModified, wantsGzip } from "./http-cache.ts";
 import { pluginRoot } from "./root.ts";
 import type { NotifyPrefs, NotifyPrefsStore } from "./notify-prefs.ts";
@@ -74,6 +79,11 @@ import type {
   CrewStatusResponse,
   Launcher,
   LaunchersResponse,
+  CacheRulesResponse,
+  CacheRuleWire,
+  CacheWatchListResponse,
+  CacheWatchResponse,
+  PaneCache,
   PaneHistoryResponse,
   PaneReadResponse,
   PaneWire,
@@ -702,8 +712,32 @@ export function startServer(opts: {
    * answers 503, and one that was never given it does the same.
    */
   stt?: () => Promise<SttProvider | null>;
+  /**
+   * The journal registry, built once by the caller. Absent means this function builds its own, which
+   * is what every test does; `bridge/index.ts` passes one so the cache tracker and the history route
+   * share the adapters' memoised path caches.
+   */
+  journals?: Record<string, JournalAdapter>;
+  /**
+   * The prompt-cache ledger, read synchronously at serialise time exactly as `activity` is. Absent
+   * means no pane carries a `cache` key — which is every test, and every install with
+   * `COLLIE_TRANSCRIPT` off.
+   */
+  cache?: { get(sessionKey: string): PaneCache | undefined };
+  /**
+   * The prompt-cache watch list — which panes the operator asked to be warned about (ADR 0042).
+   *
+   * Absent means the three `cache-watch` routes answer 404, which is every caller that builds this
+   * server by hand in a test. `bridge/index.ts` always passes one: the store writes no file until an
+   * operator toggles something, so a bridge nobody asks still writes exactly today's four entries.
+   */
+  cacheWatch?: CacheWatchSurface;
 }) {
   const { cfg, registry, push, snooze, notifyPrefs, updateMonitor, audit, activity, crew } = opts;
+  // The prompt-cache ledger, built in bridge/index.ts beside the journal registry it probes through,
+  // because the state engine's poll is what drives it and that poll is wired there. Undefined when
+  // `COLLIE_TRANSCRIPT` is off: no journal, no probe, and every pane reads exactly as it did in 1.8.2.
+  const cache = opts.cache;
   const pairing = opts.pairing;
   const stt = opts.stt ?? (async () => null);
   // One gate per Bun server, not per request: two slow uploads and their two provider calls share
@@ -728,7 +762,11 @@ export function startServer(opts: {
   const operatorFonts = createOperatorFonts(cfg.themeFile);
   // Its sibling too, on the same contract: one reader, one mtime cache, launchers.toml off the hot path.
   const operatorLaunchers = createOperatorLaunchers(cfg.launchersFile);
-  const journals = cfg.transcript ? buildJournalRegistry(cfg.journalRoots) : null;
+  // The sixth on that contract: the operator's own prompt-cache TTLs, cache-rules.toml off the hot path.
+  const operatorCacheRules = createCacheRulesReader(cfg.cacheRulesFile);
+  // ONE registry for the process, built by the caller so the cache tracker probes through the same
+  // adapters (and therefore the same memoised path caches) the history route reads.
+  const journals = cfg.transcript ? (opts.journals ?? buildJournalRegistry(cfg.journalRoots)) : null;
   const transcripts = cfg.transcript ? new TranscriptStore() : null;
   /** Does this agent have a journal at all — the snapshot's History-affordance gate. */
   const hasJournal = (agent: string) => adapterFor(journals ?? {}, agent) !== undefined;
@@ -777,9 +815,17 @@ export function startServer(opts: {
     // are read at serialise time, i.e. as fresh as the request. The ledger is keyed by SESSION, so
     // the runtime whose panes are being serialised is the one that has to be asked — which is why
     // this takes the runtime rather than closing over the ambient one.
+    // The prompt-cache reading rides the same way and for the same reason: the tracker's map is read
+    // HERE, at serialise time, because `localSnapshot` is synchronous and a probe touches disk (the
+    // probe runs on the state engine's poll instead — bridge/cache/tracker.ts). Keyed by the harness
+    // SESSION id rather than the pane id, because pane ids churn and a renumbered pane must inherit
+    // nothing. No entry means no key at all, which renders as nothing.
     const withActivity = (from: SessionRuntime, p: AgentView): AgentView => {
       const a = activity.get(from.name, p.paneId);
-      return a ? { ...p, lastActiveAt: a.activeAt, lastSeenAt: a.seenAt } : p;
+      const withTimes = a ? { ...p, lastActiveAt: a.activeAt, lastSeenAt: a.seenAt } : p;
+      const key = p.agentSession?.value;
+      const reading = key === undefined ? undefined : cache?.get(key);
+      return reading === undefined ? withTimes : { ...withTimes, cache: reading };
     };
     // The one place a pane leaves the bridge: the session ref is stripped to a presence flag here,
     // so an agent-reported filesystem path never reaches a browser (see toPaneWire). The flag is
@@ -830,6 +876,44 @@ export function startServer(opts: {
     // Only report device state when the feature is on, so an off deployment sends nothing new.
     if (device !== null) body.device = device;
     return body;
+  };
+
+  /**
+   * Every watchable pane in sight, by watch key, with the pane id it currently answers to.
+   *
+   * Built per request and thrown away: it is read by the list route only, which a phone opens when it
+   * is looking at Settings. A watched pane that is in NO snapshot is simply absent from the map, which
+   * is what makes its row list without a link rather than disappear (ADR 0042).
+   */
+  const watchedPaneIds = (): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const rt of registry.all()) {
+      for (const view of rt.engine.current().agents) {
+        const pane = localWatchPane(view, rt.isPrimary ? undefined : rt.name);
+        if (pane !== undefined) out.set(pane.key, pane.paneId);
+      }
+    }
+    for (const contribution of crewLead?.contributions() ?? []) {
+      for (const wire of contribution.body?.agents ?? []) {
+        const pane = peerWatchPane(wire, contribution.state.memberId);
+        if (pane !== undefined) out.set(pane.key, pane.paneId);
+      }
+    }
+    return out;
+  };
+
+  /** One pane's place in the list, as the sheet reads it. */
+  const cacheWatchBody = (watch: CacheWatchSurface, pane: CacheWarnPane): CacheWatchResponse => ({
+    on: watch.has(pane.key),
+    global: notifyPrefs.current().cache,
+    watchable: cacheWatchable(pane),
+    warnSeconds: cfg.cacheWarnSeconds,
+  });
+
+  /** The whole bridge's list, with a pane id on every row whose pane is in sight. */
+  const cacheWatchListBody = (watch: CacheWatchSurface): CacheWatchListResponse => {
+    const ids = watchedPaneIds();
+    return { entries: watch.list((entry) => ids.get(watchKeyOf(entry))) };
   };
 
   /**
@@ -1236,6 +1320,45 @@ export function startServer(opts: {
       const host = crewHandler ? selectHostFrom(url) : LOCAL_HOST;
 
       /**
+       * The watch identity behind `(host, session, paneId)`, or the reason there is none.
+       *
+       * THE BRIDGE IS THE ONLY PARTY THAT CAN DO THIS, which is the whole reason the routes speak an
+       * address rather than a key: a phone can only ever name `(host, session, paneId)`, and the ref a
+       * watch is keyed by is server-side only (`bridge/types.ts` § agentSession).
+       *
+       * It resolves WITHOUT FORWARDING. A peer's pane is read out of the body the lead's own sweep
+       * last parsed (`CrewLead.contributions`), exactly as `bridge/crew/notify.ts` reads it, because
+       * the preference belongs on the machine holding the subscription and a forward would store it on
+       * the machine that cannot send.
+       */
+      const watchTargetFor = (
+        paneId: string,
+        selector: HostSelector,
+        session: string | undefined,
+      ): { pane: CacheWarnPane; error?: undefined } | { pane?: undefined; error: ErrorCode } => {
+        if (selector.kind === "member") {
+          const body = crewLead?.contributions().find((c) => c.state.memberId === selector.id)?.body;
+          const wire = body?.agents.find((p) => p.paneId === paneId);
+          if (wire === undefined) return { error: "cache.pane_unknown" };
+          // A peer's pane carries no ref, so `hasSession` is what "names a session" means here — the
+          // same flag the History affordance is gated on.
+          if (wire.hasSession !== true) return { error: "cache.no_session" };
+          const pane = peerWatchPane(wire, selector.id);
+          return pane === undefined ? { error: "cache.no_session" } : { pane };
+        }
+        if (selector.kind !== "local") return { error: "cache.pane_unknown" };
+        const rt = registry.get(session);
+        if (!rt) return { error: "cache.pane_unknown" };
+        const view = rt.engine.current().agents.find((p) => p.paneId === paneId);
+        if (view === undefined) return { error: "cache.pane_unknown" };
+        // The session is omitted for the primary, the omitted-not-null rule the push payload follows —
+        // and it is read off the REGISTRY rather than off the query, so one pane has one key however
+        // the caller spelled its address.
+        const pane = localWatchPane(view, rt.isPrimary ? undefined : rt.name, (key) => cache?.get(key));
+        return pane === undefined ? { error: "cache.no_session" } : { pane };
+      };
+
+      /**
        * The `(host, session)` target of a session-scoped route, or the Response refusing it.
        *
        * An unknown host is a 404, mirroring `unknownSession()` exactly (§4) — and so is an
@@ -1345,6 +1468,18 @@ export function startServer(opts: {
       if (sessionRouted) return sessionRouted;
 
       // ── Misc API ─────────────────────────────────────────────────────────
+      // The rule catalog behind the cache chips, and the overrides this host applies. Gated exactly as
+      // `/api/config` is — read-level, and through `guard` so COLLIE_PUBLIC_HOSTS covers it — because
+      // it is the same kind of payload: Collie's own facts plus operator-authored text.
+      if (pathname === "/api/cache-rules" && req.method === "GET") {
+        const denied = guard(req, cfg, "read", pairing);
+        if (denied) return denied;
+        return cacheRulesRoute(
+          operatorCacheRules,
+          req.headers.get("accept-encoding"),
+          req.headers.get("if-none-match"),
+        );
+      }
       if (pathname === "/api/config") {
         // Read-level, like the other non-terminal endpoints. Nothing Collie puts here is a
         // credential — the VAPID public key is handed to every browser by design — but the payload
@@ -1544,6 +1679,78 @@ export function startServer(opts: {
         }
         return text("method not allowed", 405);
       }
+      // ── The per-pane half of the cache warning (ADR 0042) ────────────────
+      // Three paths in the `notifications` family, all read-level for the reason the prefs block above
+      // is: setting your own notification preference does not drive a terminal.
+      //
+      // THEY ARE QUERY-ADDRESSED AND NONE OF THEM IS FORWARDABLE. `?host=` names the machine the PANE
+      // lives on; the preference itself always lives on the collie the phone is talking to, because
+      // that is the only machine holding a push subscription (CREW_PROTOCOL.md §5). A segment on
+      // `PANE_ROUTE` would have been forwarded to the peer and stored there, where nothing can send.
+      if (pathname === "/api/notifications/cache-watch") {
+        const denied = guard(req, cfg, "read", pairing);
+        if (denied) return denied;
+        const watch = opts.cacheWatch;
+        if (!watch) return text("not found", 404);
+        const paneId = url.searchParams.get("pane");
+        // A malformed REQUEST is refused the way the prefs block above refuses one: in plain text, with
+        // no code. A code is for a refusal the phone has to explain to the operator, and "you forgot a
+        // query parameter" is a bug in the caller. The two refusals below are the explainable ones.
+        if (paneId === null || paneId === "") return text("bad request", 400);
+        const found = watchTargetFor(paneId, host, sessionName);
+        if (found.error !== undefined) {
+          const status = found.error === "cache.pane_unknown" ? 404 : 409;
+          return jsonError(apiError(found.error, { paneId }), status, req.headers.get("accept-encoding"));
+        }
+        if (req.method === "POST") {
+          let body: JsonValue;
+          try {
+            // SAFETY: `Request.json()` output IS a JsonValue by construction; `parseCacheWatchRequest`
+            // rejects anything that is not a single boolean `on`.
+            body = (await req.json()) as JsonValue;
+          } catch {
+            return text("bad request", 400);
+          }
+          const parsed = parseCacheWatchRequest(body);
+          if (parsed === null) return text("bad on", 400);
+          // The 409 a race earns: the GET already reported `watchable: false` and the sheet already
+          // disabled the switch, so the ordinary operator never sees this. It exists for the tap that
+          // lands after the harness dropped its session, where accepting would leave a switch that lies.
+          if (parsed.on && !cacheWatchable(found.pane)) {
+            return jsonError(apiError("cache.no_session", { paneId }), 409, req.headers.get("accept-encoding"));
+          }
+          await watch.set(found.pane, found.pane.label, parsed.on);
+        } else if (req.method !== "GET") {
+          return text("method not allowed", 405);
+        }
+        return json(cacheWatchBody(watch, found.pane), req.headers.get("accept-encoding"));
+      }
+      if (pathname === "/api/notifications/cache-watch/list" && req.method === "GET") {
+        const denied = guard(req, cfg, "read", pairing);
+        if (denied) return denied;
+        const watch = opts.cacheWatch;
+        if (!watch) return text("not found", 404);
+        return json(cacheWatchListBody(watch), req.headers.get("accept-encoding"));
+      }
+      if (pathname === "/api/notifications/cache-watch/forget" && req.method === "POST") {
+        const denied = guard(req, cfg, "read", pairing);
+        if (denied) return denied;
+        const watch = opts.cacheWatch;
+        if (!watch) return text("not found", 404);
+        let body: JsonValue;
+        try {
+          // SAFETY: as above — `parseCacheWatchForget` rejects anything but a non-empty string `id`.
+          body = (await req.json()) as JsonValue;
+        } catch {
+          return text("bad request", 400);
+        }
+        const id = parseCacheWatchForget(body);
+        if (id === null) return text("bad id", 400);
+        // An id naming no entry is NOT an error: removing something already gone is the outcome the
+        // operator asked for, and the answer is the list either way.
+        await watch.forget(id);
+        return json(cacheWatchListBody(watch), req.headers.get("accept-encoding"));
+      }
       if (pathname === "/api/update/check" && req.method === "POST") {
         // Force an immediate upstream check (the "check for updates" button), instead of waiting for
         // the periodic timer. Read-level — checking a version isn't terminal-driving — and idempotent
@@ -1588,14 +1795,10 @@ export function startServer(opts: {
         // notice about a machine a package manager owns. Absent reads as the offer, which is what
         // every client before the crew states could close.
         //
-        // REMOVE_IN_1_9_0: `"pack"` is 1.7.0's name for the `"crew"` scope, and a phone still
-        // running the 1.7.0 bundle sends it. Accepted here and folded into `"crew"` before anything
-        // is written, so the record on disk only ever carries the new name.
-        const asked = record === null ? undefined : record.scope;
-        if (asked !== undefined && asked !== "offer" && asked !== "crew" && asked !== "pack") {
+        const scope = record === null ? undefined : record.scope;
+        if (scope !== undefined && scope !== "offer" && scope !== "crew") {
           return text("bad scope", 400);
         }
-        const scope = asked === "pack" ? "crew" : asked;
         await updateMonitor.dismiss(version, scope ?? "offer");
         return json(updateMonitor.status(), req.headers.get("accept-encoding"));
       }
@@ -1806,13 +2009,6 @@ export function startServer(opts: {
         // The ONLY time this token exists outside the requesting device. Nothing stores it here.
         return json({ token: claimed.token, label: parsed.label }, req.headers.get("accept-encoding"));
       }
-      // REMOVE_IN_1_9_0: `/api/pack` is 1.7.0's name for the route below. A 308 keeps the method,
-      // so a phone still serving the 1.7.0 bundle out of its service worker cache follows it and
-      // reads the same census. The query string rides along rather than being dropped.
-      if (pathname === "/api/pack" && req.method === "GET") {
-        const moved = `/api/crew${url.search}`;
-        return new Response(null, { status: 308, headers: { location: moved } });
-      }
       if (pathname === "/api/crew" && req.method === "GET") {
         // Read-level, exactly like `/api/devices` and `/api/config`: this is a report about machines
         // the operator already owns, and it drives nothing. Every field is a fact this process was
@@ -1950,7 +2146,67 @@ export function startupWarnings(cfg: Config): string[] {
   return warnings;
 }
 
-async function readPane(
+/** ESC, as a code point: the lint keeps control characters out of regexes, so this is a string. */
+const ESC = "\u001b";
+
+/** CSI final byte — anything from `@` to `~` ends the sequence (ECMA-48 §5.4). */
+const isCsiFinal = (ch: string): boolean => ch >= "@" && ch <= "~";
+
+/**
+ * Drop the escape sequences Herdr's `ansi` read carries — colour and weight only, never cursor moves
+ * (see `MuxGrid`) — leaving the characters the operator sees.
+ *
+ * Written as a scan rather than a regex because a regex for this needs a control character in it,
+ * which this repo's lint forbids outright and which the web's own parser (`web/src/lib/ansi.ts`)
+ * also avoids: an escape is recognised by its code point.
+ */
+export function stripSgr(ansiText: string): string {
+  let visible = "";
+  for (let i = 0; i < ansiText.length; i++) {
+    // SAFETY: `i` is inside the string by the loop's own bound, so this is its character.
+    const ch = ansiText[i] as string;
+    if (ch !== ESC) {
+      visible += ch;
+      continue;
+    }
+    // `ESC [` opens a CSI; skip to its final byte. A lone ESC (or the text ending mid-sequence) is
+    // dropped: it paints nothing either way.
+    let j = i + 1;
+    if (ansiText[j] === "[") {
+      j += 1;
+      // SAFETY: guarded by the bound on `j` in the same condition.
+      while (j < ansiText.length && !isCsiFinal(ansiText[j] as string)) j += 1;
+    }
+    i = j;
+  }
+  return visible;
+}
+
+// A URL that runs to the end of its row, and a row that starts with a URL character. The character
+// set is links.ts's stop-set, so the gate and the client's repair (`repairWrapped`) agree on what a
+// fragment and its continuation look like: the client adopts nothing across trailing blanks or onto
+// a row that opens with whitespace, so neither is worth a read here.
+const URL_AT_ROW_END = /https?:\/\/[^\s<>"'`\\{}|^[\]]+\r?$/;
+const URL_CHAR_AT_ROW_START = /^[^\s<>"'`\\{}|^[\]]/;
+
+/**
+ * Does this grid end a row with an http(s) URL that the next row could continue — that is, might
+ * the pane's column edge have cut one?
+ *
+ * The mirror's autolinker scans one line at a time (`web/src/lib/links.ts`), so a wrapped URL is
+ * only ever linked as its first fragment, with a truncated href. Spotting that shape here is what
+ * keeps the extra `recent_unwrapped` read off every other poll: it is asked for exactly when there
+ * is something the client could repair. A false positive (a URL that happens to end a row above a
+ * row of prose) costs one read and repairs nothing.
+ */
+export function hasSplitUrl(ansiText: string): boolean {
+  const rows = stripSgr(ansiText).split("\n");
+  return rows.some(
+    (row, i) => URL_AT_ROW_END.test(row) && URL_CHAR_AT_ROW_START.test(rows[i + 1] ?? ""),
+  );
+}
+
+export async function readPane(
   herdr: MuxAdapter,
   cfg: Config,
   paneId: string,
@@ -1971,7 +2227,16 @@ async function readPane(
     // to `strip` would move someone's screen on every revalidate — see the adapter's `readGrid`.
     const read = await herdr.readGrid(paneId, { scope: "recent", lines, styling: "preserve" });
     if (!read.ok) return text(`${herdr.mux} read failed: ${read.detail}`, 502);
-    const data = paneReadResponse(paneId, read.value);
+    // A URL the pane's column edge cut in two is the one thing the mirror cannot repair on its own,
+    // and the repair needs the same rows with soft wraps undone. Ask for them only when the grid
+    // shows such a URL — this is a second round trip, and a multiplexer without the source has
+    // nothing to give. Same `lines` and the same escape-carrying form as the grid read above, so a
+    // read that would move the operator's screen here is the one `readGrid` already refuses.
+    const logical =
+      herdr.readLogicalText !== undefined && hasSplitUrl(read.value.text)
+        ? await herdr.readLogicalText(paneId, lines)
+        : undefined;
+    const data = paneReadResponse(paneId, read.value, logical?.ok ? stripSgr(logical.value) : undefined);
     // ETag is derived from the serialised body — if content hasn't changed the client gets a 304
     // and skips the whole transfer (the big win on a cellular link).
     const bodyStr = JSON.stringify(data);
@@ -2005,8 +2270,17 @@ async function readPane(
  * (the client's prompt-select race guard depends on it) is covered by the bridge unit tests without
  * standing up Bun.serve / a socket.
  */
-export function paneReadResponse(paneId: string, read: MuxGrid): PaneReadResponse {
-  return { paneId, text: read.text, truncated: read.truncated, revision: read.revision };
+export function paneReadResponse(paneId: string, read: MuxGrid, logicalText?: string): PaneReadResponse {
+  const body: PaneReadResponse = {
+    paneId,
+    text: read.text,
+    truncated: read.truncated,
+    revision: read.revision,
+  };
+  // Absent, never empty, when there is nothing to repair: the ETag is computed over this body, so an
+  // always-present key would invalidate every client's cached copy once for no gain.
+  if (logicalText !== undefined) body.logicalText = logicalText;
+  return body;
 }
 
 /**
@@ -3024,6 +3298,56 @@ export async function launchersRoute(
   return json({ launchers: rows, home: homedir() } satisfies LaunchersResponse, acceptEncoding);
 }
 
+// GET /api/cache-rules — the rule catalog behind every cache chip on THIS host, plus the overrides
+// the operator's own `cache-rules.toml` applies right now.
+//
+// A READ, and a cheap one: a dozen object literals and one mtime-checked file read. ETagged because
+// the catalog only moves on a release or a file edit, so a phone that has it re-asks with one
+// `if-none-match` and gets 304 for the rest of its boot.
+//
+// NOT FORWARDED ACROSS THE CREW LINK, and that is a decision rather than an omission. A peer may hold
+// its own override, so quoting the lead's catalog for a peer's number would cite a page that peer never
+// read. The sheet on a peer's pane says where the number was read instead (ADR 0041, Decision 11).
+export async function cacheRulesRoute(
+  getOverrides: () => Promise<readonly CacheOverride[]>,
+  acceptEncoding: string | null,
+  ifNoneMatch: string | null,
+): Promise<Response> {
+  const overrides = await getOverrides();
+  const byId = new Map(overrides.map((o) => [o.ruleId, o]));
+  const rules: CacheRuleWire[] = allCacheRules().map((rule) => {
+    const row: CacheRuleWire = {
+      id: rule.id,
+      label: rule.label,
+      ttlSeconds: rule.ttlSeconds.value,
+      confidence: rule.ttlSeconds.confidence,
+      sourceTitle: rule.ttlSeconds.source.title,
+      sourceUrl: rule.ttlSeconds.source.url,
+      retrievedAt: rule.ttlSeconds.source.retrievedAt,
+      slidingWindow: rule.slidingWindow,
+      automatic: rule.automatic,
+    };
+    // One line, not the whole list: the sheet has room for the caveat that changes how the number is
+    // read, and `notes` is written caveat-first.
+    const note = rule.ttlSeconds.note ?? rule.notes?.[0];
+    if (note !== undefined) row.note = note;
+    const moved = byId.get(rule.id);
+    if (moved !== undefined) {
+      const overridden = { ttlSeconds: moved.ttlSeconds, sourceUrl: moved.sourceUrl, retrieved: moved.retrieved };
+      row.overridden = moved.note === undefined ? overridden : { ...overridden, note: moved.note };
+    }
+    return row;
+  });
+  const body: CacheRulesResponse = { rules };
+  const etag = computeEtag(JSON.stringify(body));
+  if (notModified(ifNoneMatch, etag)) {
+    // RFC 7232 §4.1: a 304 MUST echo the ETag and MUST carry no body.
+    return new Response(null, { status: 304, headers: { etag, "cache-control": "no-store" } });
+  }
+  return gzipJsonResponse(body, acceptEncoding, { etag });
+}
+
+
 // Launch one allowlisted command, either in a new throwaway Space (from the dashboard, no pane
 // context) or as a new tab beside a pane the client names (from a pane, the swipe-up switcher). The
 // configured list doubles as the allowlist `POST /api/launch` matches: the client names a row by its
@@ -3567,6 +3891,36 @@ export function parseNotifyPrefsPatch(v: JsonValue | undefined): Partial<NotifyP
     patch[key] = value;
   }
   return patch;
+}
+
+/**
+ * Validate an untrusted `POST /api/notifications/cache-watch` body. `{ on: true }` or `{ on: false }`
+ * and nothing else; any other shape is `null` → 400. `parseNotifyPrefsPatch`'s sibling, and pure +
+ * exported for the same reason (CLAUDE.md: a route body cannot be unit-tested, a parser can).
+ */
+export function parseCacheWatchRequest(v: JsonValue | undefined): { on: boolean } | null {
+  const o = asJsonRecord(v);
+  if (o === null || typeof o.on !== "boolean") return null;
+  return { on: o.on };
+}
+
+/** The same for `POST /api/notifications/cache-watch/forget`: one non-empty opaque id. */
+export function parseCacheWatchForget(v: JsonValue | undefined): string | null {
+  const o = asJsonRecord(v);
+  if (o === null || typeof o.id !== "string" || o.id === "") return null;
+  return o.id;
+}
+
+/**
+ * Can this pane be watched at all?
+ *
+ * False when it carries no prompt-cache reading — a pane with no rule, no probe, or an agent that has
+ * not taken a turn yet — and false for `unknown`, which is spec 02's "nothing measured, so nothing
+ * said". The switch is then disabled with the reason beside it rather than accepting a preference that
+ * could never fire.
+ */
+export function cacheWatchable(pane: CacheWarnPane): boolean {
+  return pane.cache !== undefined && pane.cache.state !== "unknown";
 }
 
 // Shape-check an untrusted /api/subscribe body before persisting it (a malformed sub would be

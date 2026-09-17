@@ -163,10 +163,7 @@ export function parsePreflightReport(stdout: string): PreflightReport | null {
   // SAFETY: `verdict` was checked against `VERDICTS` above, which holds exactly the three members of
   // the union, and the guard there returned for every string that is not one of them.
   const printed = verdict as "green" | "amber" | "red";
-  // REMOVE_IN_1_9_0: `pack` is 1.7.0's name for `crew`. The document read here is printed by a
-  // SEPARATE process — `collie update --check --json` — which may be the older binary mid-swap, so
-  // both names are accepted. Only `crew` is ever written.
-  const members = rec.crew ?? rec.pack;
+  const members = rec.crew;
   const topLevel = members === undefined ? printed : worstVerdict(checks.map((c) => c.verdict));
   const kind = readInstallKind(rec.installKind);
   // Assigned, never conditionally spread: a report that named no kind must carry NO such key.
@@ -480,9 +477,7 @@ const CREW_VERDICTS: ReadonlySet<string> = new Set(["green", "amber", "red", "un
 export function parseCrewRows(doc: JsonValue): CrewUpdateRow[] {
   const rec = asRecord(doc);
   if (rec === null) return [];
-  // REMOVE_IN_1_9_0: `pack` is 1.7.0's name for `crew`, and the answer read here comes from a
-  // bridge that may still be the older build. Both names are accepted; only `crew` is written.
-  const rows = rec.crew ?? rec.pack;
+  const rows = rec.crew;
   if (!Array.isArray(rows)) return [];
   const out: CrewUpdateRow[] = [];
   for (const raw of rows) {
@@ -870,7 +865,19 @@ function peersNeedLevelling(state: UpdateStartState): boolean {
  * a host with neither. That ladder is deliberately the same three tiers as `cli/update-run.ts`'s
  * `launchPlan`, for the same reasons written there — it is restated rather than imported because
  * nothing in `bridge/` may import from `cli/`.
+ *
+ * **`detach` is the spawn's own `setsid()`, and it is on for every tier but `systemd-run`** (#213).
+ * macOS has neither `systemd-run` nor a `setsid` binary, so the bare tier used to leave the runner in
+ * the launchd job's process group; `collie update` then boots that job out to restart it, launchd
+ * kills the whole group, and the `bootstrap` that should follow never runs. The systemd-run tier
+ * stays attached on purpose: its client must stay a member of this cgroup until the manager answers
+ * (ADR 0037), and systemd kills by cgroup, not by process group, so a new session would buy nothing.
  */
+export interface UpdateStartPlan {
+  readonly command: string[];
+  readonly detach: boolean;
+}
+
 export function updateStartCommand(a: {
   readonly platform: string;
   readonly binary: string;
@@ -888,13 +895,54 @@ export function updateStartCommand(a: {
    * (M16/04). Absent on the lead's own button, which takes what an update would take.
    */
   readonly toTag?: string | null;
-}): string[] {
+}): UpdateStartPlan {
   const verb = a.major ? ["update", "--major"] : ["update"];
   if (a.toTag !== undefined && a.toTag !== null) verb.push("--to-tag", a.toTag);
   if (a.runId !== undefined && a.runId !== null) verb.push("--run-id", a.runId);
   if (a.platform === "linux" && a.hasSystemdRun) {
-    return ["systemd-run", "--user", "--collect", "--unit", `collie-api-update-${a.stamp}`, a.binary, ...verb];
+    return {
+      command: ["systemd-run", "--user", "--collect", "--unit", `collie-api-update-${a.stamp}`, a.binary, ...verb],
+      detach: false,
+    };
   }
-  if (a.hasSetsid) return ["setsid", a.binary, ...verb];
-  return [a.binary, ...verb];
+  if (a.hasSetsid) return { command: ["setsid", a.binary, ...verb], detach: true };
+  return { command: [a.binary, ...verb], detach: true };
+}
+
+/** The options the runner is spawned with. Every stream is ignored, so nothing ties it to the bridge. */
+export interface UpdateRunnerSpawnOptions {
+  readonly cwd: string;
+  readonly stdin: "ignore";
+  readonly stdout: "ignore";
+  readonly stderr: "ignore";
+  readonly detached: boolean;
+}
+
+/** `Bun.spawn` in the bridge; a recorder in a test. */
+export type UpdateRunnerSpawn = (command: string[], options: UpdateRunnerSpawnOptions) => { unref(): void };
+
+/**
+ * Spawn the plan {@link updateStartCommand} chose. **The one place the runner is spawned**: the
+ * phone's button and a peer's own follow both reach it through `startDetachedUpdate` in `index.ts`.
+ *
+ * Never waited on, and never held open: `collie update` stages and then restarts this very process.
+ * The record on disk is how the phone follows it from here (M15/04).
+ */
+export function launchUpdateRunner(
+  plan: UpdateStartPlan,
+  a: { readonly cwd: string; readonly spawn: UpdateRunnerSpawn },
+): { ok: true } | { ok: false; reason: string } {
+  try {
+    const child = a.spawn(plan.command, {
+      cwd: a.cwd,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+      detached: plan.detach,
+    });
+    child.unref();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+  }
 }

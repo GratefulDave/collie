@@ -5,7 +5,6 @@ import { Check, FileText, Image, Keyboard, Loader2, Mic, Paperclip, Send, Settin
 
 import { applyDraftFontSize, fontStack, inputFocusZoomsPage } from "@/hooks/use-display-prefs";
 import type { DisplayPrefs } from "@/hooks/use-display-prefs";
-import type { AgentStatus } from "@/lib/types";
 import { usePendingConfirm } from "@/hooks/use-pending-confirm";
 import { useDirectTyping } from "@/hooks/use-direct-typing";
 import { useLocale } from "@/hooks/use-locale";
@@ -20,6 +19,7 @@ import { ChatInput } from "@/components/ui/chat/chat-input";
 import { NavTray } from "@/components/nav-tray";
 import { CommandPalette } from "@/components/command-palette";
 import { QuickActionsContent } from "@/components/quick-actions";
+import { ActionsRow } from "@/components/actions-row";
 import { DisplayPrefsContent } from "@/components/display-prefs";
 import { SectionLabel } from "@/components/ui/section-label";
 import { Collapse } from "@/components/ui/collapse";
@@ -34,7 +34,6 @@ import { acceptAttribute, limitMb, offersFiles, PHOTO_ACCEPT, rejectAttachment, 
 import { ctrlPresetsFor } from "@/lib/operator-keys";
 import { isDestructiveInput } from "@/lib/destructive";
 import { HostChip } from "@/components/host-chip";
-import { StatusWordSlot } from "@/components/status-badge";
 import { useAmbientHost, useHostLabel } from "@/components/crew-provider";
 import { clearDraft, fitsDraftStore, loadDraft, saveDraft } from "@/lib/drafts";
 import { useHoldReload } from "@/lib/reload-guard";
@@ -60,22 +59,13 @@ interface ComposerProps {
   scope?: Scope;
   /** The pane's agent name — drives the slash-command palette and the reply-vs-shell placeholder. */
   agent: string | undefined | null;
-  /** True for a bare shell pane (tweaks the placeholder copy, and is its own status word). */
+  /** True for a bare shell pane — tweaks the placeholder copy. */
   isShell: boolean;
-  /**
-   * What the pane is DOING, as the word on the status strip above the controls row. Undefined only
-   * when there is no pane left to describe (`gone`), where the strip stands empty.
-   *
-   * It lives here rather than in the pane header because that is where the operator's question is:
-   * the header's caption line held this one word and nothing else, so the top of a 60px row was
-   * spent on it. Beside the host it completes a sentence — which machine, and what is it doing —
-   * at the surface being typed into. The header keeps the DOT badged on the agent's own tile; the
-   * word is the half of that pair a colour-blind reader can use (status-badge.tsx measures why),
-   * so it moved rather than went.
-   */
-  status?: AgentStatus;
-  /** The reading is the last snapshot's, not live — dims the word exactly as the header's dot dims. */
-  stale?: boolean;
+  /* NO `status` AND NO `stale` HERE ANY MORE. The composer took the pane's state as a prop for one
+     reason: the status band above the controls row drew it as a word. That band is gone (see the
+     long note at the row below), the word went with it rather than moving, and the state is the
+     pane header's and the dashboard's to state. A composer that knows what the pane is DOING is a
+     composer that will be asked to draw it again; it does not know any more. */
   /** Pane is gone (no agent) — locks the composer with a distinct placeholder. */
   gone: boolean;
   /** This device isn't authorised to type — locks the composer with a distinct placeholder. */
@@ -124,6 +114,23 @@ interface ComposerProps {
   setExpandClippedReply: (expandClippedReply: boolean) => void;
   /** Snap the mirror to the live tail (follow + revalidate + scroll) after a successful send. */
   onSent: () => void;
+
+  /**
+   * The pane switcher, in two pieces: a Switch pill pinned at the actions belt's right end
+   * (`onClick`, the tap) and the belt itself as a drag surface (`ref`, the finger-tracked pull).
+   * Threaded straight through to {@link import("@/components/actions-row").ActionsRow} — this file
+   * decides nothing about either and draws none of it.
+   *
+   * Absent, rather than flagged off: the pane passes nothing here when there is nowhere to switch
+   * to.
+   */
+  pullHandle?: {
+    ref: (node: HTMLElement | null) => void;
+    onClick: () => void;
+    label: string;
+    /** Another pane needs you: the switcher mark wears a red dot. */
+    alert?: boolean;
+  };
 }
 
 // The composer cluster at the bottom of the pane view — everything a phone keyboard can't do on its
@@ -136,46 +143,11 @@ interface ComposerProps {
 // "display" joined the drawer union when the permanent icon-only View row was retired: wrap / raw
 // terminal / font size are settings you touch once, so they cost a whole row of a phone viewport for
 // nothing, and the raw-terminal toggle in particular was an unlabelled `>_` glyph nobody could
-// decode. They now live behind the ⚙ on the single Controls row, as labelled rows in the same
+// decode. They now live behind the ⚙ on the actions row, as labelled rows in the same
 // in-flow dock (they change how the mirror LOOKS, so the mirror has to stay visible while you flip
 // them). Find moved the other way — to the header, where its find bar already takes over the row.
 type ComposerDrawer = "quick" | "cmd" | "keys" | "display" | null;
 
-// The Controls row's "on" look, authored once so an open dock and an armed mode can never drift
-// apart. `hover:` is pinned to the same tint: without it, hovering an already-on control repaints it
-// with the ghost variant's hover background and it reads as switching off under the cursor.
-const CONTROL_ON = "bg-control-on text-control-on-foreground hover:bg-control-on";
-const CONTROL_OFF = "text-muted-foreground";
-
-// The box every LABELLED control on that row wears. Authored once because the row's whole defect was
-// per-button drift in a fixed width: four buttons sized by their own text, in a container that is
-// 366px on a 390px phone and cannot grow.
-//
-// `shrink` is the load-bearing word. `ui/button.tsx`'s base string carries `shrink-0`, so `flex-1`
-// (which does set flex-shrink:1, in a shorthand) lost to the longhand and every button sat at its
-// CONTENT width. Measured on the pane screen at 390px: the row's scrollWidth ran 18px past its
-// clientWidth in English and 70px past in Japanese, and the overflow-x-hidden ancestor on the pane
-// column cut the ⚙ in half rather than letting it scroll — the control was not reachable at all.
-// Restoring flex-shrink, plus `min-w-0` to lift the flex item's min-content floor, plus `truncate`
-// on the label span (below) makes the row structurally incapable of exceeding its container: the
-// worst case is now an ellipsis on the longest word, not a missing button.
-//
-// `h-11` is 44px — the tap target the row never actually had (it was `h-8`/32px). It costs the
-// composer 12px of height, and that is the trade: a control you can hit beats a control that only
-// looks tidy.
-//
-// The icon sits ABOVE the word (`flex-col`) rather than beside it, and that is a MEASUREMENT, not a
-// taste. Side by side, a 74.5px button spends 16px on the icon and its gap before the first letter,
-// which leaves ~38px of text — and four of the six shipped locales ellipsised at 390px, CJK worst
-// (`エージェント` is six full-width glyphs). Stacked, the word gets the button's whole width and a
-// 10px size, so all six draw in full at 390px and only ja's longest ellipsises at 320px. A fix that
-// only reads in English is not a fix.
-const CONTROL_BUTTON =
-  "h-11 min-w-0 flex-1 shrink flex-col gap-0.5 px-1 has-[>svg]:px-1 text-[10px] font-medium leading-none [&>svg]:shrink-0";
-// The label inside that box. `truncate` needs a box of its own to clip against — a bare text node
-// in a flex button has none — and `max-w-full` is what keeps that box from simply being the text's
-// own width.
-const CONTROL_LABEL = "max-w-full truncate";
 
 // Pause after clearing a stranded terminal draft so the TUI settles before pane.send_text. Exported
 // so the test can pin the WAIT ITSELF (the reply never overtakes the sweep) against the constant
@@ -237,7 +209,7 @@ function ComposerDock({
 const ATTACH_PRESS_MS = 220;
 
 export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Composer(
-  { paneId, scope, agent, isShell, status, stale, gone, readOnly, hostBlock, composing, dialogPresent, text, terminalDraft, rawTerminalDraft, prefs, setWrap, stepFontSize, setRawTerminal, setTapToFocus, setExpandClippedReply, onSent },
+  { paneId, scope, agent, isShell, gone, readOnly, hostBlock, composing, dialogPresent, text, terminalDraft, rawTerminalDraft, prefs, setWrap, stepFontSize, setRawTerminal, setTapToFocus, setExpandClippedReply, onSent, pullHandle },
   ref,
 ) {
   const revalidator = useRevalidator();
@@ -276,11 +248,9 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
   // The machine every write on this row lands on. The pane view addresses one host (the pane's own,
   // carried in `?h=` since the row was opened), so the ambient scope IS the target here. Undefined on
   // a solo install, which renders no chip and leaves every confirm string unchanged.
+  // It names the Keys dock's own header; the belt below it carried the tag for a day and the pane
+  // header carries it now (agent-chat.tsx).
   const writeHost = useAmbientHost(scope?.host);
-  // The word for the status strip. A bare shell has no agent and therefore no agent status, but it
-  // still owes the strip a word or a solo install's strip would be empty; a GONE pane has nothing
-  // left to describe, and the strip stands empty rather than reporting a stale state as current.
-  const statusWord: AgentStatus | "shell" | undefined = isShell ? "shell" : status;
   // Its display name, or undefined when there is no crew — the copy-level half of the hide rule.
   const writeHostLabel = useHostLabel(scope?.host);
   // …and a ref alongside it, for the ONE caller that reads it after an await. `send()` checks
@@ -1151,222 +1121,139 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
             and NOT flex-1 — it's a settings affordance, not a peer of the three action toggles, and
             keeping it to one square (44px, its tap target and nothing more) leaves the labelled
             buttons the rest of a 390px phone. */}
-        {/* THE STATUS BAND — A STATUS LINE, NOT A HEADING, AND NOW A REGION OF ITS OWN.
+        {/* THE STATUS BAND IS GONE, AND THIS IS WHERE IT STOOD.
 
-            It used to be 12px of `pt-3` reserved at the top of the controls row, with its two runs
-            lifted out of the flex flow into one `absolute` box. It is now a real box, a sibling
-            above the row, because the operator asked for a bottom rule, and a rule cannot be drawn
-            on padding. What it SAYS is unchanged: it reads as ONE SENTENCE —
-            the machine every button on the row (and the field below) writes to, and what that
-            machine's pane is doing. It replaced the word "Controls", which named a row whose five
-            buttons already carry their own labels.
+            It was 14px, roomy-only, bounded by a hairline on both edges, and it read as one
+            sentence: the machine every button below writes to, then what that machine's pane was
+            doing. Altan, on the phone, after the belt landed: "we should address the small status
+            line with the server and status, the server is still necessary somewhere, but the status
+            is unnecessary at this place."
 
-            WHY HERE AND NOT IN THE FIELD. The host was docked inside the text box for one round.
-            The reasoning survives ("which machine will this land on" is asked while writing, not
-            while reading) but the price does not: docked, it took 60px out of the typing area, the
-            widest and most contested part of the composer. This band is at the same write surface
-            and costs the typing area nothing.
+            SO THE TWO RUNS WENT DIFFERENT WAYS. The machine moved ONE row down, onto the actions
+            belt — and then UP, into the pane header, under the cache reading, once the belt's right
+            end was needed for the Switch pill (agent-chat.tsx draws it, actions-row.tsx says why).
+            It is a `variant="tag"` either way: the 10px uppercase caption was sized for this band
+            and reads as a word that fell off something anywhere else.
 
-            WHY THE STATUS WORD CAME DOWN HERE. It was the pane header's caption line, and once the
-            host left that line it was ONE word holding a whole line of a 60px row — the operator
-            asked for the top back. It could not simply be deleted: on the app's own `--status-*`
-            tokens a deuteranope reads blocked / working / done as one colour in light theme, and
-            "needs you" against "done" collapses in both, so the DOT alone cannot carry the range
-            (status-badge.tsx holds the measurement). The dot stays badged on the agent's tile in the
-            header, welded to its subject; the word stands here, where the same question is being
-            asked about the same machine.
+            THE STATUS WORD WAS DELETED, NOT MOVED, AND THAT NEEDED ONE CHECK FIRST. The word was
+            here because a 10px dot encodes this range in HUE ALONE and the range does not survive
+            it: on the app's own `--status-*` tokens a deuteranope reads blocked / working / done as
+            one colour in light theme, and "needs you" against "done" collapses in both
+            (status-badge.tsx holds the measurement). Deleting a coloured word is therefore only
+            safe while the state is still readable without colour SOMEWHERE. It is: the pane
+            header's agent tile badges a StatusDot that is NAMED — `label={statusLabel(...)}`, the
+            one named dot in the app — so a screen reader still gets "needs you" from the header,
+            and a shell pane's tile carries an `sr-only` "shell" for the same reason
+            (agent-chat.tsx says both at the line). The dashboard states it in words as well. No
+            visible word was added anywhere to pay for this one; that was the point of removing it.
 
-            NOTHING HERE CAN MOVE ANYTHING. Both runs state the same 12px line box (`text-[10px]/3`,
-            one utility — tailwind-merge deletes an earlier `leading-*` when a later `text-<size>`
-            follows it in the same cn()). `h-[14px]` then STATES the band's height rather than
-            letting it be the sum of whatever stands in it, so a solo install (where HostChip renders
-            null, its hide rule unchanged, leaving the word alone), a crew, and a gone pane (no word
-            at all) are identical BY CONSTRUCTION and not by three occupants happening to agree.
-            `text-[10px]/3` is stated on the BAND as
-            well as on both runs, and that is load-bearing rather than decorative: a block layer
-            inside the slot takes its line box from its OWN inherited strut, so without it the 14px
-            page strut won and the band measured 25px instead of 14px.
-            The WORD's own width is the case padding cannot reserve — "needs you" is 54.6px and
-            "done" 27.9px — so it stands in a slot sized to every word it can hold, which is what
-            `StatusWordSlot` is for; the machine's name truncates into what is left, always the same
-            amount of it. DESIGN.md §2: reserve, never reflow.
+            WHAT THE REMOVAL BOUGHT, MEASURED AT 390px: 22px off the stack — the band's own 14px
+            (1 + 12 + 1) plus the 8px `mt-2` that separated it from the buttons. The belt's top
+            margin absorbed that decision: see `mt-1.5` on the roomy ActionsRow below, which is the
+            air between the dock/handle above and the belt now that there is nothing between them.
 
-            THE GROUND IS THE PAGE COLOUR, PER DESIGN.md §4: CHROME SEPARATES WITH A RULE, NOT A
-            FILL. A fill was tried here and measured — 1.19:1 against the dock below, 1.09:1 /
-            1.10:1 against the terminal mirror above, both themes, against a `border-b border-rule`
-            doing 1.45:1 light and 2.19:1 dark — and the rule was doing between 1.2x and 2x more of
-            the separating in light, and all of it in dark, where the fill read as a continuation of
-            the terminal rather than as a band of chrome. It is gone; the band is unpainted, and the
-            two rules are what tell it apart from what stands either side of it.
-
-            THE RULES ARE `--border`, NOT `--rule`, SINCE THE 2026-08-31 ROUND. The operator read
-            the pair as too loud — two 24% hairlines 14px apart make a bright sandwich around 10px
-            type — and the token doctrine agrees with the eye: --rule cuts BETWEEN regions of
-            chrome, and both of this band's neighbours are the same chrome surface (the handle
-            above, the controls below; the regional cut against the terminal is the chrome block's
-            own top rule in agent-chat.tsx). These are component edges inside one surface, which is
-            what --border (12%) is for. Nothing about the geometry below changes: the centring fix
-            was the SYMMETRY of `border-y`, never the weight of the lines.
-
-            IT IS BOUNDED ON BOTH EDGES NOW — `border-y`, and that is the round's actual fix. The
-            band had a rule below it and 10px of the dock's own `pt-2.5` above it, which is why it
-            read as uncentred no matter what the numbers said: the box the EYE draws ran from the
-            dock's top rule to the band's bottom rule, ~23px of one unbroken ground, and the words
-            sat at the bottom of it. Measured on the page (390px, DPR 3, dark) the geometry inside
-            the 13px band was already right to half a pixel — caps 3.0 → 10.0 in a 0 → 13 box — so
-            there was nothing to centre BETTER. There was a box to state. The band now states it:
-            a rule above, a rule below, nothing between them but the two runs.
-
-            The 10px did not vanish, it moved BELOW the band, onto the controls row — `mt-2.5`
-            then, `mt-2` since the 2026-08-31 shave (with `mb-2` going to `mb-1.5` beside it, 4px
-            returned in all) — where it separates the band from the buttons instead of pretending
-            to be part of it.
-            The dock therefore takes NO top padding at all, and its top rule and fill moved out to
-            the chrome block in `agent-chat.tsx` — the swipe handle stands on that same ground, so
-            the boundary against the terminal is drawn once, above everything the thumb operates.
-            Two components drawing one boundary is a fault this codebase has already fixed twice
-            (`space-strip.tsx` / `tab-strip.tsx`).
-
-            THE STACK GOT 9px SHORTER: −10px of dock padding, +1px for the band's new top rule.
-
-            AND THE 1px NUDGE IS GONE WITH IT. The band used to carry `pt-px`, which existed to pay
-            for a rule on ONE edge: `items-center` centres in the CONTENT box, the band the eye read
-            was the border box, and with a hairline below and none above the two centres were half a
-            pixel apart. `border-y` makes the box symmetric by construction, so there is nothing left
-            to compensate for and a compensation still applied would tip it the other way. Both
-            spellings were measured on the page, 390px at DPR 3, as ink rows in the band's own 14px
-            border box (rules at 0 → 1 and 13 → 14):
-
-              with `pt-px`   caps 4.00 → 11.00, centroid 7.33 · all ink centroid 7.83
-              without        caps 3.00 → 10.00, centroid 6.33 · all ink centroid 6.83
-
-            against a border-box centre of 7.00. The eye centres the CLUSTER, not the capital
-            letters — the host's glyph is part of the line — so the all-ink number is the one that
-            decides, and it goes from 0.83px low to 0.17px high. The height is simply stated
-            (14px = 1 + 12 + 1) and `items-center` does the rest. The host's glyph stays `size-2.5`
-            in this variant (host-chip.tsx states why at the line): 10px in a 12px content box
-            clears both rules instead of touching one.
-
-            Nothing about the reserve changes: the slot still stacks every word (§2), and the height
-            is the same 14px solo, on a crew, and on a gone pane.
-
-            FULL-BLEED, and the content still at 10px. `-mx-3` cancels the dock's `px-3` so both
-            rules run edge to edge — one that stopped short would not separate the regions it
-            sits between. `px-2.5` then puts the content back at the 10px inset the controls row
-            asked for, so nothing on this line moved by a pixel: the band is what absorbs the old
-            `-mx-0.5`, a 2px overhang that was invisible on this unpainted strip either way. */}
-        <div
-          data-slot="composer-status"
-          className="-mx-3 flex h-[14px] items-center justify-end gap-1.5 border-y border-border px-2.5 text-[10px]/3"
-        >
-          <HostChip host={writeHost} variant="caption" className="min-w-0" />
-          <StatusWordSlot status={statusWord} stale={stale} />
-        </div>
-        {/* `gap-1.5` rather than `gap-2`: four gaps at 8px is 32px of a 366px row, and 6px reads the
-            same. The group still carries `aria-labelledby` to the word "Controls" — the word is now
-            `sr-only` rather than deleted, because it was doing TWO jobs and only one of them was
-            visual. Sighted, it labelled a row of five self-labelling buttons and earned nothing. In
-            the accessibility tree it is the only thing that names the group at all, and dropping it
-            would leave a bare `role="group"` wrapping Keys/Type/Quick/Agent/⚙ with no name for a
-            screen reader to announce on entry. The host does NOT inherit that job: it names a
-            machine, not a run of controls, and it is absent on every solo install — which is also
-            why it now stands OUTSIDE this group, in the band above, where it belongs to the line it
-            completes rather than to five buttons it does not describe. */}
-        <div
-          data-slot="composer-controls"
-          role="group"
-          aria-labelledby="composer-controls-label"
-          className="-mx-0.5 mb-1.5 mt-2 flex items-center gap-1.5"
-        >
-          <SectionLabel id="composer-controls-label" className="sr-only">
-            {translate("composer.controls.label")}
-          </SectionLabel>
-          {/* Keys and Quick are TOGGLES for the in-flow dock above (not overlays): tap to open, tap
-              again to close. aria-expanded ties each to the dock; secondary variant marks it pressed
-              while open. Both share the single-valued `drawer`, so opening one closes the other. */}
-          <Button
-            variant="ghost"
-            size="sm"
-            className={cn(CONTROL_BUTTON, drawer === "keys" ? CONTROL_ON : CONTROL_OFF)}
-            disabled={locked}
-            aria-expanded={drawer === "keys"}
-            aria-label={translate("composer.controls.keys")}
-            onClick={() => requestDrawer(drawer === "keys" ? null : "keys")}
-          >
-            <Keyboard className="size-4" />
-            <span className={CONTROL_LABEL}>{translate("composer.controls.keys")}</span>
-          </Button>
-          {/* "Type into terminal" lives HERE, beside Keys, rather than on the Send button.
-              It is the same problem split in half: Keys exists because the phone keyboard cannot
-              send Esc/Tab/arrows/chords, this exists because it cannot send bare printable letters —
-              so someone who wants to press `b` looks in this row first. It is also used in bursts
-              (a picker, a y/n prompt) and then not for days, which is the wrong shape for a
-              permanent fixture on the app's most-used control: a split Send button cost a third of
-              the primary action's width every day to serve a mode used on a few of them.
-              Unlike its neighbours this toggles state instead of opening a dock — the armed strip
-              above the input is what makes that visible. Arming is still an explicit NAMED choice,
-              which is what keeps an accidental touch from quietly wiring the keyboard to a live
-              terminal; see use-direct-typing.ts for the rest of that argument. */}
-          <Button
-            variant="ghost"
-            size="sm"
-            className={cn(CONTROL_BUTTON, direct.active ? CONTROL_ON : CONTROL_OFF)}
-            disabled={locked || sending}
-            aria-pressed={direct.active}
-            aria-label={translate("composer.controls.typeAria")}
-            onClick={() => {
-              if (direct.active) {
-                direct.deactivate();
-                return;
-              }
-              // Close whatever dock is open first: the mode needs the phone keyboard, and a dock
-              // holding half the viewport is the thing in its way. Routed through requestDrawer so a
-              // staged key queue still gets its discard confirm (ADR 0005).
-              requestDrawer(null);
-              direct.activate();
-            }}
-          >
-            <Terminal className="size-4" />
-            <span className={CONTROL_LABEL}>{translate("composer.controls.type")}</span>
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className={cn(CONTROL_BUTTON, drawer === "quick" ? CONTROL_ON : CONTROL_OFF)}
-            disabled={locked}
-            aria-expanded={drawer === "quick"}
-            aria-label={translate("composer.controls.quick")}
-            onClick={() => requestDrawer(drawer === "quick" ? null : "quick")}
-          >
-            <Zap className="size-4" />
-            <span className={CONTROL_LABEL}>{translate("composer.controls.quick")}</span>
-          </Button>
-          {commands.length > 0 && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className={cn(CONTROL_BUTTON, "text-muted-foreground")}
-              disabled={locked}
-              aria-label={translate("composer.controls.agent")}
-              onClick={() => requestDrawer("cmd")}
-            >
-              <Slash className="size-4" />
-              <span className={CONTROL_LABEL}>{translate("composer.controls.agent")}</span>
-            </Button>
-          )}
-          {/* Display prefs. Not gated on `locked`: wrap/font/raw-terminal are local view state, so a
-              read-only device or a gone pane can still make its mirror readable. */}
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn("size-11 shrink-0", drawer === "display" ? CONTROL_ON : CONTROL_OFF)}
-            aria-label={translate("composer.controls.displayAria")}
-            aria-expanded={drawer === "display"}
-            onClick={() => requestDrawer(drawer === "display" ? null : "display")}
-          >
-            <Settings2 className="size-4" />
-          </Button>
-        </div>
+            The dock still takes NO top padding: its top rule and fill live on the chrome block in
+            `agent-chat.tsx`, because the swipe handle stands on that same ground and the boundary
+            against the terminal is drawn once, above everything the thumb operates. */}
+        {/* ── THE ACTIONS ROW ──────────────────────────────────────────────────────────────────
+            One row, two segments: Collie's own controls, then the running harness's own commands in
+            the harness's own colour. It replaced the Controls row and the separate harness bar,
+            which were two rows of a phone's glass answering one question. The row itself is
+            actions-row.tsx; everything below is only what each action DOES.
+  */}
+        <ActionsRow
+          general={[
+              // Keys and Quick are TOGGLES for the in-flow dock above (not overlays): tap to
+              // open, tap again to close. `expanded` ties each to the dock; the "on" tint marks
+              // it pressed while open. Both share the single-valued `drawer`, so opening one
+              // closes the other.
+              {
+                id: "keys",
+                icon: Keyboard,
+                label: translate("composer.controls.keys"),
+                on: drawer === "keys",
+                expanded: drawer === "keys",
+                disabled: locked,
+                onSelect: () => requestDrawer(drawer === "keys" ? null : "keys"),
+              },
+              // "Type into terminal" lives HERE, beside Keys, rather than on the Send button.
+              // It is the same problem split in half: Keys exists because the phone keyboard
+              // cannot send Esc/Tab/arrows/chords, this exists because it cannot send bare
+              // printable letters — so someone who wants to press `b` looks in this row first.
+              // It is also used in bursts (a picker, a y/n prompt) and then not for days, which
+              // is the wrong shape for a permanent fixture on the app's most-used control: a
+              // split Send button cost a third of the primary action's width every day to serve
+              // a mode used on a few of them.
+              // Unlike its neighbours this toggles state instead of opening a dock — the armed
+              // strip above the input is what makes that visible. Arming is still an explicit
+              // NAMED choice, which is what keeps an accidental touch from quietly wiring the
+              // keyboard to a live terminal; see use-direct-typing.ts for the rest.
+              {
+                id: "type",
+                icon: Terminal,
+                // Announced in full, drawn short: the pill has one word of room beside its glyph,
+                // and "Type into terminal" is the name a reader must still hear.
+                label: translate("composer.controls.typeAria"),
+                word: translate("composer.controls.type"),
+                on: direct.active,
+                pressed: direct.active,
+                disabled: locked || sending,
+                onSelect: () => {
+                  if (direct.active) {
+                    direct.deactivate();
+                    return;
+                  }
+                  // Close whatever dock is open first: the mode needs the phone keyboard, and a
+                  // dock holding half the viewport is the thing in its way. Routed through
+                  // requestDrawer so a staged key queue still gets its discard confirm
+                  // (ADR 0005).
+                  requestDrawer(null);
+                  direct.activate();
+                },
+              },
+              {
+                id: "quick",
+                icon: Zap,
+                label: translate("composer.controls.quick"),
+                on: drawer === "quick",
+                expanded: drawer === "quick",
+                disabled: locked,
+                onSelect: () => requestDrawer(drawer === "quick" ? null : "quick"),
+              },
+              // Withdrawn rather than greyed when this pane has no commands at all: there is no
+              // palette to open, which is a different thing from one this device may not use.
+              ...(commands.length > 0
+                ? [
+                    {
+                      id: "agent",
+                      icon: Slash,
+                      label: translate("composer.controls.agent"),
+                      disabled: locked,
+                      onSelect: () => requestDrawer("cmd"),
+                    },
+                  ]
+                : []),
+              // Display prefs. Not gated on `locked`: wrap/font/raw-terminal are local view
+              // state, so a read-only device or a gone pane can still make its mirror readable.
+              {
+                id: "display",
+                icon: Settings2,
+                label: translate("composer.controls.displayAria"),
+                word: translate("composer.controls.display"),
+                on: drawer === "display",
+                expanded: drawer === "display",
+                onSelect: () => requestDrawer(drawer === "display" ? null : "display"),
+              },
+          ]}
+          agent={agent}
+          mine={operatorCommands}
+          onRun={(command) => send(command, false)}
+          disabled={locked}
+          // The pane switcher: a Switch pill pinned at this belt's right end, above Send, and the
+          // belt itself as the drag surface behind it. The pane decides whether there is one
+          // (agent-chat.tsx); this row draws the pill, wires the drag, and costs no height.
+          handle={pullHandle}
+        />
         {/* ── THE FOOTER'S NOTICE STRIPS, SORTED BY KIND (DESIGN.md §1, §2) ─────────────────────
             Every strip below arrives and leaves through `Collapse`, which is the only sanctioned way
             an in-flow surface appears at all. Before this they were bare conditionals, so each one
@@ -1462,8 +1349,25 @@ export const Composer = forwardRef<ComposerHandle, ComposerProps>(function Compo
           </p>
         </Collapse>
         {/* gap-3, not gap-2: with the attach button moved inside the field this row is only the
-            field and Send, and the old spacing left them looking joined. */}
-        <div className="flex items-end gap-3">
+            field and Send, and the old spacing left them looking joined.
+
+            `pt-1` ONLY, not `py-1`, and it is not a top-alignment nicety: the focus ring on the
+            field (chat-input.tsx: `outline-2 outline-offset-2`) reaches 4px past the field's own
+            border on every side, measured. The belt above already carries `mb-1` for its own
+            reason (actions-row.tsx), but that 4px sits OUTSIDE this row and the ring bleeds
+            straight through it — without this padding the ring's top edge lands exactly on the
+            belt's bottom edge, touching. `pt-1` absorbs the ring's 4px reach INSIDE the row instead,
+            so the belt's existing `mb-1` is what remains as clearance. The bottom needs no match:
+            the chrome container's own `pb-2` / safe-area padding below this row is already 8px,
+            twice the ring's 4px reach, so the ring already clears the chrome edge by 4px without
+            help. Adding `pb-1` here would only push that to 8px clear — don't; it is not the
+            fix, it is padding a place that was never touching.
+
+            RE-CHECKED after the belt grew from 32px to 40px (its scroller's own `py-1`,
+            actions-row.tsx): that growth is INSIDE the belt's border box, below the belt's own
+            top/bottom rules, and `mb-1` is measured from those rules outward — so it changes
+            nothing here. This row's `pt-1` still supplies exactly 4px of clearance, no more. */}
+        <div className="flex items-end gap-3 pt-1">
           {/* The input and its attach button share one box: the button is positioned INSIDE the
               field, messenger-style, rather than sitting beside it as a third control in the row.
               It used to occupy a full-height slot to the left, which spent the widest part of the

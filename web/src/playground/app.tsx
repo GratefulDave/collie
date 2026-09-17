@@ -41,13 +41,18 @@ import {
 } from "./prefs";
 import * as brand from "./sections/brand";
 import * as boot from "./sections/boot";
+import * as tour from "./sections/tour";
 import * as idle from "./sections/idle";
 import * as dashboard from "./sections/dashboard";
 import * as pane from "./sections/pane";
+import * as actionsRow from "./sections/actions-row";
 import * as crew from "./sections/crew";
 import * as settings from "./sections/settings";
 import * as notices from "./sections/notices";
+import * as updateScreen from "./sections/update-screen";
 import * as motion from "./sections/motion";
+import * as cache from "./sections/cache";
+import * as paneSettings from "./sections/pane-settings";
 
 /** What a section's `render` gets handed — the page-level knobs a section needs. Today only the
  *  shared connection clock (`BootSection`'s `clock` prop); a section that needs nothing reads
@@ -74,13 +79,18 @@ export interface SectionEntry {
 export const SECTIONS: readonly SectionEntry[] = [
   { def: dashboard.DEF, render: () => <dashboard.DashboardSection /> },
   { def: pane.DEF, render: () => <pane.PaneSection /> },
+  { def: actionsRow.DEF, render: () => <actionsRow.ActionsRowSection /> },
   { def: crew.DEF, render: () => <crew.CrewSection /> },
   { def: settings.DEF, render: () => <settings.SettingsSection /> },
   { def: boot.DEF, render: (ctx) => <boot.BootSection clock={ctx.clock} /> },
+  { def: tour.DEF, render: () => <tour.TourSection /> },
   { def: idle.DEF, render: () => <idle.IdleSection /> },
   { def: brand.DEF, render: () => <brand.BrandSection /> },
   { def: notices.DEF, render: () => <notices.NoticesSection /> },
+  { def: updateScreen.DEF, render: () => <updateScreen.UpdateScreenSection /> },
   { def: motion.DEF, render: () => <motion.MotionSection /> },
+  { def: cache.DEF, render: () => <cache.CacheSection /> },
+  { def: paneSettings.DEF, render: () => <paneSettings.PaneSettingsSection /> },
 ];
 
 const THEME_OPTIONS = [

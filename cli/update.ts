@@ -34,7 +34,15 @@ import { packageCommand } from "./package-command.ts";
 import { herdrActionCommand, type Environment, type EnvVars } from "./context.ts";
 import { EXIT } from "./io.ts";
 import { cmdLink, isCollieBinaryPath, type LinkReader, linkPath, type LinkWriter } from "./link.ts";
-import { type Exec, type Files, type Net, type NetFailure, type ResolvedTool, resolveTool } from "./sys.ts";
+import {
+  type BunReadiness,
+  type Exec,
+  type Files,
+  type Net,
+  type NetFailure,
+  type RunnableBun,
+  resolveRunnableBun,
+} from "./sys.ts";
 import { tagRemote } from "./update-remote.ts";
 import { collieBinary, unitName } from "./unit.ts";
 import {
@@ -119,8 +127,24 @@ export { isManagedCheckout };
  * Callers spawn `path` and pass its `dirname` as the child's PATH prefix: `bun cli/main.ts build`
  * spawns `bun` again by name for the two installs and the Vite build.
  */
-function resolveBun(deps: UpdateDeps): ResolvedTool | null {
-  return resolveTool(deps.exec, deps.files, deps.ctx.env, deps.ctx.home, "bun");
+function bunReadiness(deps: UpdateDeps): BunReadiness {
+  return resolveRunnableBun(deps.exec, deps.files, deps.ctx.env, deps.ctx.home);
+}
+
+/**
+ * Resolve and prove Bun before the path that needs it. `--version` is bounded in `cli/sys.ts`, so
+ * a malformed executable cannot advance a managed checkout and then leave it unable to rebuild.
+ */
+function requireRunnableBun(deps: UpdateDeps, need: string): RunnableBun | null {
+  const readiness = bunReadiness(deps);
+  if (readiness.kind === "ready") return readiness.bun;
+  const reason =
+    readiness.kind === "missing"
+      ? "bun is not installed"
+      : `bun at ${readiness.tool.path} is not runnable — \`bun --version\` did not return a readable version`;
+  deps.io.err(`error: ${reason} — ${need}.`);
+  deps.io.err("       Install or repair Bun from https://bun.sh, then re-run update.");
+  return null;
 }
 
 /**
@@ -519,6 +543,11 @@ export interface CheckoutOutcome {
    * END of the transcript, which is the part the operator reads.
    */
   higher: ReleaseTag | null;
+  /**
+   * The exact Bun proven runnable before this managed checkout moved. It is optional because no-op
+   * and refusal paths deliberately never probe Bun, and linked checkouts do not hand off this way.
+   */
+  bun?: RunnableBun;
 }
 
 /**
@@ -661,11 +690,13 @@ function updateManaged(
       deps.io.err("error: no release tags on origin — cannot pin an unversioned checkout.");
       return { code: EXIT.FAIL, moved: false, to: null, higher: null };
     }
+    const bun = requireRunnableBun(deps, "this update cannot rebuild the selected release; the checkout is unchanged");
+    if (bun === null) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
     deps.io.out(
       `updating Collie (Herdr-managed checkout: no readable version — pinning to newest release tag ${plan.newest.tag})…`,
     );
     const pinned = detachOnto(deps, git, plan.newest.tag);
-    return { code: pinned, moved: pinned === EXIT.OK, to: plan.newest.version, higher: null };
+    return { code: pinned, moved: pinned === EXIT.OK, to: plan.newest.version, higher: null, bun };
   }
   if (plan.kind === "no-higher-major") {
     printNoHigherMajor(deps, plan.major);
@@ -681,6 +712,11 @@ function updateManaged(
     announceMajor(deps, plan.higher);
     return { code: EXIT.OK, moved: false, to: null, higher: plan.higher };
   }
+  // Target selection above is read-only. Prove the exact Bun that will run the fetched source
+  // before `detachOnto` reaches its first mutation (`git fetch`), so a bad compiler leaves this
+  // managed checkout exactly where it was.
+  const bun = requireRunnableBun(deps, "this update cannot rebuild the selected release; the checkout is unchanged");
+  if (bun === null) return { code: EXIT.FAIL, moved: false, to: null, higher: null };
   deps.io.out(
     plan.crossesMajor
       ? `crossing to Collie ${plan.target.version} (--major given: consented)…`
@@ -690,7 +726,13 @@ function updateManaged(
   if (code === EXIT.OK && !plan.crossesMajor) announceMajor(deps, plan.higher);
   // A crossing just TOOK `higher`; naming it again at the end of the transcript would advertise the
   // release the operator is now standing on.
-  return { code, moved: code === EXIT.OK, to: plan.target.version, higher: plan.crossesMajor ? null : plan.higher };
+  return {
+    code,
+    moved: code === EXIT.OK,
+    to: plan.target.version,
+    higher: plan.crossesMajor ? null : plan.higher,
+    bun,
+  };
 }
 
 /** Fetch the release tag `tag` and re-detach onto it, the way Herdr got this checkout here. */
@@ -1041,12 +1083,12 @@ export async function cmdUpdate(deps: UpdateDeps, args: readonly string[] = []):
     closeWithMajor(deps, advanced.higher);
     return EXIT.OK;
   }
-  const bun = resolveBun(deps);
-  if (bun === null) {
-    deps.io.err("error: bun not found — the checkout advanced, but rebuilding needs Bun.");
-    deps.io.err("       Install it from https://bun.sh and re-run update.");
-    return EXIT.FAIL;
-  }
+  // A managed advance already proved and carried this exact Bun before its fetch. A repair of an
+  // incomplete, already-current checkout still needs the same proof, but intact no-ops above remain
+  // Bun-free.
+  const bun =
+    advanced.bun ?? requireRunnableBun(deps, "this update cannot rebuild the current checkout");
+  if (bun === null) return EXIT.FAIL;
   const r = deps.exec.runIn(
     bun.path,
     [join(deps.ctx.root, "cli", "main.ts"), "_apply-update"],
@@ -1803,12 +1845,28 @@ async function updateStagedCheckout(
   const higher =
     plan.kind === "unknown-version" || (plan.kind === "advance" && plan.crossesMajor) ? null : plan.higher;
 
-  const bun = resolveBun(deps);
-  if (bun === null) {
-    deps.io.err("error: bun not found — staging a version builds it, and that needs Bun.");
-    deps.io.err("       Install it from https://bun.sh and re-run update. Nothing was changed.");
+  const dir = target.tag;
+  const at = join(layout.versionsDir, dir);
+  // DECIDED BEFORE BUN AND BEFORE THE RECORD (#231, #232). This check needs neither a compiler nor a
+  // fetch, so it runs ahead of both: an install whose target is already live must not be refused
+  // for a broken Bun it will never use, and must not open a `staging` record it would then have to
+  // close as an abort, which a waiting phone reads as "failed" about an install that is fine.
+  if (currentVersionDir(deps, layout) === dir) {
+    // The target is already live. This is not the `plan.kind === "current"` case above — that one is
+    // decided from the manifest of the version we are RUNNING, and an install whose root still
+    // names the pre-flip tree (a stale `COLLIE_PLUGIN_ROOT`, an operator running the old binary by
+    // hand) reads as behind while `current` is not. Re-staging it would remove the running install.
+    if (stagedCurrent(deps, layout)?.complete === true) {
+      deps.io.out(`already current — ${dir} is staged and \`current\` points at it.`);
+      announceMajor(deps, higher);
+      return EXIT.OK;
+    }
+    deps.io.err(`error: ${dir} is what \`current\` points at, and it is incomplete — re-staging it`);
+    deps.io.err("       would remove the running install. Roll back first, or remove it by hand.");
     return EXIT.FAIL;
   }
+  const bun = requireRunnableBun(deps, "staging a version cannot build it; nothing was changed");
+  if (bun === null) return EXIT.FAIL;
   deps.io.out(
     plan.kind === "advance" && plan.crossesMajor
       ? `crossing to Collie ${target.version} (--major given: consented)…`
@@ -1837,22 +1895,6 @@ async function updateStagedCheckout(
 
   // 2. The worktree. A leftover directory of the same name is removed first: it is either a killed
   //    stage or the version we are re-staging after a failed build, and neither is `current`.
-  const dir = target.tag;
-  const at = join(layout.versionsDir, dir);
-  if (currentVersionDir(deps, layout) === dir) {
-    // The target is already live. This is not the `plan.kind === "current"` case above — that one is
-    // decided from the manifest of the version we are RUNNING, and an install whose root still
-    // names the pre-flip tree (a stale `COLLIE_PLUGIN_ROOT`, an operator running the old binary by
-    // hand) reads as behind while `current` is not. Re-staging it would remove the running install.
-    if (stagedCurrent(deps, layout)?.complete === true) {
-      deps.io.out(`already current — ${dir} is staged and \`current\` points at it.`);
-      announceMajor(deps, higher);
-      return EXIT.OK;
-    }
-    deps.io.err(`error: ${dir} is what \`current\` points at, and it is incomplete — re-staging it`);
-    deps.io.err("       would remove the running install. Roll back first, or remove it by hand.");
-    return EXIT.FAIL;
-  }
   if (deps.files.exists(at)) removeStagedVersion(deps, layout, dir, git);
   deps.files.mkdirp(layout.versionsDir);
   const added = deps.exec.runIn(
@@ -2056,6 +2098,10 @@ export const RUNNER_ENV_KEYS = [
   // guess a mux — so a runner without it dies on a question nobody is there to answer.
   "COLLIE_MUX",
   "COLLIE_CONFIG_DIR",
+  // The base config file's path, when the operator moved it. The runner re-reads `~/.collie/config.toml`
+  // from its own $HOME and the instance file from its own config dir, exactly as it re-reads the
+  // `.env` — but a path nobody can re-derive has to travel (ADR 0040).
+  "COLLIE_CONFIG",
   "COLLIE_STATE_DIR",
   "COLLIE_PLUGIN_ROOT",
   "COLLIE_PORT",
@@ -2104,11 +2150,11 @@ async function withStagingRecord(deps: UpdateDeps, arm: () => Promise<number>): 
 }
 
 /** Return this process's own `staging` record to `idle`. Another process's record is never touched. */
-function abandonStaging(deps: UpdateDeps): void {
+function abandonStaging(deps: UpdateDeps, reason: string = STAGING_GAVE_UP): void {
   try {
     const run = currentRun(deps);
     if (run === null || run.state !== "staging" || run.pid !== deps.pid) return;
-    writeRun(deps.files, deps.ctx.stateDir, reduce(run, { kind: "abort", reason: STAGING_GAVE_UP }, deps.now()));
+    writeRun(deps.files, deps.ctx.stateDir, reduce(run, { kind: "abort", reason }, deps.now()));
   } catch {
     /* see `beginStaging`: nothing about the record may fail an update, and this one has failed already */
   }
@@ -2116,6 +2162,7 @@ function abandonStaging(deps: UpdateDeps): void {
 
 /** What an aborted staging record says. The terminal above it has already said which step and why. */
 const STAGING_GAVE_UP = "staging stopped before the new version was laid down";
+/** The abort reason when the target was already `current`: nothing was staged because nothing needed to be. */
 
 /**
  * THE STAGING WINDOW, REPORTING ITSELF (M20/10).

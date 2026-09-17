@@ -134,6 +134,12 @@ export interface MuxPane extends MuxIdentity {
   readonly tabId: string;
   /** The tab's label, when it carries information. Absent for a positional default. */
   readonly tabLabel?: string;
+  /**
+   * True when `tabLabel` is a name the OPERATOR set, not the multiplexer's own: never a positional
+   * default, and never tmux's automatic window name (which the adapter reports as the pane's folder).
+   * Only such a name may name a pane (bridge/state-engine.ts, `soleTabName`). Absent otherwise.
+   */
+  readonly tabNamed?: true;
   /** The pane's working directory. Empty when the multiplexer does not report one. */
   readonly cwd: string;
   /**
@@ -567,6 +573,21 @@ export interface MuxAdapter {
   /** One pane's rendered screen. Needs `paneGrid`; `recent` past the viewport needs `gridScrollback`. */
   readGrid(paneId: string, request: MuxGridRequest): Promise<MuxOutcome<MuxGrid>>;
 
+  /**
+   * The same rows with soft wraps undone, when the multiplexer can produce them.
+   *
+   * The mirror renders the grid, so a URL longer than the pane arrives in fragments and the web app
+   * can only make an anchor out of the first one — a truncated href (`web/src/lib/links.ts`). This
+   * read is what says what the whole URL was. OPTIONAL by design: a multiplexer without it (or one
+   * whose panes never soft-wrap) simply yields no repair, exactly as today.
+   *
+   * Read in the same escape-carrying form as `readGrid`, and the caller strips the styling: this is
+   * only ever read for the URLs in it. Not `text`, which is the format Herdr was observed to harvest
+   * an idle alt-screen pane with, scrolling the operator's terminal; `ansi` never was
+   * (HERDR_API.md → `pane.read`).
+   */
+  readLogicalText?(paneId: string, lines: number): Promise<MuxOutcome<string>>;
+
   /** Type literal text into a pane, submitting nothing. Needs `typeText`. */
   typeText(paneId: string, text: string): Promise<MuxAck>;
 
@@ -669,4 +690,15 @@ export interface MuxAdapter {
  */
 export function muxDataFields(adapter: MuxAdapter): Pick<MuxAdapter, "logo"> {
   return adapter.logo === undefined ? {} : { logo: adapter.logo };
+}
+
+/**
+ * The OPTIONAL methods, gathered the way {@link muxDataFields} gathers the optional data fields.
+ *
+ * A decorator spreads this rather than conditionally spreading inline, so a multiplexer that cannot
+ * unwrap (tmux) never comes out of a decorator appearing to offer the read: absent stays absent.
+ */
+export function muxOptionalMethods(adapter: MuxAdapter): Pick<MuxAdapter, "readLogicalText"> {
+  const readLogicalText = adapter.readLogicalText?.bind(adapter);
+  return readLogicalText === undefined ? {} : { readLogicalText };
 }

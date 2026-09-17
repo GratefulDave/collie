@@ -17,14 +17,14 @@ import { UpdateBanner } from "@/components/update-banner";
 import { useDashPrefs, openForCount } from "@/hooks/use-dash-prefs";
 import { useSpaceActions } from "@/hooks/use-spaces";
 import { useMuxCapability } from "@/lib/mux-capability";
-import { ambientPanes, leadHost, paneScope, sessionsOnHost } from "@/lib/hosts";
+import { ambientHost, ambientPanes, paneScope, sessionsOnHost } from "@/lib/hosts";
 import { panePath, spacePath } from "@/lib/nav";
 import type { AgentView } from "@/lib/types";
 import { useRootData } from "@/lib/route-data";
 
-// Dashboard home screen. Everything you might ACT on comes first — Needs you → Ready · unseen →
-// Working → Recent (see lib/triage.ts) — and the Spaces navigator sits last, under the thing it
-// navigates to. Recent and Spaces fold; fold both and the page is the triaged herd and nothing else.
+// Dashboard home screen. Everything you might ACT on comes first — Needs you → Ready · unseen (see
+// lib/triage.ts) — then every other pane under the `space › tab` it lives in (lib/pane-groups.ts),
+// and the Spaces navigator sits last, under the thing it navigates to.
 // Launchers sit directly above Spaces: they are one-tap act-on-able actions like the herd above
 // them, but they CREATE rather than triage, so they sit under the triaged herd and above the
 // navigator their new Space will appear in. Tapping an agent opens its pane; tapping a space
@@ -46,7 +46,7 @@ export function HomeRoute() {
         .map((w) => ({ workspaceId: w.workspaceId, repoRoot: w.repoRoot!, label: w.label }))
     : [];
   const [newSpaceOpen, setNewSpaceOpen] = useState(false);
-  const { prefs, setSpacesOpen, setLaunchOpen, setRecentOpen, setRecentDir } = useDashPrefs();
+  const { prefs, setSpacesOpen, setLaunchOpen, setIsolatedSpace, toggleHiddenSpace } = useDashPrefs();
   // No stored choice yet? The space count decides — a two-space install shouldn't be handed a
   // mystery collapsed header, and a forty-space one shouldn't be handed a wall.
   const spacesOpen = openForCount(prefs.spacesOpen, data.workspaces.length);
@@ -61,13 +61,15 @@ export function HomeRoute() {
   const open = (pane: AgentView) =>
     navigate(panePath(pane.paneId, paneScope(data.scope, pane, data.servers, data.sessions)));
   const drillInto = (id: string) => navigate(spacePath(id, data.scope));
-  // The space navigator is LEAD-LOCAL (the merge deliberately does not union peer workspaces — their
-  // ids are only unique per machine), so the spaces on screen belong to the lead and their panes must
-  // be looked up under the lead's host. Undefined when solo, which keys everything exactly as before.
-  const navHost = leadHost(data.servers);
+  // The space navigator shows the ADDRESSED machine's spaces — the loader's `ambientSpaces` has
+  // already narrowed `data.workspaces`/`data.tabs` to the host `?h=` names (or the lead, absent one;
+  // untagged rows, i.e. every solo snapshot, pass regardless). Their panes must be looked up under
+  // that same host, so the navigator and the loader agree on which machine is on screen. Undefined
+  // when solo, which keys everything exactly as before.
+  const navHost = ambientHost(data.servers, data.scope.host);
   // Sessions are a per-host registry, so the session switcher only ever lists this host's.
   const sessionsHere = sessionsOnHost(data.sessions ?? [], data.scope, data.servers);
-  // …AND LEAD-LOCAL IS ALSO SESSION-LOCAL, which is the half the widened view would otherwise break.
+  // …AND THE ADDRESSED HOST IS ALSO SESSION-LOCAL, which is the half the widened view would otherwise break.
   // Workspace ids collide across sessions exactly as they collide across machines, and the space
   // navigator keys by `(host, workspaceId)` with no session in it — so on a widened body another
   // session's `w1` panes would paint their blocked dot and their recency onto the AMBIENT `w1` row,
@@ -110,19 +112,22 @@ export function HomeRoute() {
         <ReadOnlyBanner device={data.device} />
 
         <main className="flex-1">
-          {/* One list, every section, in triage order. It used to be split in two so "Needs you"
-              could be hoisted above the spaces overview; with Spaces last there is nothing to
-              straddle. */}
+          {/* One list: what needs you first, then every other pane under the tab it lives in
+              (components/agent-list.tsx). Bare shells go in with the agents — grouped by place they
+              sit beside the work they belong to, which is what stopped them being a pen of their
+              own at the bottom of the sheet. */}
           <AgentList
             agents={data.agents}
+            shellPanes={data.shellPanes}
             bridge={data.bridge}
             onOpen={open}
-            recentDir={prefs.recentDir}
-            onRecentDirChange={setRecentDir}
-            recentOpen={prefs.recentOpen}
-            onRecentOpenChange={setRecentOpen}
             error={data.error}
             lastSeenAt={data.lastSeenAt}
+            tabs={data.tabs}
+            isolated={prefs.isolatedSpace}
+            hidden={prefs.hiddenSpaces}
+            onIsolate={setIsolatedSpace}
+            onToggleHidden={toggleHiddenSpace}
           />
           <LaunchStrip open={launchOpen} onOpenChange={setLaunchOpen} scope={data.scope} />
           <SpaceOverview

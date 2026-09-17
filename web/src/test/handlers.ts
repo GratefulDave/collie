@@ -2,6 +2,7 @@ import { http, HttpResponse } from "msw";
 
 import type {
   AgentView,
+  CacheRuleWire,
   CrewStatusResponse,
   ServerSummary,
   SessionSummary,
@@ -332,6 +333,39 @@ export function paneTextWithDraft(base = "hello from the pane"): string {
 }
 
 // Default happy-path handlers; individual tests can override via server.use(...).
+/** The rule catalog `GET /api/cache-rules` answers with. Shaped exactly as the bridge composes it. */
+export const fixtureCacheRules: CacheRuleWire[] = [
+  {
+    id: "claude.subscription",
+    label: "Claude Code on a Claude subscription (Pro/Max)",
+    ttlSeconds: 3600,
+    confidence: "documented",
+    sourceTitle: "How Claude Code uses prompt caching",
+    sourceUrl: "https://code.claude.com/docs/en/prompt-caching",
+    retrievedAt: "2026-08-24",
+    slidingWindow: true,
+    automatic: true,
+    note: "Subagents use the five-minute TTL even on a subscription.",
+  },
+  {
+    id: "claude.api",
+    label: "Claude Code on an API key or third-party provider",
+    ttlSeconds: 300,
+    confidence: "documented",
+    sourceTitle: "How Claude Code uses prompt caching",
+    sourceUrl: "https://code.claude.com/docs/en/prompt-caching",
+    retrievedAt: "2026-08-24",
+    slidingWindow: true,
+    automatic: true,
+    overridden: {
+      ttlSeconds: 3600,
+      sourceUrl: "https://our.gateway.invalid/notes",
+      retrieved: "2026-09-12",
+      note: "our gateway sends ttl 1h on every request",
+    },
+  },
+];
+
 export const handlers = [
   http.get("/api/snapshot", () => HttpResponse.json(fixtureSnapshot)),
   http.get(/\/api\/pane\/[^/]+$/, () =>
@@ -392,17 +426,31 @@ export const handlers = [
   // Default world: no `launchers.toml`. Session-scoped (server.ts), so a test that wants rows
   // overrides this with its own `/api/launchers` handler rather than adding a field to `/api/config`.
   http.get("/api/launchers", () => HttpResponse.json({ launchers: [], home: "" })),
+  // The prompt-cache rule catalog. Two rows are enough for every sheet case: one plain and one the
+  // operator moved. A test that wants a different catalog overrides this handler.
+  http.get("/api/cache-rules", () => HttpResponse.json({ rules: fixtureCacheRules })),
   http.post<never, { snoozedUntil: number | null }>("/api/notifications/snooze", async ({ request }) => {
     const { snoozedUntil } = await request.json();
     return HttpResponse.json({ snoozedUntil });
   }),
   http.get("/api/notifications/prefs", () =>
-    HttpResponse.json({ blocked: true, done: false, updates: true }),
+    HttpResponse.json({ blocked: true, done: false, updates: true, cache: false }),
   ),
-  http.post<never, Partial<{ blocked: boolean; done: boolean; updates: boolean }>>("/api/notifications/prefs", async ({ request }) => {
+  http.post<never, Partial<{ blocked: boolean; done: boolean; updates: boolean; cache: boolean }>>("/api/notifications/prefs", async ({ request }) => {
     const patch = await request.json();
-    return HttpResponse.json({ blocked: true, done: false, updates: true, ...patch });
+    return HttpResponse.json({ blocked: true, done: false, updates: true, cache: false, ...patch });
   }),
+  // The prompt-cache watch list (ADR 0042). The default world watches NOTHING and has the global switch
+  // off, which is a fresh install: a test that wants a watched pane overrides these three.
+  http.get("/api/notifications/cache-watch", () =>
+    HttpResponse.json({ on: false, global: false, watchable: true, warnSeconds: 300 }),
+  ),
+  http.post<never, { on: boolean }>("/api/notifications/cache-watch", async ({ request }) => {
+    const { on } = await request.json();
+    return HttpResponse.json({ on, global: false, watchable: true, warnSeconds: 300 });
+  }),
+  http.get("/api/notifications/cache-watch/list", () => HttpResponse.json({ entries: [] })),
+  http.post("/api/notifications/cache-watch/forget", () => HttpResponse.json({ entries: [] })),
   // Device pairing. The default world has NOTHING paired — writes are ungated, exactly like a
   // fresh install — so every pre-existing test keeps asserting the unpaired-and-unenforced bridge,
   // and a test that wants pairing on overrides these two.

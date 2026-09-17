@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   Outlet,
   useLoaderData,
@@ -20,9 +21,11 @@ import { StripHost } from "@/components/ui/strip-host";
 import { ScreenTransition } from "@/components/screen-transition";
 import { CrewProvider } from "@/components/crew-provider";
 import { CollieMark } from "@/components/collie-mark";
+import { TourHost } from "@/components/tour-sheet";
 import { describeThrownError } from "@/lib/api-error-message";
 import { homePath } from "@/lib/nav";
 import { scopeFromUrl } from "@/lib/session";
+import { noteLeadName, noteSnapshotRun } from "@/lib/update-run-store";
 import { PANE_ROUTE_ID, type HomeData, type PaneData } from "@/lib/loaders";
 import { t } from "@/lib/i18n";
 import { useLocale } from "@/hooks/use-locale";
@@ -81,7 +84,28 @@ export function RootLayout() {
   // the common one — say nothing at all.
   useBusyWhile(useNavigation().state !== "idle");
   useAgentTransitions(data.agents, paneId ?? null);
-  usePushSetup();
+  // THE PUSH RACE. `usePushSetup` can raise the browser's permission prompt on its own, behind the
+  // tour's backdrop, so it waits until the tour has decided it is not showing. "pending" is what
+  // makes this correct rather than racy: a child's effect runs before the parent's, but the state it
+  // sets is not visible to the parent's effect in the same commit, so a `paused` that started false
+  // would fire the prompt before `TourHost` had decided anything.
+  const [tourDecision, setTourDecision] = useState<"pending" | "open" | "closed">("pending");
+  usePushSetup(tourDecision !== "closed");
+
+  // TWO FACTS PUBLISHED OUT OF THIS ROUTER, and nothing mounted (M28/01). The update screen lives in
+  // `App.tsx`, beside the wrapper it makes inert, so it has no loader data and no `CrewProvider` — and
+  // it needs the snapshot's run record and this machine's own name. Both go into
+  // `lib/update-run-store.ts`, which is the one place the run is reconciled. A component rendered here
+  // would be a descendant of the node the sheet makes inert, which is the arrangement the sheet exists
+  // to avoid.
+  const leadName = data.servers?.find((server) => server.isLead)?.name ?? null;
+  useEffect(() => {
+    noteLeadName(leadName);
+  }, [leadName]);
+  const snapshotRun = data.update?.run;
+  useEffect(() => {
+    noteSnapshotRun(snapshotRun);
+  }, [snapshotRun]);
 
   // A viewport-height flex column: the top banners (when shown) are in-flow rows at the top and the
   // active route fills the rest (each route root is `min-h-0 flex-1`). This is what keeps a banner
@@ -97,6 +121,13 @@ export function RootLayout() {
     // second derivation of it, so the tolerance can never be computed against a cadence we aren't
     // using. That mattered more once the cadence gained inputs beyond the snapshot (#156).
     <CrewProvider servers={data.servers} sessions={data.sessions} ts={data.ts} pollMs={pollMs}>
+      {/* The first-launch tour, and the one component on this shelf that usually renders nothing. It
+          is the GATE as well as the sheet: it reads the per-device store, opens once on the first
+          real snapshot, marks itself seen before the first slide paints, and reports what it decided
+          so the push setup above can hold its prompt back. It sits beside the band rather than
+          inside it because it is not a strip: it covers the screen, it does not share the top of
+          it. */}
+      <TourHost home={data} onDecision={setTourDecision} />
       <div className="flex h-[100dvh] flex-col overflow-hidden">
         {/* THE BAND, and the rule that there is only ever one strip in it. Four facts can be true at
             once above the header — the auth refusal, a lost connection, a degraded one, an update on
