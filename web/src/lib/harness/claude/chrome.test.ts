@@ -646,11 +646,15 @@ describe("the statusline run — as tall as a real statusline", () => {
     expect(stripChrome(lines)).not.toBe(lines);
   });
 
-  it.each([9, 10])("falls back to the raw mirror at %i rows, the deliberate ceiling", (rows) => {
+  it.each([9, 10])("at %i rows the run is no longer stripped as a statusline, but the box is still found", (rows) => {
+    // ADR 0048 amends ADR 0004: the ceiling bounds what the VIEW strips, not whether the box exists.
+    // A run taller than the ceiling is an `unknown` tail: it stays on the mirror under the transcript,
+    // is not re-surfaced as a statusline, and the send path still sees the box and its draft.
     const lines = boxWithStatusRows(`❯ ${DRAFT}`, statusRows(rows));
-    expect(extractInputDraft(lines)).toBeNull();
+    expect(extractInputDraft(lines)).toBe(DRAFT);
+    expect(hasInputBox(lines)).toBe(true);
     expect(extractStatusLines(lines)).toEqual([]);
-    expect(stripChrome(lines)).toBe(lines);
+    expect(stripChrome(lines).map(lineText)).toEqual(["earlier output", ...statusRows(rows)]);
   });
 });
 
@@ -702,14 +706,16 @@ describe("dialogs are refused by the border and blank checks — not by the row 
   });
 });
 
-describe("the row bound only catches a run taller than any plausible statusline", () => {
+describe("the row bound only decides what is stripped as a statusline", () => {
   const outputRows = (n: number) => Array.from({ length: n }, (_, i) => `tool output ${i}`);
 
-  it("refuses a complete box above an 8-row blank-free run", () => {
+  it("a complete box above an 8-row blank-free run is found, and the run stays on the mirror", () => {
+    // Before ADR 0048 this screen was refused by the row count alone. The count never guarded the
+    // send (ADR 0004); the box's own frame and the modal checks do, and neither objects here.
     const lines = boxWithBlankFreeRunBelow(outputRows(8));
     expect(extractStatusLines(lines)).toEqual([]);
-    expect(extractInputDraft(lines)).toBeNull();
-    expect(stripChrome(lines)).toBe(lines);
+    expect(extractInputDraft(lines)).toBe("do the earlier thing");
+    expect(stripChrome(lines).map(lineText)).toEqual(["old statusline", ...outputRows(8)]);
   });
 
   it("known limitation: a complete box above a 7-row blank-free run reads as live", () => {
@@ -722,12 +728,16 @@ describe("the row bound only catches a run taller than any plausible statusline"
 describe("scrollback echo — a known limitation, pinned on purpose", () => {
   const SENT = "please run the database migration now";
 
-  it.each([3, 8])("reads an echo of our own send back as a draft at %i dialog rows", (rows) => {
-    expect(extractInputDraft(echoedSendAboveDialog(SENT, rows))).toBe(SENT);
+  it.each([3, 8, 9])("refuses an echo above a dialog of %i numbered rows and a key hint", (rows) => {
+    // Until ADR 0048's statusline check, 3 and 8 rows fit the statusline walk and read as a draft.
+    // A statusline tail is now checked for numbered options and key hints too.
+    expect(extractInputDraft(echoedSendAboveDialog(SENT, rows))).toBeNull();
   });
 
-  it("stops reading the echo once the run passes the bound", () => {
-    expect(extractInputDraft(echoedSendAboveDialog(SENT, 9))).toBeNull();
+  it("still reads an echo as a draft when the rows under it name no menu", () => {
+    const rule = "─".repeat(40);
+    const lines = splitLines(parseAnsi(["earlier output", rule, `❯ ${SENT}`, rule, "  some row", "  another row"].join("\n")));
+    expect(extractInputDraft(lines)).toBe(SENT);
   });
 
   it.each(["claude--select-menu.txt", "claude--select-multi.txt"])(
@@ -754,6 +764,9 @@ describe("real corpus — pinned so any change to the walk shows up as a diff", 
     // undetectable behind them, so draft was null and stripped was 0.
     { fixture: "autocomplete-slash-long", statusRows: 0, draft: "/model", stripped: 27 },
     { fixture: "autocomplete-slash-short", statusRows: 0, draft: "/re", stripped: 7 },
+    // Hand-built from a live 82-column observation: a clipped "…ugin:…" command name inside the popup.
+    // Before the box was found by its own frame, the clipped row hid the box: draft null, stripped 1.
+    { fixture: "autocomplete-slash-clipped", statusRows: 0, draft: "/model", stripped: 32 },
     { fixture: "done", statusRows: 2, draft: null, stripped: 28 },
     { fixture: "ghost-suggestion", statusRows: 4, draft: null, stripped: 21 },
     { fixture: "ghost-typed-over", statusRows: 4, draft: "hello real draft text", stripped: 21 },
